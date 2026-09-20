@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KAELEON — Admin Control</title><link rel="stylesheet" href="admin.css">
+<style>
+.tabs{display:flex;gap:8px;overflow:auto;margin:18px 0}.tabs button{background:#0c191e;color:#dceced;border:1px solid #17343a;border-radius:12px;padding:11px 14px;white-space:nowrap}
+.section{display:none}.section.active{display:block}.data-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:13px 0;border-bottom:1px solid #17343a}.data-row span{display:flex;flex-direction:column;gap:4px}.data-row b{font-size:10px;color:#72dadd;text-transform:uppercase}.empty{color:#81979b;padding:20px 0}
+@media(max-width:650px){.data-row{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body><main>
+<header><div><b>KAELEON</b><span> ADMIN CONTROL CENTER</span></div><div id="system">VERIFICANDO…</div></header>
+
+<section class="grid">
+<article><small>USUARIOS</small><strong id="users">—</strong><p>Activos</p></article>
+<article><small>LIVE</small><strong id="live">—</strong><p>Activos</p></article>
+<article><small>PAGOS</small><strong id="payments">—</strong><p>Pendientes</p></article>
+<article><small>MOTOR</small><strong id="engine">—</strong><p>Estado</p></article>
+</section>
+
+<div class="tabs">
+<button data-tab="users">Usuarios</button><button data-tab="subscriptions">LIVE</button>
+<button data-tab="payments">Pagos</button><button data-tab="referrals">Referidos</button>
+<button data-tab="operations">Operaciones</button><button data-tab="engine">Motor</button>
+<button data-tab="markets">Mercados</button><button data-tab="audit">Auditoría</button>
+</div>
+
+<section id="users-section" class="section active"><div class="panel"><h2>Usuarios</h2><div data-admin-view="users"></div></div></section>
+<section id="subscriptions-section" class="section"><div class="panel"><h2>Suscripciones LIVE</h2><div data-admin-view="subscriptions"></div></div></section>
+<section id="payments-section" class="section"><div class="panel"><h2>Pagos</h2><div data-admin-view="payments"></div></div></section>
+<section id="referrals-section" class="section"><div class="panel"><h2>Referidos</h2><div data-admin-view="referrals"></div></div></section>
+<section id="operations-section" class="section"><div class="panel"><h2>Operaciones</h2><div data-admin-view="operations"></div></div></section>
+<section id="engine-section" class="section"><div class="panel"><h2>Motor KAELEON</h2><div data-admin-view="engine"></div></div></section>
+<section id="markets-section" class="section"><div class="panel"><h2>Mercados analizados</h2><div data-admin-view="markets"></div></div></section>
+<section id="audit-section" class="section"><div class="panel"><h2>Auditoría</h2><div data-admin-view="audit"></div></div></section>
+
+<script src="admin.js"></script><script src="admin_data_views.js"></script>
+<script>
+const fields = {
+ users:[{key:'phone',label:'Teléfono'},{key:'status',label:'Estado'},{key:'role',label:'Rol'},{key:'created_at',label:'Alta'}],
+ subscriptions:[{key:'user_id',label:'Usuario'},{key:'state',label:'Estado'},{key:'days_remaining',label:'Días'},{key:'expires_at',label:'Vence'}],
+ payments:[{key:'payment_order_id',label:'Orden'},{key:'status',label:'Estado'},{key:'amount',label:'Monto'},{key:'tx_hash',label:'TX'}],
+ referrals:[{key:'user_id',label:'Usuario'},{key:'code',label:'Código'},{key:'referred_count',label:'Referidos'},{key:'reward_days',label:'Días'}],
+ operations:[{key:'market',label:'Mercado'},{key:'side',label:'Dirección'},{key:'strategy',label:'Estrategia'},{key:'pnl',label:'PnL'}],
+ engine:[{key:'status',label:'Estado'},{key:'regime',label:'Régimen'},{key:'strategy',label:'Estrategia'},{key:'updated_at',label:'Actualizado'}],
+ markets:[{key:'symbol',label:'Mercado'},{key:'status',label:'Estado'},{key:'liquidity',label:'Liquidez'},{key:'spread',label:'Spread'}],
+ audit:[{key:'actor',label:'Actor'},{key:'action',label:'Acción'},{key:'target',label:'Objetivo'},{key:'created_at',label:'Fecha'}]
+};
+document.querySelectorAll('[data-tab]').forEach(btn=>{
+ btn.onclick=()=>{
+   document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
+   document.getElementById(btn.dataset.tab+'-section').classList.add('active');
+   loadAdminView(btn.dataset.tab, d=>{
+     const rows = Array.isArray(d) ? d : (d.items || d.data || []);
+     renderRows(document.querySelector(`[data-admin-view="${btn.dataset.tab}"]`), rows, fields[btn.dataset.tab]);
+   });
+ };
+});
+loadAdminView('users', d=>{
+ const rows=Array.isArray(d)?d:(d.items||d.data||[]);
+ renderRows(document.querySelector('[data-admin-view="users"]'),rows,fields.users);
+});
+</script>
+</main></body></html>

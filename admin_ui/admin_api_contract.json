@@ -1,0 +1,25 @@
+{
+  "base": "/admin",
+  "authorization": "Every endpoint requires an authenticated ADMIN session; backend remains authoritative.",
+  "endpoints": {
+    "dashboard": "GET /admin/dashboard",
+    "me": "GET /admin/me",
+    "users": "GET /admin/users",
+    "subscriptions": "GET /admin/subscriptions",
+    "payments": "GET /admin/payments",
+    "referrals": "GET /admin/referrals",
+    "operations": "GET /admin/operations",
+    "decisions": "GET /admin/decisions?decision_id=<id>",
+    "events": "GET /admin/events",
+    "audit": "GET /admin/audit",
+    "config": "GET /admin/config",
+    "engine": "GET /admin/engine",
+    "markets": "GET /admin/markets"
+  },
+  "safety": [
+    "Do not expose password hashes, API secrets, private keys or payment secrets.",
+    "USER sessions must receive 403/401 for ADMIN endpoints.",
+    "Sensitive admin mutations must create audit events.",
+    "Decision traceability uses decision_id."
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "base": "/admin",
+  "routes": [
+    "/admin/dashboard",
+    "/admin/users",
+    "/admin/subscriptions",
+    "/admin/payments",
+    "/admin/referrals",
+    "/admin/operations",
+    "/admin/engine",
+    "/admin/markets",
+    "/admin/audit",
+    "/admin/config"
+  ],
+  "authorization": "ADMIN backend authorization required on every route"
+}

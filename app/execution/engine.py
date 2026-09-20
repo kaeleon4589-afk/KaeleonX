@@ -1,0 +1,6 @@
+from abc import ABC, abstractmethod
+class ExecutionEngine(ABC):
+    @abstractmethod
+    def submit(self,intent,quantity): ...
+    @abstractmethod
+    def sync(self): ...

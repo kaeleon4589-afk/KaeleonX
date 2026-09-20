@@ -1,0 +1,35 @@
+import time
+
+
+class LiveExecutionEngine:
+    mode = "live"
+
+    def __init__(self, coinw_executor, leverage=1):
+        self.coinw = coinw_executor
+        self.leverage = leverage
+        self._equity_cache = 0.0
+        self._equity_cache_ts = 0.0
+        self._position_cache = {}
+        self._position_cache_ts = {}
+
+    async def submit(self, intent, quantity, market=None):
+        return await self.coinw.submit_intent(
+            intent, quantity, leverage=self.leverage
+        )
+
+    async def get_equity(self, max_age_seconds=5.0):
+        now = time.time()
+        if now - self._equity_cache_ts > max_age_seconds or self._equity_cache <= 0:
+            self._equity_cache = await self.coinw.equity()
+            self._equity_cache_ts = now
+        return self._equity_cache
+
+    async def sync_symbol(self, symbol, max_age_seconds=2.0):
+        now = time.time()
+        if now - self._position_cache_ts.get(symbol, 0) > max_age_seconds:
+            self._position_cache[symbol] = await self.coinw.current_position_rows(symbol)
+            self._position_cache_ts[symbol] = now
+        return list(self._position_cache.get(symbol, []))
+
+    async def sync(self, instruments):
+        return await self.coinw.sync_positions(instruments)

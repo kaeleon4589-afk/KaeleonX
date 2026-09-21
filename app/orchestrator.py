@@ -64,8 +64,7 @@ class TradingOrchestrator:
 
         decision_id = uuid4().hex
         try:
-            signals = self.signal_factory.build(snapshot)
-            regime = self.regime_engine.evaluate(*signals)
+            regime = self.regime_engine.evaluate_snapshot(snapshot)
             self.db.upsert("decisions", {"decision_id": decision_id}, {
                 "decision_id": decision_id,
                 "symbol": snapshot.symbol,
@@ -81,7 +80,7 @@ class TradingOrchestrator:
 
             intent = self.router.evaluate(
                 regime, snapshot.candles, decision_id, snapshot.symbol,
-                snapshot.timeframe, snapshot.last,
+                snapshot.timeframe, snapshot.last, snapshot=snapshot,
             )
             if not intent:
                 self.last_decision[key] = now

@@ -4,7 +4,8 @@ from app.config.settings import get_settings
 from app.logging.logger import get_logger, AuditLogger
 from app.storage.database import Database
 from app.coinw.market import CoinWMarketClient
-from app.market.coordinator import MarketCoordinator
+from app.market.coordinator import MultiMarketCoordinator
+from app.market.scanner import CoinWMarketScanner
 from app.security.credential_vault import CredentialVault
 from app.trading.profile import UserTradingProfileService
 from app.trading.runtime import UserTradingRuntimeManager
@@ -16,9 +17,8 @@ async def run():
     if s.environment == "production" and not s.mongodb_uri.strip():
         raise RuntimeError("mongodb_uri_required_in_production")
     logger.info(
-        "KAELEON starting | environment=%s | symbol=%s | timeframe=%s",
+        "KAELEON starting | environment=%s | market=AUTO_COINW | timeframe=%s",
         s.environment,
-        s.default_symbol,
         s.default_timeframe,
     )
 
@@ -34,12 +34,12 @@ async def run():
     )
     runtimes = UserTradingRuntimeManager(s, db, audit, profiles)
     client = CoinWMarketClient(s.coinw_rest_base_url)
-    market = MarketCoordinator(
-        client,
-        s.default_symbol,
-        s.default_timeframe,
-        poll_seconds=s.market_poll_seconds,
-        audit=audit,
+    scanner = CoinWMarketScanner(
+        client, depth=s.market_scanner_depth, cache_seconds=s.market_scanner_cache_seconds
+    )
+    market = MultiMarketCoordinator(
+        client, scanner, poll_seconds=s.market_poll_seconds, audit=audit,
+        max_parallel=s.market_scanner_parallel,
     )
 
     async def on_snapshot(snapshot):

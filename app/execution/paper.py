@@ -20,7 +20,7 @@ class PaperExecutionEngine:
         fee=fill*base_quantity*self.fee_rate
         pid='PAPER-'+uuid4().hex[:16]
         p=Position(pid,intent.decision_id,intent.symbol,intent.direction,base_quantity,fill,intent.stop_price,intent.target_price,entry_fee=fee,opened_at=market.get('ts'))
-        p.tp1_price=float(intent.metadata.get('tp1_price', fill+abs(fill-intent.stop_price)))
+        p.tp1_price=(float(intent.metadata['tp1_price']) if intent.metadata.get('partial_tp_enabled') and intent.metadata.get('tp1_price') else None)
         p.tp2_price=float(intent.metadata.get('tp2_price', intent.target_price))
         p.remaining_quantity=base_quantity
         self.positions[pid]=p

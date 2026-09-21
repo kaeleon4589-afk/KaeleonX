@@ -187,7 +187,9 @@ def system_config(authorization: str | None = Header(default=None)):
     return {
         "environment": s.environment,
         "mode": "MULTI_USER",
-        "default_symbol": s.default_symbol,
+        "market_selection": "AUTO_COINW",
+        "scanner_depth": s.market_scanner_depth,
+        "scanner_parallel": s.market_scanner_parallel,
         "default_timeframe": s.default_timeframe,
         "fixed_leverage": s.fixed_leverage,
         "risk_per_trade": s.risk_per_trade,

@@ -1,0 +1,31 @@
+import { useEffect, useMemo, useState } from 'react';
+import Brand from '../components/Brand';
+import StatCard from '../components/StatCard';
+import { api, humanizeError } from '../lib/api';
+import type { AdminDashboard, AdminReferral, AdminUser, User } from '../types';
+
+type Tab='overview'|'users'|'referrals'|'payments'|'system';
+const date=(v:unknown)=>{if(!v)return '—';const d=new Date(String(v));return Number.isNaN(d.getTime())?'—':new Intl.DateTimeFormat('es-MX',{dateStyle:'medium',timeStyle:'short'}).format(d)};
+
+export default function AdminPage({user,onBack}:{user:User;onBack:()=>void}){
+  const [tab,setTab]=useState<Tab>('overview');
+  const [dashboard,setDashboard]=useState<AdminDashboard|null>(null);
+  const [users,setUsers]=useState<AdminUser[]>([]);
+  const [referrals,setReferrals]=useState<AdminReferral[]>([]);
+  const [payments,setPayments]=useState<Record<string,unknown>[]>([]);
+  const [system,setSystem]=useState<Record<string,unknown>|null>(null);
+  const [error,setError]=useState(''); const [loading,setLoading]=useState(true); const [query,setQuery]=useState('');
+  const load=async()=>{setLoading(true);setError('');try{const [d,u,r,p,c]=await Promise.all([api.adminDashboard(),api.adminUsers(),api.adminReferrals(),api.adminPayments(),api.adminConfig()]);setDashboard(d);setUsers(u.items);setReferrals(r.items);setPayments(p.items);setSystem(c)}catch(e){setError(humanizeError(e))}finally{setLoading(false)}};
+  useEffect(()=>{load()},[]);
+  const filteredUsers=useMemo(()=>{const q=query.trim().toLowerCase();if(!q)return users;return users.filter(u=>String(u.phone||'').toLowerCase().includes(q)||String(u.user_id||'').toLowerCase().includes(q)||String(u.status||'').toLowerCase().includes(q))},[users,query]);
+  async function grantDays(phone:string|undefined){const raw=window.prompt('Días LIVE a conceder','7');if(!raw)return;const days=Number(raw);if(!Number.isInteger(days)||days<=0)return;try{await api.adminGrantLiveDays({phone,days});await load()}catch(e){setError(humanizeError(e))}}
+  async function ban(phone:string|undefined){const reason=window.prompt('Motivo del bloqueo','ADMIN')||'ADMIN';try{await api.adminBanUser({phone,reason});await load()}catch(e){setError(humanizeError(e))}}
+  async function unban(phone:string|undefined){try{await api.adminUnbanUser({phone});await load()}catch(e){setError(humanizeError(e))}}
+  return <div className="admin-shell"><header className="admin-topbar"><Brand/><div><span>{user.phone}</span><button onClick={onBack}>Volver al dashboard</button></div></header><div className="admin-body"><aside className="admin-nav"><h3>Administración</h3>{(['overview','users','referrals','payments','system'] as Tab[]).map(t=><button key={t} className={tab===t?'active':''} onClick={()=>setTab(t)}>{({overview:'Resumen',users:'Usuarios',referrals:'Referidos',payments:'Pagos',system:'Sistema'} as Record<Tab,string>)[t]}</button>)}</aside><main className="admin-main"><div className="admin-heading"><div><small>KAELEON CONTROL</small><h1>{tab==='overview'?'Resumen':tab==='users'?'Usuarios':tab==='referrals'?'Referidos':tab==='payments'?'Pagos':'Sistema'}</h1></div><button className="secondary-btn" onClick={load} disabled={loading}>{loading?'Actualizando…':'Actualizar'}</button></div>{error&&<div className="form-error">{error}</div>}
+    {tab==='overview'&&<section className="admin-card-grid"><StatCard label="Usuarios" value={dashboard?.users.total||0}/><StatCard label="Usuarios activos" value={dashboard?.users.active||0} tone="green"/><StatCard label="Posiciones abiertas" value={dashboard?.trading.open_positions||0}/><StatCard label="Pagos pendientes" value={dashboard?.payments.pending||0}/><StatCard label="Pagos confirmados" value={dashboard?.payments.confirmed||0} tone="green"/><StatCard label="Referidos" value={referrals.length}/></section>}
+    {tab==='users'&&<section className="admin-panel"><div className="admin-tools"><input placeholder="Buscar por teléfono, ID o estado" value={query} onChange={e=>setQuery(e.target.value)}/><span>{filteredUsers.length} usuarios</span></div><div className="admin-table"><div className="admin-row admin-row-head"><span>Teléfono</span><span>Estado</span><span>LIVE</span><span>Referidos</span><span>Acciones</span></div>{filteredUsers.map(u=><div className="admin-row" key={u.user_id}><strong>{u.phone||'—'}</strong><span>{u.status||'—'}</span><span>{u.live_state||'—'}</span><span>{u.referral_reward_days_total||0} días</span><div className="admin-actions"><button onClick={()=>grantDays(u.phone)}>+ días</button>{u.status==='blocked'||u.status==='suspended'?<button onClick={()=>unban(u.phone)}>Desbloquear</button>:<button className="danger-outline" onClick={()=>ban(u.phone)}>Bloquear</button>}</div></div>)}</div></section>}
+    {tab==='referrals'&&<section className="admin-panel"><div className="admin-table"><div className="admin-row referral-admin-row admin-row-head"><span>Referidor</span><span>Referido</span><span>Código</span><span>Recompensa</span><span>Fecha</span></div>{referrals.length?referrals.map((r,i)=><div className="admin-row referral-admin-row" key={`${r.referred_user_id}-${i}`}><strong>{r.referrer_phone||r.referrer_user_id||'—'}</strong><span>{r.referred_phone||r.referred_user_id||'—'}</span><code>{r.code||'—'}</code><span>{r.rewarded?`${r.reward_days||0} días`:'Pendiente'}</span><span>{date(r.created_at)}</span></div>):<div className="admin-empty">Aún no hay referidos registrados.</div>}</div></section>}
+    {tab==='payments'&&<section className="admin-panel"><div className="admin-table"><div className="admin-row admin-row-head"><span>Usuario</span><span>Estado</span><span>Importe</span><span>Plan</span><span>Fecha</span></div>{payments.length?payments.map((p,i)=><div className="admin-row" key={String(p.payment_order_id||i)}><strong>{String(p.user_id||'—')}</strong><span>{String(p.status||'—')}</span><span>{String(p.amount_usdt||p.amount||'—')}</span><span>{String(p.plan_days||p.days||'—')}</span><span>{date(p.created_at)}</span></div>):<div className="admin-empty">No hay pagos.</div>}</div></section>}
+    {tab==='system'&&<section className="admin-panel admin-system">{system?Object.entries(system).map(([k,v])=><div key={k}><span>{k}</span><strong>{String(v)}</strong></div>):null}</section>}
+  </main></div></div>
+}

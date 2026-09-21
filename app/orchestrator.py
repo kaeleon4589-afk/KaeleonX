@@ -248,6 +248,25 @@ class TradingOrchestrator:
             )
             self.audit.event("EXECUTION_RESULT", decision_id, user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol, **result)
 
+            # Every accepted signal must finish in one visible terminal event.
+            # Execution engines can reject after submit (for example because the
+            # live spread is too wide).  Previously those results were only
+            # emitted as DEBUG EXECUTION_RESULT, so at LOG_LEVEL=INFO the
+            # pipeline appeared to stop after SIGNAL_ACCEPTED.
+            if not result.get("filled"):
+                reason = str(result.get("reason") or "not_filled")
+                self.db.upsert(
+                    "decisions", {"decision_id": decision_id},
+                    {"execution": result, "status": "EXECUTION_REJECTED"},
+                )
+                self.audit.event(
+                    "EXECUTION_REJECTED", decision_id, user_id=user_id,
+                    mode=self.execution_mode, symbol=snapshot.symbol,
+                    reason=reason, accepted=bool(result.get("accepted", False)),
+                )
+                self.last_decision[key] = now
+                return result
+
             if result.get("filled") and result.get("position"):
                 raw = result["position"]
                 if isinstance(raw, Position):

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
-from app.auth.service import token_hash
+from app.auth.service import AuthService
 from app.billing import BillingService, BscUsdtVerifier, SUBSCRIPTIONS
 from app.config.settings import get_settings
 from app.storage.database import Database
@@ -21,12 +21,9 @@ def current_user(authorization: str | None):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "authentication_required")
     token = authorization.split(" ", 1)[1].strip()
-    session = service().db.find_one("sessions", {"token_hash": token_hash(token), "revoked": False})
-    if not session:
-        raise HTTPException(401, "invalid_session")
-    user = service().db.find_one("users", {"user_id": session["user_id"]})
-    if not user or user.get("status") != "active":
-        raise HTTPException(401, "invalid_session")
+    user = AuthService(service().db).authenticate_token(token)
+    if not user:
+        raise HTTPException(401, "invalid_or_expired_session")
     return user
 
 

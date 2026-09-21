@@ -11,6 +11,7 @@ from app.coinw.rest_client import CoinWRestClient
 from app.security.credential_vault import CredentialVault
 from app.storage.database import Database
 from app.trading.profile import UserTradingProfileService
+from app.trading.metrics import calculate_performance
 
 router = APIRouter(prefix="/user", tags=["user"])
 _db = None
@@ -56,7 +57,7 @@ def owned_query(user_id, extra=None):
 
 
 def collection(db, name, query):
-    if db.db:
+    if db.db is not None:
         return list(db.db[name].find(query, {"_id": 0}).sort("created_at", -1).limit(50))
     rows = [d for c, d in db.memory if c == name and all(d.get(k) == v for k, v in query.items())]
     return list(reversed(rows[-50:]))
@@ -183,9 +184,10 @@ def execution(authorization: str | None = Header(default=None)):
 @router.get("/operations")
 def operations(authorization: str | None = Header(default=None)):
     db, user, _, _ = current(authorization); uid = user["user_id"]
+    all_positions = collection(db, "positions", {"user_id": uid})
     return {
-        "open": collection(db, "positions", owned_query(uid, {"status": "OPEN"})),
-        "closed": collection(db, "positions", owned_query(uid, {"status": {"$ne": "OPEN"}})) if db.db else collection(db, "positions", {"user_id": uid}),
+        "open": [p for p in all_positions if str(p.get("status", "OPEN")).upper() == "OPEN"],
+        "closed": [p for p in all_positions if str(p.get("status", "OPEN")).upper() != "OPEN"],
     }
 
 
@@ -194,17 +196,14 @@ def performance(authorization: str | None = Header(default=None)):
     db, user, profiles, _ = current(authorization); uid = user["user_id"]
     state = db.find_one("user_engine_state", {"user_id": uid}) or {}
     profile = profiles.public(uid)
-    pnl = float(state.get("pnl", 0.0)); capital = float(state.get("capital", profile.operating_capital))
+    capital = float(profile.operating_capital)
+    positions = db.find_many("positions", {"user_id": uid}, limit=10000)
+    metrics = calculate_performance(positions, capital)
     return {
         "capital": capital,
         "configured_capital": profile.operating_capital,
-        "current_capital": capital + pnl,
-        "pnl": pnl,
-        "pnl_pct": float(state.get("pnl_pct", (pnl / capital * 100) if capital else 0)),
-        "drawdown": float(state.get("drawdown", 0.0)),
-        "win_rate": float(state.get("win_rate", 0.0)),
-        "profit_factor": float(state.get("profit_factor", 0.0)),
-        "trades": int(state.get("trades", 0)),
+        **metrics,
+        "available_equity": float(state.get("available_equity", metrics["current_capital"])),
     }
 
 

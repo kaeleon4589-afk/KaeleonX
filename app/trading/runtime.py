@@ -17,6 +17,8 @@ from app.risk.manager import RiskManager
 from app.strategy.router import StrategyRouter
 from app.market.signal_factory import SignalFactory
 from app.billing.service import BillingService
+from app.auth.service import AuthService
+from app.telegram.notifications import TelegramTradeNotifier
 from app.orchestrator import TradingOrchestrator
 from app.trading.profile import UserTradingProfileService
 from app.trading.metrics import calculate_performance
@@ -50,6 +52,7 @@ class UserTradingRuntimeManager:
         self.profiles = profile_service
         self.billing = BillingService(db, trial_days=settings.live_trial_days)
         self.signal_factory = SignalFactory()
+        self.notifier = TelegramTradeNotifier(settings, db, AuthService(db))
         self._runtimes: dict[str, UserRuntime] = {}
         self._last_refresh = 0.0
         self._lock = asyncio.Lock()
@@ -86,7 +89,7 @@ class UserTradingRuntimeManager:
                 self.settings.paper_taker_fee,
                 self.settings.paper_slippage_bps,
                 self.settings.paper_max_spread_bps,
-                capital,
+                self.settings.paper_initial_equity,
             )
             local_exits = True
 
@@ -95,14 +98,16 @@ class UserTradingRuntimeManager:
             self.audit,
             db=self.db,
             owner_user_id=user_id,
+            owner_mode=mode,
             evaluate_local_exits=local_exits,
+            on_closed=lambda position: self.notifier.position_closed(user_id, mode, position),
         )
         if hasattr(execution, "on_realized"):
             position_manager.on_realized = execution.on_realized
 
         # Recover persisted open positions after worker restarts so duplicate entries
         # are not created before the exchange/local state is reconciled.
-        for row in self.db.find_many("positions", {"user_id": user_id, "status": "OPEN"}, limit=1000):
+        for row in self.db.find_many("positions", {"user_id": user_id, "status": "OPEN", "mode": mode}, limit=1000):
             try:
                 direction = row.get("direction")
                 if not isinstance(direction, Direction):
@@ -148,6 +153,8 @@ class UserTradingRuntimeManager:
             self.audit,
             position_manager,
             self.signal_factory,
+            execution_mode=mode,
+            on_position_opened=lambda position: self.notifier.position_opened(user_id, mode, position),
         )
         return UserRuntime(
             user_id=user_id,
@@ -205,8 +212,11 @@ class UserTradingRuntimeManager:
 
                 if hasattr(runtime.execution, "get_equity"):
                     available_equity = await runtime.execution.get_equity()
+                    self.profiles.update_available_equity(runtime.user_id, available_equity)
                 else:
-                    available_equity = float(getattr(runtime.execution, "equity", runtime.configured_capital))
+                    # DEMO always owns a fixed virtual wallet. The configured
+                    # capital is only the portion allocated to KAELEON.
+                    available_equity = float(self.settings.paper_initial_equity)
 
                 effective_capital = min(runtime.configured_capital, float(available_equity))
                 if effective_capital < self.settings.min_operating_capital:
@@ -235,9 +245,10 @@ class UserTradingRuntimeManager:
             (p.__dict__ for p in runtime.position_manager.positions.values() if p.status == "OPEN"),
             None,
         )
-        positions = self.db.find_many("positions", {"user_id": runtime.user_id}, limit=10000)
+        positions = self.db.find_many("positions", {"user_id": runtime.user_id, "mode": runtime.mode}, limit=10000)
         metrics = calculate_performance(positions, runtime.configured_capital)
-        self.db.upsert("user_engine_state", {"user_id": runtime.user_id}, {
+        state_key = {"user_id": runtime.user_id, "mode": runtime.mode.upper()}
+        self.db.upsert("user_engine_state", state_key, {
             "user_id": runtime.user_id,
             "mode": runtime.mode.upper(),
             "status": status,
@@ -245,7 +256,7 @@ class UserTradingRuntimeManager:
             "capital": effective_capital,
             "available_equity": float(available_equity),
             "trading_enabled": runtime.trading_enabled,
-            "coinw_connected": runtime.mode == "live" and available_equity > 0,
+            "coinw_connected": self.profiles.public(runtime.user_id).coinw_verified,
             "open_position": open_position,
             **metrics,
         })

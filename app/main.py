@@ -13,6 +13,8 @@ from app.trading.runtime import UserTradingRuntimeManager
 async def run():
     s = get_settings()
     logger = get_logger("kaeleon")
+    if s.environment == "production" and not s.mongodb_uri.strip():
+        raise RuntimeError("mongodb_uri_required_in_production")
     logger.info(
         "KAELEON starting | environment=%s | symbol=%s | timeframe=%s",
         s.environment,

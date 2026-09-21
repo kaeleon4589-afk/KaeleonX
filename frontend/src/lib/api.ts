@@ -29,7 +29,9 @@ async function request<T>(path: string, init: RequestInit = {}, auth = true): Pr
   try {
     response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   } catch {
-    throw new ApiError(0, 'backend_unreachable');
+    // Include the failing route. A browser can surface an unhandled backend
+    // exception as a fetch/CORS error, so the route is essential diagnostics.
+    throw new ApiError(0, `backend_unreachable:${path}`);
   }
 
   const raw = await response.text();
@@ -70,6 +72,8 @@ export function humanizeError(error: unknown): string {
   const detail = error instanceof ApiError ? error.detail : error instanceof Error ? error.message : 'unknown_error';
   const map: Record<string, string> = {
     backend_unreachable: 'No se pudo conectar con el servidor.',
+    invalid_credential_encryption_key: 'La clave CREDENTIAL_ENCRYPTION_KEY del backend no es una clave Fernet válida.',
+    credential_encryption_key_required: 'Falta CREDENTIAL_ENCRYPTION_KEY en el backend.',
     invalid_credentials: 'Teléfono o contraseña incorrectos.',
     phone_already_registered: 'Ese teléfono ya está registrado.',
     invalid_phone: 'El número de teléfono no es válido.',
@@ -84,6 +88,10 @@ export function humanizeError(error: unknown): string {
     switch_to_demo_before_removing_credentials: 'Cambia a Demo antes de eliminar las credenciales.',
     disable_live_trading_and_close_position_before_changing_credentials: 'Pausa LIVE y cierra la posición antes de cambiar credenciales.',
   };
+  if (detail.startsWith('backend_unreachable:')) {
+    const route = detail.slice('backend_unreachable:'.length);
+    return `No se pudo completar la conexión con el backend en ${route}.`;
+  }
   if (detail.startsWith('coinw_connection_failed:')) return `CoinW rechazó la conexión: ${detail.slice('coinw_connection_failed:'.length)}`;
   return map[detail] || detail.replaceAll('_', ' ');
 }

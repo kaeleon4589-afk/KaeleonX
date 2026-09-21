@@ -26,16 +26,12 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("mongodb_uri_required_in_production")
         if not settings.credential_encryption_key.strip():
             raise RuntimeError("credential_encryption_key_required_in_production")
-        # Validate the Fernet key, but do not take the whole API offline if it
-        # is malformed. Endpoints that require encrypted CoinW credentials
-        # will return 503 from user_api.deps() until the deployment secret is
-        # corrected. Authentication, Telegram and health remain available.
+        # Keep the API online even if a deployment secret is malformed.
+        # Credential-dependent endpoints will return a clear 503 until fixed.
         try:
             CredentialVault(settings.credential_encryption_key)
         except ValueError:
-            logger.critical(
-                "CREDENTIAL_ENCRYPTION_KEY is invalid; credential-dependent endpoints are temporarily unavailable"
-            )
+            logger.error("CREDENTIAL_ENCRYPTION_KEY is not a valid Fernet key")
     if settings.telegram_enabled:
         if not settings.telegram_registration_configured:
             logger.error("Telegram registration verification is enabled but the required Telegram configuration is incomplete")

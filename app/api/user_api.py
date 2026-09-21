@@ -31,9 +31,6 @@ def deps():
         try:
             vault = CredentialVault(s.credential_encryption_key)
         except ValueError as exc:
-            # Do not let a malformed server-side Fernet key escape as an
-            # unhandled 500.  The browser otherwise reports it as a generic
-            # network/CORS failure, which hides the real deployment problem.
             raise HTTPException(503, str(exc)) from exc
         _profiles = UserTradingProfileService(
             _db,
@@ -56,13 +53,6 @@ def current(authorization):
     return db, user, profiles, billing
 
 
-def owned_query(user_id, extra=None):
-    q = {"user_id": user_id}
-    if extra:
-        q.update(extra)
-    return q
-
-
 def collection(db, name, query):
     if db.db is not None:
         return list(db.db[name].find(query, {"_id": 0}).sort("created_at", -1).limit(50))
@@ -70,58 +60,109 @@ def collection(db, name, query):
     return list(reversed(rows[-50:]))
 
 
+def _extract_available_equity(response) -> float:
+    data = response.get("data", response) if isinstance(response, dict) else response
+    if isinstance(data, dict):
+        for key in ("availableUsdt", "availableMargin", "available", "balance"):
+            value = data.get(key)
+            if value is not None:
+                try:
+                    return max(0.0, float(value))
+                except (TypeError, ValueError):
+                    pass
+    return 0.0
+
+
+async def _coinw_equity(profiles: UserTradingProfileService, user_id: str) -> float:
+    settings = get_settings()
+    creds = profiles.credentials(user_id)
+    client = CoinWRestClient(settings.coinw_rest_base_url, creds.api_key, creds.api_secret)
+    account = CoinWAccountAPI(client)
+    response = await account.assets("usdt")
+    return _extract_available_equity(response)
+
+
 class TradingConfigRequest(BaseModel):
     execution_mode: Literal["demo", "live"] = "demo"
     trading_enabled: bool = False
-    operating_capital: float = Field(gt=0)
+    operating_capital: float | None = Field(default=None, gt=0)
     coinw_api_key: str | None = Field(default=None, min_length=1)
     coinw_api_secret: str | None = Field(default=None, min_length=1)
 
 
-@router.get("/trading-config")
-def trading_config(authorization: str | None = Header(default=None)):
-    _, user, profiles, billing = current(authorization)
-    profile = profiles.public(user["user_id"])
-    entitlement = billing.entitlement(user["user_id"])
+def _config_payload(profile, entitlement, settings):
+    active_available = settings.paper_initial_equity if profile.execution_mode == "demo" else profile.coinw_available_equity
     return {
         "execution_mode": profile.execution_mode,
         "trading_enabled": profile.trading_enabled,
         "operating_capital": profile.operating_capital,
-        "minimum_operating_capital": profiles.minimum_operating_capital,
+        "demo_operating_capital": profile.demo_operating_capital,
+        "live_operating_capital": profile.live_operating_capital,
+        "minimum_operating_capital": settings.min_operating_capital,
+        "demo_available_equity": float(settings.paper_initial_equity),
+        "live_available_equity": profile.coinw_available_equity,
+        "available_equity": float(active_available),
         "coinw_configured": profile.coinw_configured,
+        "coinw_verified": profile.coinw_verified,
+        "coinw_verified_at": profile.coinw_verified_at,
         "coinw_api_key": profile.coinw_api_key_masked,
         "live_allowed": entitlement.live_allowed,
         "live_state": entitlement.live_state,
     }
 
 
-@router.put("/trading-config")
-def save_trading_config(req: TradingConfigRequest, authorization: str | None = Header(default=None)):
+@router.get("/trading-config")
+def trading_config(authorization: str | None = Header(default=None)):
     _, user, profiles, billing = current(authorization)
-    if req.execution_mode == "live":
-        if not billing.entitlement(user["user_id"]).live_allowed:
-            raise HTTPException(403, "live_not_entitled")
+    profile = profiles.public(user["user_id"])
+    return _config_payload(profile, billing.entitlement(user["user_id"]), get_settings())
+
+
+@router.put("/trading-config")
+async def save_trading_config(req: TradingConfigRequest, authorization: str | None = Header(default=None)):
+    _, user, profiles, billing = current(authorization)
+    uid = user["user_id"]
+    settings = get_settings()
+    if req.execution_mode == "live" and not billing.entitlement(uid).live_allowed:
+        raise HTTPException(403, "live_not_entitled")
+
     try:
+        # Validate limits before persisting capital so a rejected request cannot
+        # leave a too-large allocation stored in the profile.
+        if req.operating_capital is not None:
+            requested = float(req.operating_capital)
+            before = profiles.public(uid)
+            if not before.coinw_verified:
+                raise ValueError("coinw_verification_required_for_capital")
+            if req.execution_mode == "demo":
+                if requested > settings.paper_initial_equity:
+                    raise ValueError("demo_capital_exceeds_virtual_balance")
+            else:
+                available = await _coinw_equity(profiles, uid)
+                profiles.update_available_equity(uid, available)
+                if requested > available:
+                    raise ValueError("live_capital_exceeds_available_balance")
+
+        # Credentials are saved intentionally as unverified. The user must
+        # explicitly test them before capital/trading can be enabled.
         row = profiles.save(
-            user["user_id"],
+            uid,
             execution_mode=req.execution_mode,
             trading_enabled=req.trading_enabled,
             operating_capital=req.operating_capital,
             api_key=req.coinw_api_key,
             api_secret=req.coinw_api_secret,
         )
-        public = profiles.public(user["user_id"])
+        public = profiles.public(uid)
         return {
             "saved": True,
-            "execution_mode": public.execution_mode,
-            "trading_enabled": public.trading_enabled,
-            "operating_capital": public.operating_capital,
-            "coinw_configured": public.coinw_configured,
-            "coinw_api_key": public.coinw_api_key_masked,
+            **_config_payload(public, billing.entitlement(uid), settings),
             "profile_updated_at": row.get("updated_at"),
         }
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400, f"coinw_balance_check_failed:{exc}") from exc
 
 
 @router.delete("/coinw-credentials")
@@ -129,40 +170,39 @@ def delete_coinw_credentials(authorization: str | None = Header(default=None)):
     _, user, profiles, _ = current(authorization)
     try:
         profiles.clear_credentials(user["user_id"])
-        return {"deleted": True, "coinw_configured": False}
+        return {"deleted": True, "coinw_configured": False, "coinw_verified": False}
     except ValueError as exc:
-        raise HTTPException(409, str(exc))
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("/coinw/test")
 async def test_coinw_credentials(authorization: str | None = Header(default=None)):
     _, user, profiles, _ = current(authorization)
-    settings = get_settings()
     try:
-        creds = profiles.credentials(user["user_id"])
-        client = CoinWRestClient(settings.coinw_rest_base_url, creds.api_key, creds.api_secret)
-        account = CoinWAccountAPI(client)
-        response = await account.assets("usdt")
-        data = response.get("data", response) if isinstance(response, dict) else response
-        if isinstance(data, dict):
-            available = float(data.get("availableUsdt") or data.get("availableMargin") or 0.0)
-        else:
-            available = 0.0
-        return {"connected": True, "available_equity": available, "api_key": profiles.public(user["user_id"]).coinw_api_key_masked}
+        available = await _coinw_equity(profiles, user["user_id"])
+        profiles.mark_verified(user["user_id"], available)
+        return {
+            "connected": True,
+            "verified": True,
+            "available_equity": available,
+            "demo_equity": float(get_settings().paper_initial_equity),
+            "api_key": profiles.public(user["user_id"]).coinw_api_key_masked,
+        }
     except Exception as exc:
-        raise HTTPException(400, f"coinw_connection_failed:{exc}")
+        raise HTTPException(400, f"coinw_connection_failed:{exc}") from exc
 
 
 @router.get("/dashboard")
 def dashboard(authorization: str | None = Header(default=None)):
     db, user, profiles, _ = current(authorization)
     uid = user["user_id"]
-    state = db.find_one("user_engine_state", {"user_id": uid}) or {
-        "mode": "DEMO", "status": "PAUSADO", "capital": 0.0,
+    profile = profiles.public(uid)
+    mode = profile.execution_mode
+    state = db.find_one("user_engine_state", {"user_id": uid, "mode": mode.upper()}) or {
+        "mode": mode.upper(), "status": "PAUSADO", "capital": 0.0,
         "pnl": 0.0, "pnl_pct": 0.0, "regime": "TRANSITION",
         "direction": "NEUTRAL", "strategy": None, "open_position": None,
     }
-    profile = profiles.public(uid)
     state["configured_capital"] = profile.operating_capital
     state["trading_enabled"] = profile.trading_enabled
     return {"user": {"user_id": uid, "role": user.get("role")}, "engine": state}
@@ -171,16 +211,21 @@ def dashboard(authorization: str | None = Header(default=None)):
 @router.get("/execution")
 def execution(authorization: str | None = Header(default=None)):
     db, user, profiles, _ = current(authorization)
-    state = db.find_one("user_engine_state", {"user_id": user["user_id"]}) or {}
     profile = profiles.public(user["user_id"])
+    mode = profile.execution_mode
+    state = db.find_one("user_engine_state", {"user_id": user["user_id"], "mode": mode.upper()}) or {}
     return {
-        "mode": state.get("mode", profile.execution_mode.upper()),
+        "mode": state.get("mode", mode.upper()),
         "status": state.get("status", "PAUSADO" if not profile.trading_enabled else "ANALIZANDO"),
         "capital": state.get("capital", profile.operating_capital),
         "configured_capital": profile.operating_capital,
+        "available_equity": state.get(
+            "available_equity",
+            get_settings().paper_initial_equity if mode == "demo" else profile.coinw_available_equity,
+        ),
         "markets_scanned": state.get("markets_scanned", 0),
         "candidates": state.get("candidates", 0),
-        "coinw_connected": bool(state.get("coinw_connected", profile.coinw_configured and profile.execution_mode == "live")),
+        "coinw_connected": profile.coinw_verified,
         "leverage": "INTERNAL",
         "market_selection": "KAELEON_AUTO",
         "timeframe_selection": "KAELEON_INTERNAL",
@@ -190,9 +235,12 @@ def execution(authorization: str | None = Header(default=None)):
 
 @router.get("/operations")
 def operations(authorization: str | None = Header(default=None)):
-    db, user, _, _ = current(authorization); uid = user["user_id"]
-    all_positions = collection(db, "positions", {"user_id": uid})
+    db, user, profiles, _ = current(authorization)
+    uid = user["user_id"]
+    mode = profiles.public(uid).execution_mode
+    all_positions = collection(db, "positions", {"user_id": uid, "mode": mode})
     return {
+        "mode": mode,
         "open": [p for p in all_positions if str(p.get("status", "OPEN")).upper() == "OPEN"],
         "closed": [p for p in all_positions if str(p.get("status", "OPEN")).upper() != "OPEN"],
     }
@@ -200,17 +248,21 @@ def operations(authorization: str | None = Header(default=None)):
 
 @router.get("/performance")
 def performance(authorization: str | None = Header(default=None)):
-    db, user, profiles, _ = current(authorization); uid = user["user_id"]
-    state = db.find_one("user_engine_state", {"user_id": uid}) or {}
+    db, user, profiles, _ = current(authorization)
+    uid = user["user_id"]
     profile = profiles.public(uid)
+    mode = profile.execution_mode
+    state = db.find_one("user_engine_state", {"user_id": uid, "mode": mode.upper()}) or {}
     capital = float(profile.operating_capital)
-    positions = db.find_many("positions", {"user_id": uid}, limit=10000)
+    positions = db.find_many("positions", {"user_id": uid, "mode": mode}, limit=10000)
     metrics = calculate_performance(positions, capital)
+    default_available = get_settings().paper_initial_equity if mode == "demo" else profile.coinw_available_equity
     return {
+        "mode": mode,
         "capital": capital,
-        "configured_capital": profile.operating_capital,
+        "configured_capital": capital,
         **metrics,
-        "available_equity": float(state.get("available_equity", metrics["current_capital"])),
+        "available_equity": float(state.get("available_equity", default_available)),
     }
 
 
@@ -239,5 +291,6 @@ def settings(authorization: str | None = Header(default=None)):
         "trading_enabled": profile.trading_enabled,
         "operating_capital": profile.operating_capital,
         "coinw_configured": profile.coinw_configured,
+        "coinw_verified": profile.coinw_verified,
         "coinw_api_key": profile.coinw_api_key_masked,
     }

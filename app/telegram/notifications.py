@@ -9,11 +9,21 @@ from app.telegram.bot import TelegramBotService
 logger = logging.getLogger("kaeleon.telegram.trades")
 
 
-def _fmt_money(value: Any) -> str:
+def _fmt_number(value: Any, *, price: bool = False) -> str:
     try:
-        return f"{float(value):,.2f}"
+        number = float(value)
     except (TypeError, ValueError):
         return "—"
+    if price:
+        absolute = abs(number)
+        decimals = 2 if absolute >= 100 else 4 if absolute >= 1 else 6
+        return f"{number:,.{decimals}f}"
+    return f"{number:,.6f}".rstrip("0").rstrip(".")
+
+
+def _strategy(position: Any) -> str:
+    value = getattr(position, "strategy", None)
+    return str(value or "—").upper()
 
 
 def _direction(position: Any) -> str:
@@ -76,11 +86,13 @@ class TelegramTradeNotifier:
             "🟢 KAELEON — Operación abierta\n\n"
             f"Modo: {mode.upper()}\n"
             f"Par: {getattr(position, 'symbol', '—')}\n"
+            f"Estrategia: {_strategy(position)}\n"
             f"Dirección: {_direction(position)}\n"
-            f"Entrada: {_fmt_money(getattr(position, 'entry_price', None))}\n"
-            f"Cantidad: {_fmt_money(getattr(position, 'quantity', None))}\n"
-            f"Stop Loss: {_fmt_money(getattr(position, 'stop_price', None))}\n"
-            f"Take Profit: {_fmt_money(getattr(position, 'target_price', None))}"
+            f"Entrada: {_fmt_number(getattr(position, 'entry_price', None), price=True)}\n"
+            f"Cantidad: {_fmt_number(getattr(position, 'quantity', None))}\n"
+            f"Stop Loss: {_fmt_number(getattr(position, 'stop_price', None), price=True)}\n"
+            f"Take Profit: {_fmt_number(getattr(position, 'target_price', None), price=True)}\n"
+            f"RR ejecución: {_fmt_number(getattr(position, 'execution_rr', None))}"
         )
         self._schedule(user_id, text)
 
@@ -94,11 +106,12 @@ class TelegramTradeNotifier:
             "🏁 KAELEON — Operación cerrada\n\n"
             f"Modo: {mode.upper()}\n"
             f"Par: {getattr(position, 'symbol', '—')}\n"
+            f"Estrategia: {_strategy(position)}\n"
             f"Dirección: {_direction(position)}\n"
             f"Resultado: {result}\n"
-            f"Entrada: {_fmt_money(getattr(position, 'entry_price', None))}\n"
-            f"Salida: {_fmt_money(getattr(position, 'exit_price', None))}\n"
-            f"PnL neto: {'+' if net > 0 else ''}{_fmt_money(net)} USDT\n"
+            f"Entrada: {_fmt_number(getattr(position, 'entry_price', None), price=True)}\n"
+            f"Salida: {_fmt_number(getattr(position, 'exit_price', None), price=True)}\n"
+            f"PnL neto: {'+' if net > 0 else ''}{_fmt_number(net)} USDT\n"
             f"Motivo: {getattr(position, 'exit_reason', None) or 'EXCHANGE'}"
         )
         self._schedule(user_id, text)

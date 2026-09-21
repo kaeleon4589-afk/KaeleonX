@@ -1,6 +1,6 @@
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.config.settings import get_settings
@@ -337,4 +337,60 @@ def referrals(authorization: str | None = Header(default=None)):
         'reward_days_total': int(fresh.get('referral_reward_days_total', 0) or 0),
         'reward_rules': {'15': 7, '30': 15},
         'items': items,
+    }
+
+
+@router.get("/activity")
+def activity(
+    authorization: str | None = Header(default=None),
+    limit: int = Query(default=25, ge=1, le=50),
+    mode: str | None = Query(default=None),
+):
+    """Lightweight monitor data without storing operational logs in MongoDB.
+
+    The current regime/strategy comes from the upserted engine state and recent
+    trade activity comes from the positions collection, which is business data
+    we need anyway. No append-only events collection is required.
+    """
+    db, user, profiles, _ = current(authorization)
+    uid = user["user_id"]
+    active_mode = (mode or profiles.public(uid).execution_mode).lower()
+    state = db.find_one("user_engine_state", {"user_id": uid, "mode": active_mode.upper()}) or {}
+    rows = db.find_many("positions", {"user_id": uid, "mode": active_mode}, limit=max(limit * 2, 20), sort_field="opened_at", descending=True)
+
+    items = []
+    if state.get("regime") or state.get("regime_candidate"):
+        items.append({
+            "event": "REGIME_STATE",
+            "mode": active_mode,
+            "symbol": state.get("last_symbol"),
+            "regime": state.get("regime"),
+            "candidate": state.get("regime_candidate"),
+            "confidence": state.get("regime_confidence"),
+            "updated_at": state.get("updated_at"),
+        })
+    if state.get("strategy"):
+        items.append({
+            "event": "STRATEGY_STATE",
+            "mode": active_mode,
+            "symbol": state.get("last_symbol"),
+            "strategy": state.get("strategy"),
+            "trace": state.get("last_strategy_trace"),
+            "updated_at": state.get("updated_at"),
+        })
+
+    for row in rows:
+        clean = {k: v for k, v in row.items() if k != "_id"}
+        status = str(row.get("status") or "").upper()
+        clean["event"] = "POSITION_OPENED" if status == "OPEN" else "POSITION_CLOSED"
+        clean["mode"] = active_mode
+        items.append(clean)
+        if len(items) >= limit:
+            break
+
+    return {
+        "mode": active_mode,
+        "items": items[:limit],
+        "count": min(len(items), limit),
+        "engine": {k: v for k, v in state.items() if k != "_id"},
     }

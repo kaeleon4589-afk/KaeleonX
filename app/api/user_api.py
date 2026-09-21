@@ -12,6 +12,7 @@ from app.security.credential_vault import CredentialVault
 from app.storage.database import Database
 from app.trading.profile import UserTradingProfileService
 from app.trading.metrics import calculate_performance
+from app.referrals import new_referral_code
 
 router = APIRouter(prefix="/user", tags=["user"])
 _db = None
@@ -293,4 +294,47 @@ def settings(authorization: str | None = Header(default=None)):
         "coinw_configured": profile.coinw_configured,
         "coinw_verified": profile.coinw_verified,
         "coinw_api_key": profile.coinw_api_key_masked,
+    }
+
+
+def _mask_phone(phone: str | None) -> str | None:
+    if not phone:
+        return None
+    value = str(phone)
+    if len(value) <= 5:
+        return value
+    return f"{value[:3]}{'*' * max(2, len(value) - 5)}{value[-2:]}"
+
+
+@router.get('/referrals')
+def referrals(authorization: str | None = Header(default=None)):
+    db, user, _, _ = current(authorization)
+    uid = user['user_id']
+    fresh = db.find_one('users', {'user_id': uid}) or user
+    if not fresh.get('referral_code'):
+        code = new_referral_code(db)
+        db.upsert('users', {'user_id': uid}, {'referral_code': code})
+        fresh = {**fresh, 'referral_code': code}
+    referred = db.find_many('users', {'referred_by_user_id': uid}, limit=200, sort_field='created_at')
+    reward_rows = db.find_many('referral_rewards', {'referrer_user_id': uid}, limit=500, sort_field='created_at')
+    reward_by_referred = {str(row.get('referred_user_id')): row for row in reward_rows}
+    items = []
+    for row in referred:
+        reward = reward_by_referred.get(str(row.get('user_id')))
+        items.append({
+            'user_id': row.get('user_id'),
+            'phone_masked': _mask_phone(row.get('phone')),
+            'status': row.get('status'),
+            'created_at': row.get('created_at'),
+            'rewarded': bool(row.get('referral_rewarded_at') or reward),
+            'reward_days': int((reward or {}).get('reward_days') or row.get('referral_reward_days') or 0),
+            'rewarded_at': row.get('referral_rewarded_at') or (reward or {}).get('created_at'),
+        })
+    return {
+        'referral_code': fresh.get('referral_code'),
+        'referred_count': len(referred),
+        'rewarded_count': sum(1 for item in items if item['rewarded']),
+        'reward_days_total': int(fresh.get('referral_reward_days_total', 0) or 0),
+        'reward_rules': {'15': 7, '30': 15},
+        'items': items,
     }

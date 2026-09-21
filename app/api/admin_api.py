@@ -31,44 +31,14 @@ def current_admin(authorization: str | None):
     if not user:
         raise HTTPException(401, "invalid_or_expired_session")
     configured = get_settings().admin_phone
-    if not configured or user.get("phone") != configured:
+    try:
+        configured = normalize_phone(configured) if configured else ''
+    except ValueError:
+        configured = ''
+    if not configured or normalize_phone(user.get('phone', '')) != configured:
         audit.event("ADMIN_ACCESS_DENIED", user_id=user.get("user_id"), phone=user.get("phone"))
         raise HTTPException(403, "admin_access_denied")
     audit.event("ADMIN_ACCESS_GRANTED", user_id=user.get("user_id"))
-    return user
-
-
-
-class UserLookup(BaseModel):
-    phone: str | None = None
-    telegram_user_id: str | None = None
-
-    def validate_identifier(self):
-        if self.phone:
-            return normalize_phone(self.phone)
-        if self.telegram_user_id:
-            return str(self.telegram_user_id)
-        raise ValueError("phone_or_telegram_user_id_required")
-
-
-class GrantLiveDaysRequest(UserLookup):
-    days: int = Field(gt=0, le=3650)
-
-
-class BanUserRequest(UserLookup):
-    days: int | None = Field(default=None, gt=0, le=3650)
-    reason: str | None = Field(default=None, max_length=500)
-
-
-def target_user(req):
-    if req.phone:
-        return find_user(deps()[0], phone=normalize_phone(req.phone))
-    return find_user(deps()[0], telegram_user_id=str(req.telegram_user_id))
-
-def require_target(req):
-    user = target_user(req)
-    if not user:
-        raise HTTPException(404, "user_not_found")
     return user
 
 
@@ -99,7 +69,7 @@ def clean(doc):
     if not doc:
         return None
     out = dict(doc)
-    for key in ("password_hash",):
+    for key in ('_id', 'password_hash'):
         out.pop(key, None)
     return out
 
@@ -141,19 +111,19 @@ def users(authorization: str | None = Header(default=None), limit: int = 100):
 def payments(authorization: str | None = Header(default=None), limit: int = 100):
     current_admin(authorization)
     db, _, _ = deps()
-    return {"items": db.find_many("payment_orders", limit=min(max(limit, 1), 200), sort_field="created_at")}
+    return {"items": [clean(x) for x in db.find_many("payment_orders", limit=min(max(limit, 1), 200), sort_field="created_at")]}
 
 @router.get("/trading/positions")
 def trading_positions(authorization: str | None = Header(default=None), limit: int = 100):
     current_admin(authorization)
     db, _, _ = deps()
-    return {"items": db.find_many("positions", limit=min(max(limit, 1), 200), sort_field="updated_at")}
+    return {"items": [clean(x) for x in db.find_many("positions", limit=min(max(limit, 1), 200), sort_field="updated_at")]}
 
 @router.get("/trading/decisions")
 def trading_decisions(authorization: str | None = Header(default=None), limit: int = 100):
     current_admin(authorization)
     db, _, _ = deps()
-    return {"items": db.find_many("decisions", limit=min(max(limit, 1), 200), sort_field="updated_at")}
+    return {"items": [clean(x) for x in db.find_many("decisions", limit=min(max(limit, 1), 200), sort_field="updated_at")]}
 
 @router.post("/users/live-days")
 def grant_live_days_admin(req: GrantLiveDaysRequest, authorization: str | None = Header(default=None)):
@@ -208,7 +178,7 @@ def restore_user(req: UserLookup, authorization: str | None = Header(default=Non
 def system_events(authorization: str | None = Header(default=None), limit: int = 200):
     current_admin(authorization)
     db, _, _ = deps()
-    return {"items": db.find_many("events", limit=min(max(limit, 1), 500), sort_field="created_at")}
+    return {"items": [clean(x) for x in db.find_many("events", limit=min(max(limit, 1), 500), sort_field="created_at")]}
 
 @router.get("/system/config")
 def system_config(authorization: str | None = Header(default=None)):
@@ -225,3 +195,55 @@ def system_config(authorization: str | None = Header(default=None)):
         "coinw_ws_url": s.coinw_ws_url,
         "admin_phone_configured": bool(s.admin_phone),
     }
+
+@router.get('/referrals')
+def admin_referrals(authorization: str | None = Header(default=None), limit: int = 200):
+    current_admin(authorization)
+    db, _, _ = deps()
+    users = db.find_many('users', limit=min(max(limit, 1), 500), sort_field='created_at')
+    by_id = {str(u.get('user_id')): u for u in users}
+    referred = [u for u in users if u.get('referred_by_user_id')]
+    items = []
+    for row in referred:
+        referrer = by_id.get(str(row.get('referred_by_user_id'))) or db.find_one('users', {'user_id': row.get('referred_by_user_id')}) or {}
+        items.append({
+            'referred_user_id': row.get('user_id'),
+            'referred_phone': row.get('phone'),
+            'referrer_user_id': row.get('referred_by_user_id'),
+            'referrer_phone': referrer.get('phone'),
+            'code': row.get('referred_by_code'),
+            'created_at': row.get('referral_attached_at') or row.get('created_at'),
+            'rewarded': bool(row.get('referral_rewarded_at')),
+            'reward_days': int(row.get('referral_reward_days', 0) or 0),
+        })
+    return {
+        'items': items[:min(max(limit, 1), 500)],
+        'total': len(items),
+        'rewarded': sum(1 for item in items if item['rewarded']),
+    }
+
+
+@router.get('/subscriptions')
+def admin_subscriptions(authorization: str | None = Header(default=None), limit: int = 200):
+    current_admin(authorization)
+    db, _, _ = deps()
+    rows = db.find_many('users', limit=min(max(limit, 1), 500), sort_field='created_at')
+    items = []
+    for row in rows:
+        if row.get('live_state') not in ('not_started', None) or row.get('subscription_expires_at') or row.get('live_access_until'):
+            items.append({
+                'user_id': row.get('user_id'),
+                'phone': row.get('phone'),
+                'live_state': row.get('live_state'),
+                'subscription_expires_at': row.get('subscription_expires_at'),
+                'live_access_until': row.get('live_access_until'),
+                'referral_reward_days_total': int(row.get('referral_reward_days_total', 0) or 0),
+            })
+    return {'items': items[:min(max(limit, 1), 500)]}
+
+
+@router.get('/operations')
+def admin_operations(authorization: str | None = Header(default=None), limit: int = 200):
+    current_admin(authorization)
+    db, _, _ = deps()
+    return {'items': [clean(x) for x in db.find_many('positions', limit=min(max(limit, 1), 500), sort_field='created_at')]}

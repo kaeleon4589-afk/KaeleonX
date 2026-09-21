@@ -22,12 +22,12 @@ class PaperExecutionEngine:
         p=Position(pid,intent.decision_id,intent.symbol,intent.direction,base_quantity,fill,intent.stop_price,intent.target_price,entry_fee=fee,opened_at=market.get('ts'))
         p.tp1_price=float(intent.metadata.get('tp1_price', fill+abs(fill-intent.stop_price)))
         p.tp2_price=float(intent.metadata.get('tp2_price', intent.target_price))
-        p.remaining_quantity=quantity
+        p.remaining_quantity=base_quantity
         self.positions[pid]=p
         self.equity -= fee
         self.orders[pid]={'order_id':pid,'status':'FILLED','fill_price':fill,'fee':fee,'decision_id':intent.decision_id}
         if self.audit: self.audit.event('PAPER_FILL',intent.decision_id,position_id=pid,quantity=base_quantity,notional=quantity,price=fill,fee=fee)
-        return {'accepted':True,'filled':True,'position_id':pid,'fill_price':fill,'fee':fee,'mode':'paper'}
+        return {'accepted':True,'filled':True,'position_id':pid,'fill_price':fill,'fee':fee,'mode':'demo','position':p}
 
     def on_realized(self, position, gross_pnl, quantity, price):
         exit_fee=price*quantity*self.fee_rate

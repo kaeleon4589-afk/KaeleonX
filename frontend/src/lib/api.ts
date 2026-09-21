@@ -1,4 +1,4 @@
-import type { Entitlement, Execution, Operations, Performance, TradingConfig, User } from '../types';
+import type { AdminDashboard, AdminReferral, AdminUser, Entitlement, Execution, Operations, Performance, ReferralSummary, TradingConfig, User } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
@@ -66,6 +66,20 @@ export const api = {
   performance: () => request<Performance>('/user/performance'),
   entitlement: () => request<Entitlement>('/billing/entitlement'),
   activateTrial: () => request<Entitlement>('/billing/live/activate-trial', { method: 'POST' }),
+
+  referrals: () => request<ReferralSummary>('/user/referrals'),
+  adminMe: () => request<User>('/admin/me'),
+  adminDashboard: () => request<AdminDashboard>('/admin/dashboard'),
+  adminUsers: () => request<{items: AdminUser[]}>('/admin/users'),
+  adminPayments: () => request<{items: Record<string, unknown>[]}>('/admin/payments'),
+  adminReferrals: () => request<{items: AdminReferral[]; total: number; rewarded: number}>('/admin/referrals'),
+  adminSubscriptions: () => request<{items: Record<string, unknown>[]}>('/admin/subscriptions'),
+  adminOperations: () => request<{items: Record<string, unknown>[]}>('/admin/operations'),
+  adminEvents: () => request<{items: Record<string, unknown>[]}>('/admin/system/events'),
+  adminConfig: () => request<Record<string, unknown>>('/admin/system/config'),
+  adminGrantLiveDays: (body: {phone?: string; telegram_user_id?: string; days: number}) => request('/admin/users/live-days', {method:'POST', body:JSON.stringify(body)}),
+  adminBanUser: (body: {phone?: string; telegram_user_id?: string; days?: number; reason?: string}) => request('/admin/users/ban', {method:'POST', body:JSON.stringify(body)}),
+  adminUnbanUser: (body: {phone?: string; telegram_user_id?: string}) => request('/admin/users/unban', {method:'POST', body:JSON.stringify(body)}),
 };
 
 export function humanizeError(error: unknown): string {

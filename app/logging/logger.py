@@ -25,18 +25,21 @@ _STATE_INFO = {
     'STRATEGY_EVALUATED',
     'SIGNAL_REJECTED',
     'RISK_REJECTED',
+    'EXECUTION_REJECTED',
 }
 _ALWAYS_ERROR = {
     'MARKET_SCAN_ERROR',
     'MARKET_LOOP_ERROR',
     'WORKER_CRASHED',
-    'MARKET_SNAPSHOT_ERROR',
     'BTC_CONTEXT_ERROR',
     'POSITION_SYNC_ERROR',
     'USER_RUNTIME_ERROR',
     'USER_RUNTIME_CONFIG_ERROR',
     'POSITION_RESTORE_ERROR',
     'TELEGRAM_NOTIFY_FAILED',
+}
+_THROTTLED_WARNING = {
+    'MARKET_SNAPSHOT_ERROR',
 }
 _DEBUG_ONLY = {
     'DECISION_START',
@@ -115,8 +118,10 @@ class AuditLogger:
             selected = data.get('strategy') or (trace.get('selected') if isinstance(trace, dict) else None)
             reason = trace.get('reason') if isinstance(trace, dict) else None
             return f'{selected or "NONE"}|{reason or ""}'
-        if event in {'SIGNAL_REJECTED', 'RISK_REJECTED'}:
+        if event in {'SIGNAL_REJECTED', 'RISK_REJECTED', 'EXECUTION_REJECTED'}:
             return str(data.get('reason') or 'unknown')
+        if event == 'MARKET_SNAPSHOT_ERROR':
+            return str(data.get('error') or 'market_snapshot_error')
         return ''
 
     def _should_emit_state(self, event: str, data: dict) -> bool:
@@ -129,7 +134,7 @@ class AuditLogger:
         signature = self._state_signature(event, data)
         now = time.monotonic()
         previous = self._last_state.get(key)
-        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'RISK_REJECTED'} else self.state_repeat_seconds
+        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'RISK_REJECTED', 'EXECUTION_REJECTED', 'MARKET_SNAPSHOT_ERROR'} else self.state_repeat_seconds
         if previous and previous[0] == signature and now - previous[1] < repeat:
             return False
         self._last_state[key] = (signature, now)
@@ -141,6 +146,10 @@ class AuditLogger:
         requested = str(level).upper()
         if event in _ALWAYS_ERROR or requested in {'ERROR', 'CRITICAL'}:
             effective = requested if requested in {'ERROR', 'CRITICAL'} else 'ERROR'
+        elif event in _THROTTLED_WARNING:
+            if not self._should_emit_state(event, data):
+                return None
+            effective = 'WARNING'
         elif requested == 'DEBUG' or event in _DEBUG_ONLY:
             effective = 'DEBUG'
         elif event in _ALWAYS_INFO:

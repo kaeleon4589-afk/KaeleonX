@@ -9,8 +9,15 @@ class PaperExecutionEngine:
         self.equity=float(initial_equity); self.realized_pnl=0.0; self.reserved_margin=0.0
 
     def submit(self,intent,quantity,market):
-        bid,ask=market.get('bid',0),market.get('ask',0)
-        if bid<=0 or ask<=0: return {'accepted':False,'filled':False,'reason':'market_unavailable'}
+        # Order-book data can be temporarily missing for individual CoinW symbols.
+        # Never let a None/string quote crash the whole user runtime.
+        try:
+            bid=float(market.get('bid'))
+            ask=float(market.get('ask'))
+        except (TypeError, ValueError):
+            return {'accepted':False,'filled':False,'reason':'market_unavailable'}
+        if bid<=0 or ask<=0:
+            return {'accepted':False,'filled':False,'reason':'market_unavailable'}
         spread=(ask-bid)/bid*10000
         if spread>self.max_spread_bps: return {'accepted':False,'filled':False,'reason':'spread_too_wide'}
         raw=ask if intent.direction==Direction.LONG else bid

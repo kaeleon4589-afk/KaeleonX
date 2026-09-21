@@ -134,3 +134,17 @@ export type AdminReferral = {
   rewarded?: boolean;
   reward_days?: number;
 };
+
+export type BillingPlan = { code: string; days: number; price_usdt: string };
+export type PaymentOrder = {
+  payment_order_id: string;
+  plan_code: string;
+  duration_days: number;
+  amount_usdt: string;
+  network: string;
+  destination_wallet: string;
+  status: string;
+  created_at?: string;
+  expires_at?: string;
+  tx_hash?: string | null;
+};

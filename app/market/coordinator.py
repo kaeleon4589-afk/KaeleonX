@@ -44,13 +44,17 @@ class MarketCoordinator:
             await asyncio.sleep(max(.1,self.poll_seconds-(time.monotonic()-started)))
 
 class MultiMarketCoordinator:
-    def __init__(self,client,scanner,poll_seconds=2.0,audit=None,max_parallel=3): self.client=client; self.scanner=scanner; self.poll_seconds=poll_seconds; self.audit=audit; self.max_parallel=max_parallel; self._btc=None; self._cursor=0
+    def __init__(self,client,scanner,poll_seconds=2.0,audit=None,max_parallel=3,heartbeat_seconds=900.0): self.client=client; self.scanner=scanner; self.poll_seconds=poll_seconds; self.audit=audit; self.max_parallel=max_parallel; self.heartbeat_seconds=heartbeat_seconds; self._btc=None; self._cursor=0; self._last_heartbeat=0.0
     async def run(self,on_snapshot):
         base=MarketCoordinator(self.client,'BTC',poll_seconds=self.poll_seconds,audit=self.audit)
         while True:
             started=time.monotonic()
             try:
                 ranked=await self.scanner.ranked(); symbols=[x['symbol'] for x in ranked] or ['BTC']
+                now=time.monotonic()
+                if self.audit and (self._last_heartbeat == 0.0 or now - self._last_heartbeat >= self.heartbeat_seconds):
+                    self.audit.event('ENGINE_HEARTBEAT','system',market='AUTO_COINW',markets_scanned=len(symbols),top_symbols=symbols[:5])
+                    self._last_heartbeat=now
                 if self.audit:
                     self.audit.event('MARKET_BATCH_SELECTED','system',level='DEBUG',persist=False,universe_size=len(symbols),cursor=self._cursor,max_parallel=self.max_parallel,symbols=symbols)
                 try: self._btc=(await base.snapshot('BTC')).candles

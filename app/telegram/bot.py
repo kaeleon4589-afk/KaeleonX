@@ -199,6 +199,7 @@ class TelegramBotService:
             state["challenge_hash"],
             telegram_user_id,
             phone,
+            str(chat_id),
         )
         if not verified:
             await self.clear_keyboard(

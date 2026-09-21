@@ -69,7 +69,13 @@ def _redact(value, key: str | None = None):
     if isinstance(value, dict):
         return {k: _redact(v, k) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
+        # Never dump long indicator/candle/EMA series into Railway logs.  They
+        # can contain hundreds of values and add cost without operational value.
+        if len(value) > 12:
+            return {"_sequence_omitted": True, "count": len(value)}
         return [_redact(v) for v in value]
+    if isinstance(value, str) and len(value) > 1200:
+        return value[:1200] + "…<truncated>"
     return value
 
 

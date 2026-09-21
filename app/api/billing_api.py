@@ -59,6 +59,20 @@ def activate_trial(authorization: str | None = Header(default=None)):
         raise HTTPException(409, str(exc))
 
 
+
+
+@router.get("/orders")
+def user_orders(authorization: str | None = Header(default=None), limit: int = 20):
+    user = current_user(authorization)
+    rows = service().db.find_many(
+        "payment_orders",
+        {"user_id": user["user_id"]},
+        limit=min(max(limit, 1), 100),
+        sort_field="created_at",
+    )
+    return {"items": rows}
+
+
 @router.post("/orders")
 def create_order(req: PaymentOrderRequest, authorization: str | None = Header(default=None)):
     user = current_user(authorization)

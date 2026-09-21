@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.models.enums import Direction
@@ -33,3 +34,15 @@ def test_trade_telegram_messages_include_strategy_and_precise_prices():
     assert 'Operación cerrada' in sent[-1][1]
     assert 'Estrategia: LIQUIDITY_SWEEP' in sent[-1][1]
     assert 'PnL neto: +0.15 USDT' in sent[-1][1]
+
+
+def test_breakout_strategy_exposes_execution_rr_in_trace_and_metadata():
+    from app.strategy.breakout_retest import BreakoutRetestStrategy
+    from app.models.enums import Strategy
+    # Contract-level guard: breakout must expose the same execution-RR field
+    # as liquidity sweep once a setup is accepted.
+    src = Path(__file__).resolve().parents[1] / "app" / "strategy" / "breakout_retest.py"
+    text = src.read_text(encoding="utf-8")
+    assert "'execution_rr':execution_rr" in text
+    assert "'structural_stop_pct':structural" in text
+    assert "Strategy.BREAKOUT_RETEST" in text

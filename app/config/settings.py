@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
     environment: Literal['development','test','staging','production'] = 'development'
     log_level: str = 'INFO'
+    cors_allowed_origins: str = ''
     coinw_rest_base_url: str = 'https://api.coinw.com'
     coinw_ws_url: str = 'wss://ws.futurescw.com/perpum'
     mongodb_uri: str = ''

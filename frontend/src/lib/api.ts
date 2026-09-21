@@ -1,4 +1,4 @@
-import type { AdminDashboard, AdminReferral, AdminUser, Entitlement, Execution, Operations, Performance, ReferralSummary, TradingConfig, User } from '../types';
+import type { AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
@@ -66,6 +66,11 @@ export const api = {
   performance: () => request<Performance>('/user/performance'),
   entitlement: () => request<Entitlement>('/billing/entitlement'),
   activateTrial: () => request<Entitlement>('/billing/live/activate-trial', { method: 'POST' }),
+  billingPlans: () => request<{plans: BillingPlan[]}>('/billing/plans', {}, false),
+  billingOrders: () => request<{items: PaymentOrder[]}>('/billing/orders'),
+  createBillingOrder: (plan_code: string) => request<PaymentOrder>('/billing/orders', {method:'POST', body:JSON.stringify({plan_code})}),
+  submitBillingTx: (payment_order_id: string, tx_hash: string) => request<PaymentOrder>('/billing/orders/tx', {method:'POST', body:JSON.stringify({payment_order_id,tx_hash})}),
+  verifyBillingPayment: (payment_order_id: string, tx_hash: string) => request<{confirmed:boolean;live_state:string;live_expires_at?:string|null}>('/billing/orders/verify', {method:'POST', body:JSON.stringify({payment_order_id,tx_hash})}),
 
   referrals: () => request<ReferralSummary>('/user/referrals'),
   adminMe: () => request<User>('/admin/me'),
@@ -107,6 +112,16 @@ export function humanizeError(error: unknown): string {
     close_live_position_before_switching_to_demo: 'Cierra la posición LIVE antes de volver a Demo.',
     switch_to_demo_before_removing_credentials: 'Cambia a Demo antes de eliminar las credenciales.',
     disable_live_trading_and_close_position_before_changing_credentials: 'Pausa LIVE y cierra la posición antes de cambiar credenciales.',
+    payment_wallet_not_configured: 'La wallet receptora de pagos no está configurada en el backend.',
+    payment_verifier_not_configured: 'El verificador de pagos BSC no está configurado correctamente.',
+    payment_order_expired: 'La orden de pago venció. Crea una nueva.',
+    payment_order_not_found: 'No se encontró la orden de pago.',
+    payment_order_not_verifiable: 'Esta orden ya no puede verificarse.',
+    tx_already_used: 'Ese hash de transacción ya fue utilizado.',
+    tx_not_confirmed: 'La transacción todavía no está confirmada en BNB Smart Chain.',
+    wrong_network: 'La transacción no pertenece a BNB Smart Chain.',
+    amount_or_destination_mismatch: 'El importe o la wallet receptora no coinciden con la orden.',
+    bsc_verification_error: 'No se pudo validar la transacción en BNB Smart Chain. Inténtalo nuevamente.',
   };
   if (detail.startsWith('backend_unreachable:')) {
     const route = detail.slice('backend_unreachable:'.length);

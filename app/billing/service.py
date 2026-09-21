@@ -73,20 +73,24 @@ class BillingService:
         user = self.ensure_account(user_id)
         live_state = str(user.get("live_state", "not_started"))
 
-        if live_state == "trial":
-            expires = user.get("live_trial_expires_at")
-            if expires and _as_utc(expires) > now:
-                return Entitlement(True, True, "trial", _as_utc(expires), "live_trial_active")
+        candidates = []
+        trial_expiry = user.get("live_trial_expires_at")
+        if trial_expiry and _as_utc(trial_expiry) > now:
+            candidates.append((_as_utc(trial_expiry), "trial", "live_trial_active"))
+        subscription_expiry = user.get("subscription_expires_at")
+        if subscription_expiry and _as_utc(subscription_expiry) > now:
+            candidates.append((_as_utc(subscription_expiry), "subscribed", "subscription_active"))
+        manual_expiry = user.get("live_access_until")
+        if manual_expiry and _as_utc(manual_expiry) > now:
+            candidates.append((_as_utc(manual_expiry), "granted", "manual_live_access_active"))
+
+        if candidates:
+            expires, state, reason = max(candidates, key=lambda item: item[0])
+            return Entitlement(True, True, state, expires, reason)
+
+        if live_state in {"trial", "subscribed", "granted"}:
             self.db.upsert("users", {"user_id": user_id}, {"live_state": "expired"})
             live_state = "expired"
-
-        if live_state == "subscribed":
-            expires = user.get("subscription_expires_at")
-            if expires and _as_utc(expires) > now:
-                return Entitlement(True, True, "subscribed", _as_utc(expires), "subscription_active")
-            self.db.upsert("users", {"user_id": user_id}, {"live_state": "expired"})
-            live_state = "expired"
-
         return Entitlement(True, False, live_state, None, "live_not_entitled")
 
     def activate_live_first_time(self, user_id: str, now: Optional[datetime] = None) -> Entitlement:
@@ -164,6 +168,10 @@ class BillingService:
         order = self.db.find_one("payment_orders", {"payment_order_id": payment_order_id})
         if not order:
             raise ValueError("payment_order_not_found")
+        if order.get("status") == "CONFIRMED":
+            if order.get("tx_hash") != tx_hash:
+                raise ValueError("tx_hash_mismatch")
+            return self.entitlement(order["user_id"])
         if order.get("status") == "EXPIRED" or (order.get("expires_at") and _as_utc(order["expires_at"]) <= utcnow()):
             self.db.upsert("payment_orders", {"payment_order_id": payment_order_id}, {"status": "EXPIRED"})
             raise ValueError("payment_order_expired")

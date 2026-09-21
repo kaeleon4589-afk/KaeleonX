@@ -55,6 +55,16 @@ def expiry(hours: int = 24) -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=hours)
 
 
+def as_utc(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class AuthService:
     def __init__(self, db, session_hours: int = 24):
         self.db = db
@@ -103,7 +113,7 @@ class AuthService:
         if not ch:
             return None
         expires_at = ch.get("expires_at")
-        if expires_at and expires_at < datetime.now(timezone.utc):
+        if expires_at and as_utc(expires_at) < datetime.now(timezone.utc):
             return None
         return {
             "challenge_hash": ch["challenge_hash"],
@@ -117,7 +127,7 @@ class AuthService:
 
     def mark_telegram_contact_by_hash(self, challenge_hash: str, telegram_user_id: str, telegram_phone: str) -> bool:
         ch = self.db.find_one("registration_challenges", {"challenge_hash": challenge_hash, "used": False})
-        if not ch or ch.get("expires_at", datetime.now(timezone.utc)) < datetime.now(timezone.utc):
+        if not ch or as_utc(ch.get("expires_at") or datetime.now(timezone.utc)) < datetime.now(timezone.utc):
             return False
         if normalize_phone(telegram_phone) != ch["phone"]:
             return False
@@ -130,7 +140,7 @@ class AuthService:
 
     def verify_registration(self, challenge: str) -> bool:
         ch = self.db.find_one("registration_challenges", {"challenge_hash": token_hash(challenge), "used": False})
-        if not ch or ch.get("expires_at", datetime.now(timezone.utc)) < datetime.now(timezone.utc):
+        if not ch or as_utc(ch.get("expires_at") or datetime.now(timezone.utc)) < datetime.now(timezone.utc):
             return False
         tv = self.db.find_one("telegram_verifications", {"challenge_hash": ch["challenge_hash"], "verified": True})
         if not tv or tv.get("phone") != ch["phone"]:
@@ -147,7 +157,7 @@ class AuthService:
         user = self.db.find_one("users", {"phone": normalized})
         if user and user.get("status") == "suspended":
             ban_until = user.get("ban_until")
-            if ban_until and ban_until <= datetime.now(timezone.utc):
+            if ban_until and as_utc(ban_until) <= datetime.now(timezone.utc):
                 self.db.upsert("users", {"user_id": user["user_id"]}, {"status": "active", "ban_until": None})
                 user = self.db.find_one("users", {"phone": normalized})
         if not user or user.get("status") != "active" or not verify_password(password, user.get("password_hash", "")):
@@ -165,7 +175,7 @@ class AuthService:
         if not token:
             return None
         session = self.db.find_one("sessions", {"token_hash": token_hash(token), "revoked": False})
-        if not session or session.get("expires_at", datetime.now(timezone.utc)) <= datetime.now(timezone.utc):
+        if not session or as_utc(session.get("expires_at") or datetime.now(timezone.utc)) <= datetime.now(timezone.utc):
             return None
         user = self.db.find_one("users", {"user_id": session.get("user_id")})
         if not user or user.get("status") != "active":
@@ -175,9 +185,12 @@ class AuthService:
     def get_current_user(self, token: str):
         """Used by /auth/me, /auth/tutorial, /auth/logout and app/api/user_api.py."""
         session = self.db.find_one("sessions", {"token_hash": token_hash(token), "revoked": False})
-        if not session or session.get("expires_at", datetime.now(timezone.utc)) < datetime.now(timezone.utc):
+        if not session or as_utc(session.get("expires_at") or datetime.now(timezone.utc)) <= datetime.now(timezone.utc):
             return None
-        return self.db.find_one("users", {"user_id": session.get("user_id")})
+        user = self.db.find_one("users", {"user_id": session.get("user_id")})
+        if not user or user.get("status") != "active":
+            return None
+        return user
 
     def public_user(self, user: dict) -> dict:
         return {

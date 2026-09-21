@@ -7,7 +7,7 @@ import type { User } from '../types';
 
 export default function AuthPage({onAuthenticated}:{onAuthenticated:(user:User)=>void}) {
   const [mode,setMode]=useState<'login'|'register'|'verify'>('login');
-  const [phone,setPhone]=useState(''); const [country,setCountry]=useState('+52'); const [password,setPassword]=useState(''); const [showPassword,setShowPassword]=useState(false); const [referral,setReferral]=useState('');
+  const [phone,setPhone]=useState(''); const [country,setCountry]=useState('+52'); const [password,setPassword]=useState(''); const [showPassword,setShowPassword]=useState(false); const [referral,setReferral]=useState(()=>new URLSearchParams(window.location.search).get('ref')||'');
   const [challenge,setChallenge]=useState(''); const [telegramUrl,setTelegramUrl]=useState(''); const [error,setError]=useState(''); const [busy,setBusy]=useState(false);
   const countryValue=useMemo(()=>countries.find(c=>c.dial===country)?.iso||'MX',[country]);
 

@@ -58,9 +58,9 @@ export const api = {
   logout: () => request<{logged_out: boolean}>('/auth/logout', { method: 'POST' }),
   tutorial: (completed = true) => request<{tutorial_completed: boolean}>('/auth/tutorial', { method: 'POST', body: JSON.stringify({ completed }) }),
   config: () => request<TradingConfig>('/user/trading-config'),
-  saveConfig: (body: {execution_mode: 'demo'|'live'; trading_enabled: boolean; operating_capital: number; coinw_api_key?: string; coinw_api_secret?: string}) => request('/user/trading-config', { method: 'PUT', body: JSON.stringify(body) }),
+  saveConfig: (body: {execution_mode: 'demo'|'live'; trading_enabled: boolean; operating_capital?: number; coinw_api_key?: string; coinw_api_secret?: string}) => request('/user/trading-config', { method: 'PUT', body: JSON.stringify(body) }),
   deleteCredentials: () => request('/user/coinw-credentials', { method: 'DELETE' }),
-  testCoinW: () => request<{connected: boolean; available_equity: number; api_key?: string}>('/user/coinw/test', { method: 'POST' }),
+  testCoinW: () => request<{connected: boolean; verified: boolean; available_equity: number; demo_equity: number; api_key?: string}>('/user/coinw/test', { method: 'POST' }),
   execution: () => request<Execution>('/user/execution'),
   operations: () => request<Operations>('/user/operations'),
   performance: () => request<Performance>('/user/performance'),
@@ -84,6 +84,12 @@ export function humanizeError(error: unknown): string {
     coinw_credentials_required_for_live: 'Configura tus credenciales CoinW antes de usar Live Trading.',
     coinw_credentials_not_configured: 'Todavía no has configurado CoinW.',
     operating_capital_below_platform_minimum: 'El capital operativo está por debajo del mínimo permitido.',
+    coinw_verification_required_for_capital: 'Verifica primero tu API Key y API Secret de CoinW para configurar capital.',
+    coinw_verification_required_for_trading: 'Verifica primero tu conexión CoinW antes de activar el trading.',
+    operating_capital_required_before_trading: 'Configura el capital operativo antes de activar el trading.',
+    demo_capital_exceeds_virtual_balance: 'En DEMO el capital no puede superar los 100 USDT virtuales.',
+    live_capital_exceeds_available_balance: 'El capital LIVE supera el saldo USDT disponible en CoinW.',
+    pause_live_before_removing_credentials: 'Pausa LIVE antes de eliminar las credenciales CoinW.',
     close_live_position_before_switching_to_demo: 'Cierra la posición LIVE antes de volver a Demo.',
     switch_to_demo_before_removing_credentials: 'Cambia a Demo antes de eliminar las credenciales.',
     disable_live_trading_and_close_position_before_changing_credentials: 'Pausa LIVE y cierra la posición antes de cambiar credenciales.',
@@ -92,6 +98,7 @@ export function humanizeError(error: unknown): string {
     const route = detail.slice('backend_unreachable:'.length);
     return `No se pudo completar la conexión con el backend en ${route}.`;
   }
+  if (detail.startsWith('coinw_balance_check_failed:')) return `No se pudo verificar el saldo de CoinW: ${detail.slice('coinw_balance_check_failed:'.length)}`;
   if (detail.startsWith('coinw_connection_failed:')) return `CoinW rechazó la conexión: ${detail.slice('coinw_connection_failed:'.length)}`;
   return map[detail] || detail.replaceAll('_', ' ');
 }

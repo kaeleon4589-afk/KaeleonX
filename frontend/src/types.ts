@@ -92,3 +92,45 @@ export type Entitlement = {
   live_expires_at?: string | null;
   reason?: string | null;
 };
+
+export type ReferralItem = {
+  user_id?: string;
+  phone_masked?: string | null;
+  status?: string;
+  created_at?: string;
+  rewarded: boolean;
+  reward_days: number;
+  rewarded_at?: string | null;
+};
+export type ReferralSummary = {
+  referral_code?: string | null;
+  referred_count: number;
+  rewarded_count: number;
+  reward_days_total: number;
+  reward_rules: Record<string, number>;
+  items: ReferralItem[];
+};
+export type AdminDashboard = {
+  users: { total: number; active: number; blocked: number; suspended: number };
+  trading: { open_positions: number; orders: number; decisions: number };
+  payments: { total: number; pending: number; confirmed: number };
+  timestamp: string;
+};
+export type AdminUser = User & {
+  created_at?: string;
+  live_state?: string;
+  subscription_expires_at?: string | null;
+  live_access_until?: string | null;
+  referral_code?: string;
+  referral_reward_days_total?: number;
+};
+export type AdminReferral = {
+  referred_user_id?: string;
+  referred_phone?: string;
+  referrer_user_id?: string;
+  referrer_phone?: string;
+  code?: string;
+  created_at?: string;
+  rewarded?: boolean;
+  reward_days?: number;
+};

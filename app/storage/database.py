@@ -14,7 +14,6 @@ class Database:
         self.db.orders.create_index([('order_id',ASCENDING)])
         self.db.positions.create_index([('position_id',ASCENDING)],unique=True)
         self.db.positions.create_index([('user_id',ASCENDING),('mode',ASCENDING),('status',ASCENDING)])
-        self.db.events.create_index([('created_at',DESCENDING)])
         self.db.pnl.create_index([('position_id',ASCENDING)])
         self.db.users.create_index([('phone',ASCENDING)], unique=True)
         self.db.users.create_index([('user_id',ASCENDING)], unique=True)

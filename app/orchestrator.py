@@ -10,7 +10,8 @@ class TradingOrchestrator:
     """Single decision/execution coordinator with duplicate and restart safeguards."""
 
     def __init__(self, regime_engine, router, risk, execution, db, audit,
-                 position_manager, signal_factory, cooldown_seconds=30):
+                 position_manager, signal_factory, cooldown_seconds=30,
+                 execution_mode=None, on_position_opened=None):
         self.regime_engine = regime_engine
         self.router = router
         self.risk = risk
@@ -22,6 +23,8 @@ class TradingOrchestrator:
         self.cooldown_seconds = cooldown_seconds
         self.last_decision = {}
         self.inflight = set()
+        self.execution_mode = execution_mode or getattr(execution, "mode", "demo")
+        self.on_position_opened = on_position_opened
 
     def _has_open_position(self, symbol, user_id=None):
         return any(
@@ -155,13 +158,15 @@ class TradingOrchestrator:
                 self.position_manager.add(position)
                 self.db.upsert(
                     "positions", {"position_id": position.position_id},
-                    {**position.__dict__, "user_id": user_id},
+                    {**position.__dict__, "user_id": user_id, "mode": self.execution_mode},
                 )
                 self.db.upsert(
                     "orders",
                     {"order_id": result.get("order_id", position.position_id)},
-                    {**result, "decision_id": decision_id, "user_id": user_id},
+                    {**result, "decision_id": decision_id, "user_id": user_id, "mode": self.execution_mode},
                 )
+                if self.on_position_opened:
+                    self.on_position_opened(position)
 
             self.last_decision[key] = now
             return result

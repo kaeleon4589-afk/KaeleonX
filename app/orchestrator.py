@@ -107,16 +107,43 @@ class TradingOrchestrator:
                 snapshot.timeframe, snapshot.last, snapshot=snapshot,
             )
             strategy_trace = getattr(self.router, "last_trace", {}) or {}
+
+            # Keep production logs operationally useful.  Strategy internals can
+            # contain many nested checks; Railway only needs the selected model
+            # and the final reason/score.  Full traces remain available in-memory
+            # via the engine state when needed for targeted debugging.
+            selected_strategy = strategy_trace.get("selected")
+            selected_reason = strategy_trace.get("reason")
+            compact_trace = {
+                "selected": selected_strategy,
+                "reason": selected_reason,
+            }
+            for name in ("breakout", "sweep"):
+                branch = strategy_trace.get(name)
+                if isinstance(branch, dict):
+                    compact_trace[name] = {
+                        k: branch.get(k) for k in ("accepted", "reason", "score", "side", "direction")
+                        if k in branch
+                    }
+
             self.audit.event(
                 "STRATEGY_EVALUATED", decision_id, user_id=user_id, mode=self.execution_mode,
-                symbol=snapshot.symbol, regime=regime_meta.get("active"), trace=strategy_trace,
+                symbol=snapshot.symbol, regime=regime_meta.get("active"), trace=compact_trace,
             )
             if not intent:
                 self.last_decision[key] = now
+                # Surface one concise rejection reason instead of the full nested
+                # strategy trace.  Prefer the branch that actually ran.
+                rejection_reason = "no_valid_setup"
+                for name in ("breakout", "sweep"):
+                    branch = strategy_trace.get(name)
+                    if isinstance(branch, dict) and branch.get("reason") not in (None, "not_run", "regime_breakout_not_allowed", "regime_sweep_not_allowed"):
+                        rejection_reason = str(branch.get("reason"))
+                        break
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id, mode=self.execution_mode,
                     symbol=snapshot.symbol, regime=regime_meta.get("active"),
-                    reason="no_valid_setup", strategy_trace=strategy_trace,
+                    reason=rejection_reason,
                 )
                 return None
 

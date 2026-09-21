@@ -1,6 +1,6 @@
 import type { Entitlement, Execution, Operations, Performance, TradingConfig, User } from '../types';
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'https://kaeleonx-production.up.railway.app').replace(/\/$/, '');
+const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
 
 export const session = {

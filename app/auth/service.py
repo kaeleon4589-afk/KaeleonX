@@ -163,10 +163,10 @@ class AuthService:
             "expires_at": expires_at,
         }
 
-    def mark_telegram_contact(self, challenge: str, telegram_user_id: str, telegram_phone: str) -> bool:
-        return self.mark_telegram_contact_by_hash(token_hash(challenge), telegram_user_id, telegram_phone)
+    def mark_telegram_contact(self, challenge: str, telegram_user_id: str, telegram_phone: str, telegram_chat_id: str | None = None) -> bool:
+        return self.mark_telegram_contact_by_hash(token_hash(challenge), telegram_user_id, telegram_phone, telegram_chat_id)
 
-    def mark_telegram_contact_by_hash(self, challenge_hash: str, telegram_user_id: str, telegram_phone: str) -> bool:
+    def mark_telegram_contact_by_hash(self, challenge_hash: str, telegram_user_id: str, telegram_phone: str, telegram_chat_id: str | None = None) -> bool:
         ch = self.db.find_one("registration_challenges", {"challenge_hash": challenge_hash, "used": False})
         if not ch or as_utc(ch.get("expires_at") or datetime.now(timezone.utc)) < datetime.now(timezone.utc):
             return False
@@ -174,7 +174,7 @@ class AuthService:
             return False
         self.db.upsert("telegram_verifications", {"challenge_hash": ch["challenge_hash"]}, {
             "challenge_hash": ch["challenge_hash"], "user_id": ch["user_id"],
-            "telegram_user_id": str(telegram_user_id), "phone": ch["phone"],
+            "telegram_user_id": str(telegram_user_id), "telegram_chat_id": str(telegram_chat_id or telegram_user_id), "phone": ch["phone"],
             "verified": True, "verified_at": datetime.now(timezone.utc),
         })
         return True
@@ -188,7 +188,9 @@ class AuthService:
             return False
         self.db.upsert("users", {"user_id": ch["user_id"]}, {
             "status": "active", "telegram_verified": True,
-            "telegram_user_id": tv["telegram_user_id"], "verified_at": datetime.now(timezone.utc)
+            "telegram_user_id": tv["telegram_user_id"],
+            "telegram_chat_id": tv.get("telegram_chat_id") or tv["telegram_user_id"],
+            "verified_at": datetime.now(timezone.utc)
         })
         self.db.upsert("registration_challenges", {"challenge_hash": ch["challenge_hash"]}, {"used": True})
         return True

@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     mongodb_database: str = 'kaeleon'
     default_symbol: str = 'BTC'
     default_timeframe: str = '5m'
-    paper_initial_equity: float = Field(10000, gt=0)
+    paper_initial_equity: float = Field(100, gt=0)
     paper_taker_fee: float = Field(.0006, ge=0)
     paper_maker_fee: float = Field(.0001, ge=0)
     paper_slippage_bps: float = Field(2.0, ge=0)

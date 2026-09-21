@@ -35,7 +35,7 @@ async def run():
     runtimes = UserTradingRuntimeManager(s, db, audit, profiles)
     client = CoinWMarketClient(s.coinw_rest_base_url)
     scanner = CoinWMarketScanner(
-        client, depth=s.market_scanner_depth, cache_seconds=s.market_scanner_cache_seconds
+        client, depth=s.market_scanner_depth, cache_seconds=s.market_scanner_cache_seconds, audit=audit
     )
     market = MultiMarketCoordinator(
         client, scanner, poll_seconds=s.market_poll_seconds, audit=audit,

@@ -52,7 +52,7 @@ class UserTradingRuntimeManager:
         self.profiles = profile_service
         self.billing = BillingService(db, trial_days=settings.live_trial_days)
         self.signal_factory = SignalFactory()
-        self.notifier = TelegramTradeNotifier(settings, db, AuthService(db))
+        self.notifier = TelegramTradeNotifier(settings, db, AuthService(db), audit=audit)
         self._runtimes: dict[str, UserRuntime] = {}
         self._last_refresh = 0.0
         self._lock = asyncio.Lock()
@@ -138,7 +138,7 @@ class UserTradingRuntimeManager:
                     exit_reason=row.get("exit_reason"),
                 )
             except (KeyError, TypeError, ValueError) as exc:
-                self.audit.event("POSITION_RESTORE_ERROR", user_id, position_id=row.get("position_id"), error=str(exc))
+                self.audit.event("POSITION_RESTORE_ERROR", user_id, user_id=user_id, mode=mode, position_id=row.get("position_id"), error=str(exc))
 
         orchestrator = TradingOrchestrator(
             RegimeEngine(),
@@ -194,7 +194,7 @@ class UserTradingRuntimeManager:
                 try:
                     self._runtimes[uid] = await self._build_runtime(uid, profile, fp)
                 except Exception as exc:
-                    self.audit.event("USER_RUNTIME_CONFIG_ERROR", uid, error=str(exc))
+                    self.audit.event("USER_RUNTIME_CONFIG_ERROR", uid, user_id=uid, error=str(exc))
                     self._runtimes.pop(uid, None)
 
             for uid in list(self._runtimes):
@@ -206,6 +206,7 @@ class UserTradingRuntimeManager:
         await self.refresh()
         for runtime in list(self._runtimes.values()):
             try:
+                self.audit.event('USER_MARKET_ANALYSIS_START', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, trading_enabled=runtime.trading_enabled, configured_capital=runtime.configured_capital)
                 live_allowed = True
                 if runtime.mode == TradingEnvironment.LIVE.value:
                     live_allowed = self.billing.entitlement(runtime.user_id).live_allowed
@@ -220,14 +221,18 @@ class UserTradingRuntimeManager:
 
                 effective_capital = min(runtime.configured_capital, float(available_equity))
                 if effective_capital < self.settings.min_operating_capital:
-                    self._persist_state(runtime, available_equity, effective_capital, "INSUFFICIENT_CAPITAL")
+                    self.audit.event('ENTRY_BLOCKED', runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='insufficient_capital', effective_capital=effective_capital, minimum=self.settings.min_operating_capital)
+                    self._persist_state(runtime, available_equity, effective_capital, "INSUFFICIENT_CAPITAL", snapshot)
                     continue
 
+                allow_entries = runtime.trading_enabled and live_allowed
+                if not allow_entries:
+                    self.audit.event('ENTRY_BLOCKED', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='trading_paused' if not runtime.trading_enabled else 'live_not_entitled')
                 result = await runtime.orchestrator.on_snapshot(
                     snapshot,
                     effective_capital,
                     user_id=runtime.user_id,
-                    allow_entries=runtime.trading_enabled and live_allowed,
+                    allow_entries=allow_entries,
                 )
                 if runtime.mode == TradingEnvironment.LIVE.value and not live_allowed:
                     status = "LIVE_NO_ENTITLED"
@@ -235,12 +240,12 @@ class UserTradingRuntimeManager:
                     status = "ACTIVO" if runtime.trading_enabled else "PAUSADO"
                 if result and result.get("filled"):
                     status = "OPERANDO"
-                self._persist_state(runtime, available_equity, effective_capital, status)
+                self._persist_state(runtime, available_equity, effective_capital, status, snapshot)
             except Exception as exc:
-                self.audit.event("USER_RUNTIME_ERROR", runtime.user_id, symbol=snapshot.symbol, error=str(exc))
-                self._persist_state(runtime, 0.0, 0.0, "ERROR")
+                self.audit.event("USER_RUNTIME_ERROR", runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, error=str(exc))
+                self._persist_state(runtime, 0.0, 0.0, "ERROR", snapshot)
 
-    def _persist_state(self, runtime: UserRuntime, available_equity: float, effective_capital: float, status: str) -> None:
+    def _persist_state(self, runtime: UserRuntime, available_equity: float, effective_capital: float, status: str, snapshot=None) -> None:
         open_position = next(
             (p.__dict__ for p in runtime.position_manager.positions.values() if p.status == "OPEN"),
             None,
@@ -248,6 +253,8 @@ class UserTradingRuntimeManager:
         positions = self.db.find_many("positions", {"user_id": runtime.user_id, "mode": runtime.mode}, limit=10000)
         metrics = calculate_performance(positions, runtime.configured_capital)
         state_key = {"user_id": runtime.user_id, "mode": runtime.mode.upper()}
+        regime_meta = getattr(runtime.orchestrator.regime_engine, 'last_metadata', {}) or {}
+        strategy_trace = getattr(runtime.orchestrator.router, 'last_trace', {}) or {}
         self.db.upsert("user_engine_state", state_key, {
             "user_id": runtime.user_id,
             "mode": runtime.mode.upper(),
@@ -258,5 +265,14 @@ class UserTradingRuntimeManager:
             "trading_enabled": runtime.trading_enabled,
             "coinw_connected": self.profiles.public(runtime.user_id).coinw_verified,
             "open_position": open_position,
+            "markets_scanned": int(getattr(snapshot, 'markets_scanned', 0) or 0),
+            "candidates": int(getattr(snapshot, 'candidates', 0) or 0),
+            "last_symbol": getattr(snapshot, 'symbol', None),
+            "last_price": getattr(snapshot, 'last', None),
+            "regime": regime_meta.get('active'),
+            "regime_candidate": regime_meta.get('candidate'),
+            "regime_confidence": regime_meta.get('confidence'),
+            "strategy": strategy_trace.get('selected'),
+            "last_strategy_trace": strategy_trace,
             **metrics,
         })

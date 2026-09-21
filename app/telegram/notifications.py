@@ -28,8 +28,9 @@ class TelegramTradeNotifier:
     a Telegram outage cannot block the trading engine.
     """
 
-    def __init__(self, settings, db, auth):
+    def __init__(self, settings, db, auth, audit=None):
         self.db = db
+        self.audit = audit
         self.enabled = bool(settings.telegram_enabled and settings.telegram_bot_token)
         self.bot = TelegramBotService(
             auth,
@@ -48,21 +49,26 @@ class TelegramTradeNotifier:
 
     def _schedule(self, user_id: str, text: str) -> None:
         if not self.bot:
+            if self.audit:self.audit.event('TELEGRAM_NOTIFY_SKIPPED', user_id, level='DEBUG', user_id=user_id, reason='bot_disabled')
             return
         chat_id = self._chat_id(user_id)
         if not chat_id:
+            if self.audit:self.audit.event('TELEGRAM_NOTIFY_SKIPPED', user_id, user_id=user_id, reason='chat_id_missing')
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             logger.warning("No running loop for Telegram trade notification user=%s", user_id)
             return
+        if self.audit:self.audit.event('TELEGRAM_NOTIFY_QUEUED', user_id, level='DEBUG', user_id=user_id, message_type='trade')
         loop.create_task(self._send(chat_id, text, user_id))
 
     async def _send(self, chat_id: str, text: str, user_id: str) -> None:
         try:
             await self.bot.send_message(chat_id, text)
-        except Exception:
+            if self.audit:self.audit.event('TELEGRAM_NOTIFY_SENT', user_id, user_id=user_id, status='sent')
+        except Exception as exc:
+            if self.audit:self.audit.event('TELEGRAM_NOTIFY_FAILED', user_id, level='ERROR', user_id=user_id, status='failed', error=str(exc))
             logger.exception("Unable to send Telegram trade notification user=%s", user_id)
 
     def position_opened(self, user_id: str, mode: str, position: Any) -> None:

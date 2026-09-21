@@ -51,15 +51,22 @@ class MultiMarketCoordinator:
             started=time.monotonic()
             try:
                 ranked=await self.scanner.ranked(); symbols=[x['symbol'] for x in ranked] or ['BTC']
+                if self.audit:
+                    self.audit.event('MARKET_BATCH_SELECTED','system',level='DEBUG',persist=False,universe_size=len(symbols),cursor=self._cursor,max_parallel=self.max_parallel,symbols=symbols)
                 try: self._btc=(await base.snapshot('BTC')).candles
-                except Exception: pass
+                except Exception as exc:
+                    if self.audit:self.audit.event('BTC_CONTEXT_ERROR','system',level='WARNING',error=str(exc))
                 batch=symbols[self._cursor:self._cursor+self.max_parallel]
                 if not batch: self._cursor=0; batch=symbols[:self.max_parallel]
                 self._cursor=(self._cursor+len(batch))%max(len(symbols),1)
+                if self.audit:self.audit.event('MARKET_BATCH_START','system',level='DEBUG',persist=False,batch=batch)
                 snaps=await asyncio.gather(*(base.snapshot(s,self._btc) for s in batch),return_exceptions=True)
                 for snap in snaps:
                     if isinstance(snap,Exception):
                         if self.audit:self.audit.event('MARKET_SNAPSHOT_ERROR','system',error=str(snap)); continue
+                    snap.markets_scanned=len(symbols)
+                    snap.candidates=len(ranked)
+                    snap.scan_batch=list(batch)
                     r=on_snapshot(snap); await r if hasattr(r,'__await__') else None
             except Exception as exc:
                 if self.audit:self.audit.event('MARKET_LOOP_ERROR','system',error=str(exc),symbol='MULTI')

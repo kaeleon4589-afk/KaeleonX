@@ -5,12 +5,13 @@ import AuthPage from './pages/AuthPage';
 import DashboardPage from './pages/DashboardPage';
 import AdminPage from './pages/AdminPage';
 import SubscriptionPage from './pages/SubscriptionPage';
+import ActivityPage from './pages/ActivityPage';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(Boolean(session.get()));
   const [isAdmin, setIsAdmin] = useState(false);
-  const [page, setPage] = useState<'dashboard'|'admin'|'subscription'>(() => window.location.pathname.startsWith('/admin') ? 'admin' : window.location.pathname.startsWith('/subscription') ? 'subscription' : 'dashboard');
+  const [page, setPage] = useState<'dashboard'|'admin'|'subscription'|'activity'>(() => window.location.pathname.startsWith('/admin') ? 'admin' : window.location.pathname.startsWith('/subscription') ? 'subscription' : window.location.pathname.startsWith('/activity') ? 'activity' : 'dashboard');
 
   useEffect(() => {
     if (!session.get()) return;
@@ -21,5 +22,6 @@ export default function App() {
   if (!user) return <AuthPage onAuthenticated={async u => { setUser(u); try { await api.adminMe(); setIsAdmin(true); } catch { setIsAdmin(false); } }} />;
   if (page === 'admin' && isAdmin) return <AdminPage user={user} onBack={() => { history.pushState({}, '', '/'); setPage('dashboard'); }} />;
   if (page === 'subscription') return <SubscriptionPage user={user} onBack={() => { history.pushState({}, '', '/'); setPage('dashboard'); }} />;
-  return <DashboardPage user={user} isAdmin={isAdmin} onOpenAdmin={() => { history.pushState({}, '', '/admin'); setPage('admin'); }} onOpenSubscription={() => { history.pushState({}, '', '/subscription'); setPage('subscription'); }} onSignedOut={() => { setUser(null); setIsAdmin(false); }} />;
+  if (page === 'activity') return <ActivityPage user={user} onBack={() => { history.pushState({}, '', '/'); setPage('dashboard'); }} />;
+  return <DashboardPage user={user} isAdmin={isAdmin} onOpenAdmin={() => { history.pushState({}, '', '/admin'); setPage('admin'); }} onOpenSubscription={() => { history.pushState({}, '', '/subscription'); setPage('subscription'); }} onOpenActivity={() => { history.pushState({}, '', '/activity'); setPage('activity'); }} onSignedOut={() => { setUser(null); setIsAdmin(false); }} />;
 }

@@ -148,3 +148,22 @@ export type PaymentOrder = {
   expires_at?: string;
   tx_hash?: string | null;
 };
+
+export type ActivityEvent = {
+  ts?: string;
+  created_at?: string;
+  event: string;
+  decision_id?: string | null;
+  user_id?: string;
+  mode?: string;
+  symbol?: string;
+  strategy?: string;
+  reason?: string;
+  state?: string;
+  regime?: string;
+  quality?: number;
+  score?: number;
+  approved?: boolean;
+  [key: string]: unknown;
+};
+export type ActivityResponse = { mode: string; items: ActivityEvent[]; count: number };

@@ -1,4 +1,4 @@
-import type { AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
+import type { ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
@@ -64,6 +64,7 @@ export const api = {
   execution: () => request<Execution>('/user/execution'),
   operations: () => request<Operations>('/user/operations'),
   performance: () => request<Performance>('/user/performance'),
+  activity: (limit = 120, mode?: string) => request<ActivityResponse>(`/user/activity?limit=${limit}${mode ? `&mode=${encodeURIComponent(mode)}` : ''}`),
   entitlement: () => request<Entitlement>('/billing/entitlement'),
   activateTrial: () => request<Entitlement>('/billing/live/activate-trial', { method: 'POST' }),
   billingPlans: () => request<{plans: BillingPlan[]}>('/billing/plans', {}, false),

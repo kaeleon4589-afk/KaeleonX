@@ -180,11 +180,34 @@ class TradingOrchestrator:
                 )
                 return None
 
+            # Execution requires a usable live order book even in DEMO because
+            # demo fills are simulated against CoinW bid/ask. Missing depth must
+            # reject the execution, never crash the runtime.
+            try:
+                market_bid = float(snapshot.bid)
+                market_ask = float(snapshot.ask)
+            except (TypeError, ValueError):
+                market_bid = 0.0
+                market_ask = 0.0
+            if market_bid <= 0 or market_ask <= 0:
+                self.last_decision[key] = now
+                result = {'accepted': False, 'filled': False, 'reason': 'market_unavailable'}
+                self.db.upsert(
+                    "decisions", {"decision_id": decision_id},
+                    {"execution": result, "status": "EXECUTION_REJECTED"},
+                )
+                self.audit.event(
+                    "EXECUTION_REJECTED", decision_id, user_id=user_id,
+                    mode=self.execution_mode, symbol=snapshot.symbol,
+                    reason='market_unavailable', orderbook_valid=getattr(snapshot, 'orderbook_valid', False),
+                )
+                return result
+
             result = self.execution.submit(
                 intent, risk.quantity,
                 {
-                    "bid": snapshot.bid,
-                    "ask": snapshot.ask,
+                    "bid": market_bid,
+                    "ask": market_ask,
                     "last": snapshot.last,
                     "ts": now_ms,
                 },

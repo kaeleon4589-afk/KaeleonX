@@ -1,6 +1,7 @@
 from uuid import uuid4
 import inspect
 import time
+import math
 
 from app.models.trading import Position
 from app.models.enums import Direction
@@ -119,12 +120,35 @@ class TradingOrchestrator:
                 )
                 return None
 
+            entry = float(intent.entry_price)
+            stop = float(intent.stop_price)
+            target = float(intent.target_price)
+            risk_distance = abs(entry - stop)
+            reward_distance = abs(target - entry)
+            execution_rr = reward_distance / max(risk_distance, 1e-12)
+            geometry_ok = (
+                math.isfinite(execution_rr) and execution_rr > 0 and
+                ((intent.direction == Direction.LONG and stop < entry < target) or
+                 (intent.direction == Direction.SHORT and target < entry < stop))
+            )
+            if not geometry_ok:
+                self.last_decision[key] = now
+                self.audit.event(
+                    "SIGNAL_REJECTED", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    reason="invalid_trade_geometry", entry_price=entry, stop_price=stop,
+                    target_price=target, execution_rr=execution_rr,
+                )
+                return None
+
+            structural_rr = (getattr(intent, "metadata", {}) or {}).get("structural_rr_estimate")
             self.audit.event(
                 "SIGNAL_ACCEPTED", decision_id, user_id=user_id, mode=self.execution_mode,
                 symbol=snapshot.symbol, strategy=getattr(intent.strategy, "value", str(intent.strategy)),
-                direction=getattr(intent.direction, "value", str(intent.direction)), quality=intent.quality,
-                entry_price=intent.entry_price, stop_price=intent.stop_price, target_price=intent.target_price,
-                risk_multiplier=intent.risk_multiplier, metadata=getattr(intent, "metadata", {}),
+                direction=getattr(intent.direction, "value", str(intent.direction)), quality=round(float(intent.quality), 2),
+                entry_price=entry, stop_price=stop, target_price=target,
+                execution_rr=round(execution_rr, 4), structural_rr=structural_rr,
+                risk_multiplier=intent.risk_multiplier,
             )
             risk = self.risk.evaluate(
                 intent,
@@ -198,6 +222,12 @@ class TradingOrchestrator:
                         opened_at=raw.get("opened_at"),
                         entry_fee=float(raw.get("entry_fee", 0)),
                     )
+                strategy_name = getattr(intent.strategy, "value", str(intent.strategy))
+                position.strategy = strategy_name
+                position.quality = round(float(intent.quality), 2)
+                position.execution_rr = round(execution_rr, 4)
+                if structural_rr is not None:
+                    position.structural_rr = structural_rr
                 self.position_manager.add(position)
                 self.db.upsert(
                     "positions", {"position_id": position.position_id},
@@ -213,7 +243,7 @@ class TradingOrchestrator:
                     symbol=position.symbol, position_id=position.position_id,
                     direction=getattr(position.direction, "value", str(position.direction)),
                     quantity=position.quantity, entry_price=position.entry_price, stop_price=position.stop_price,
-                    target_price=position.target_price, strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    target_price=position.target_price, strategy=strategy_name, execution_rr=round(execution_rr, 4),
                 )
                 if self.on_position_opened:
                     self.on_position_opened(position)

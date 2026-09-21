@@ -112,7 +112,7 @@ class UserTradingRuntimeManager:
                 direction = row.get("direction")
                 if not isinstance(direction, Direction):
                     direction = Direction(str(direction))
-                position_manager.positions[str(row["position_id"])] = Position(
+                restored = Position(
                     position_id=str(row["position_id"]),
                     decision_id=str(row.get("decision_id", "RECOVERED")),
                     symbol=str(row.get("symbol", "")),
@@ -137,6 +137,10 @@ class UserTradingRuntimeManager:
                     exit_price=row.get("exit_price"),
                     exit_reason=row.get("exit_reason"),
                 )
+                for attr in ("strategy", "quality", "execution_rr", "structural_rr"):
+                    if row.get(attr) is not None:
+                        setattr(restored, attr, row.get(attr))
+                position_manager.positions[str(row["position_id"])] = restored
             except (KeyError, TypeError, ValueError) as exc:
                 self.audit.event("POSITION_RESTORE_ERROR", user_id, user_id=user_id, mode=mode, position_id=row.get("position_id"), error=str(exc))
 

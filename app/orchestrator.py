@@ -74,12 +74,29 @@ class TradingOrchestrator:
         try:
             regime = self.regime_engine.evaluate_snapshot(snapshot)
             regime_meta = getattr(self.regime_engine, "last_metadata", {}) or {}
+            # Keep INFO regime logs intentionally compact.  Full EMA/indicator
+            # series are useful for calculation but extremely noisy/costly in Railway.
+            rf = regime_meta.get("features") or {}
+            rs = regime_meta.get("state") or {}
+            feature_summary = {
+                k: rf.get(k) for k in (
+                    "adx", "choppiness", "efficiency_ratio", "atr_pct",
+                    "wick_instability", "body_quality", "breakout_failure_ratio",
+                    "ema_stack_alignment", "trend_bias", "btc_shock_ratio",
+                ) if k in rf
+            }
+            state_summary = {
+                k: rs.get(k) for k in (
+                    "active", "candidate", "pending", "pending_count",
+                    "bars", "cooldown", "changed",
+                ) if k in rs
+            }
             self.audit.event(
                 "REGIME_EVALUATED", decision_id, user_id=user_id, mode=self.execution_mode,
                 symbol=snapshot.symbol, state=regime.global_state.value, score=regime.core_score,
                 candidate=regime_meta.get("candidate"), active=regime_meta.get("active"),
                 confidence=regime_meta.get("confidence"), scores=regime_meta.get("scores"),
-                features=regime_meta.get("features"), state_machine=regime_meta.get("state"),
+                features=feature_summary, state_machine=state_summary,
                 breakout_allowed=regime.breakout_allowed, sweep_allowed=regime.sweep_allowed,
                 hard_block=regime.hard_block, risk_multiplier=regime.risk_multiplier,
             )

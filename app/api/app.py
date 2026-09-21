@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 
 from fastapi import FastAPI
@@ -16,6 +17,7 @@ from app.security.credential_vault import CredentialVault
 from app.telegram.bot import TelegramBotService, TelegramBotError
 
 logger = logging.getLogger("kaeleon.api")
+_worker_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -54,7 +56,41 @@ async def lifespan(app: FastAPI):
                 logger.info("Telegram webhook configured for @%s", me.get("username") or settings.telegram_bot_username)
             except (TelegramBotError, Exception):
                 logger.exception("Unable to configure Telegram webhook during startup")
-    yield
+
+    global _worker_task
+    if settings.trading_worker_enabled:
+        from app.main import run as run_trading_worker
+
+        async def _supervise_worker():
+            from app.logging.logger import AuditLogger
+            audit = AuditLogger()
+            while True:
+                try:
+                    audit.event('WORKER_STARTED', 'system', embedded=True, market='AUTO_COINW')
+                    await run_trading_worker()
+                    audit.event('WORKER_STOPPED', 'system', embedded=True, reason='worker_returned')
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    audit.event('WORKER_STOPPED', 'system', embedded=True, reason='shutdown')
+                    raise
+                except Exception as exc:
+                    audit.event('WORKER_CRASHED', 'system', error=str(exc), embedded=True)
+                    await asyncio.sleep(10)
+
+        _worker_task = asyncio.create_task(_supervise_worker(), name='kaeleon-trading-worker')
+    else:
+        logger.warning("Trading worker is disabled; API will run but no market analysis or trades will execute. Set TRADING_WORKER_ENABLED=true for a single-service Railway deployment.")
+
+    try:
+        yield
+    finally:
+        if _worker_task is not None:
+            _worker_task.cancel()
+            try:
+                await _worker_task
+            except asyncio.CancelledError:
+                pass
+            _worker_task = None
 
 
 app = FastAPI(title="KAELEON API", version="0.12.0", lifespan=lifespan)
@@ -89,4 +125,6 @@ def health():
         "version": "0.12.0",
         "telegram_verification": "configured" if telegram_configured else "disabled_or_unconfigured",
         "credential_vault": vault_status,
+        "trading_worker_enabled": settings.trading_worker_enabled,
+        "trading_worker_running": bool(_worker_task and not _worker_task.done()),
     }

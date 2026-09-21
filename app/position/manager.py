@@ -69,7 +69,7 @@ class PositionManager:
                 p.unrealized_pnl = 0.0
                 self._persist(p)
                 if self.audit:
-                    self.audit.event('POSITION_CLOSED', p.decision_id, user_id=self.owner_user_id, mode=self.owner_mode, position_id=p.position_id, symbol=p.symbol, direction=getattr(p.direction,'value',str(p.direction)), reason=p.exit_reason, exit_price=p.exit_price, realized_pnl=p.realized_pnl)
+                    self.audit.event('POSITION_CLOSED', p.decision_id, user_id=self.owner_user_id, mode=self.owner_mode, position_id=p.position_id, symbol=p.symbol, direction=getattr(p.direction,'value',str(p.direction)), reason=p.exit_reason, exit_price=p.exit_price, realized_pnl=p.realized_pnl, strategy=getattr(p,'strategy',None), execution_rr=getattr(p,'execution_rr',None))
                 if self.on_closed:
                     self.on_closed(p)
                 continue
@@ -143,7 +143,7 @@ class PositionManager:
                 self.on_realized(p, gross, qty, price)
             self._audit(action, p, price, qty, gross)
             if self.audit:
-                self.audit.event('POSITION_CLOSED', p.decision_id, user_id=self.owner_user_id, mode=self.owner_mode, position_id=p.position_id, symbol=p.symbol, direction=getattr(p.direction,'value',str(p.direction)), reason=action, exit_price=price, quantity=qty, realized_pnl=p.realized_pnl, gross_pnl=gross)
+                self.audit.event('POSITION_CLOSED', p.decision_id, user_id=self.owner_user_id, mode=self.owner_mode, position_id=p.position_id, symbol=p.symbol, direction=getattr(p.direction,'value',str(p.direction)), reason=action, exit_price=price, quantity=qty, realized_pnl=p.realized_pnl, gross_pnl=gross, strategy=getattr(p,'strategy',None), execution_rr=getattr(p,'execution_rr',None))
             if self.on_closed:
                 self.on_closed(p)
         self._persist(p)

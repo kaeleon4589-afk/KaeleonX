@@ -39,7 +39,7 @@ async def run():
     )
     market = MultiMarketCoordinator(
         client, scanner, poll_seconds=s.market_poll_seconds, audit=audit,
-        max_parallel=s.market_scanner_parallel,
+        max_parallel=s.market_scanner_parallel, heartbeat_seconds=s.engine_heartbeat_seconds,
     )
 
     async def on_snapshot(snapshot):

@@ -1,0 +1,16 @@
+import type { SVGProps } from 'react';
+const P = ({children, ...props}: SVGProps<SVGSVGElement>) => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>{children}</svg>;
+export const HomeIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="m3 11 9-8 9 8v9a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z"/></P>;
+export const BoltIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M13 2 4 14h7l-1 8 10-13h-7Z"/></P>;
+export const ChartIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M4 19V9m5 10V5m5 14v-7m5 7V3"/></P>;
+export const SwapIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M7 7h12l-3-3m3 3-3 3M17 17H5l3 3m-3-3 3-3"/></P>;
+export const GearIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v4H21a1.7 1.7 0 0 0-1.6 1Z"/></P>;
+export const BellIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></P>;
+export const UserIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></P>;
+export const WalletIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M3 7h16a2 2 0 0 1 2 2v10H5a2 2 0 0 1-2-2V7Zm0 0 13-4v4m1 6h4"/></P>;
+export const EyeIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></P>;
+export const ShieldIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M12 3 4 6v6c0 5 3.4 8.3 8 9 4.6-.7 8-4 8-9V6Z"/><path d="m9 12 2 2 4-4"/></P>;
+export const PlayIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="m9 6 9 6-9 6Z"/></P>;
+export const PauseIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M9 5v14M15 5v14"/></P>;
+export const CheckIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="m5 12 4 4L19 6"/></P>;
+export const RefreshIcon=(p:SVGProps<SVGSVGElement>)=><P {...p}><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18 10a7 7 0 0 0-12-3M6 14a7 7 0 0 0 12 3"/></P>;

@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth_api import router as auth_router
 from app.api.admin_api import router as admin_router
@@ -19,6 +20,11 @@ logger = logging.getLogger("kaeleon.api")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    if settings.environment == "production":
+        if not settings.mongodb_uri.strip():
+            raise RuntimeError("mongodb_uri_required_in_production")
+        if not settings.credential_encryption_key.strip():
+            raise RuntimeError("credential_encryption_key_required_in_production")
     if settings.telegram_enabled:
         if not settings.telegram_registration_configured:
             logger.error("Telegram registration verification is enabled but the required Telegram configuration is incomplete")
@@ -45,6 +51,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="KAELEON API", version="0.12.0", lifespan=lifespan)
+_cors_origins = [origin.strip() for origin in get_settings().cors_allowed_origins.split(",") if origin.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 app.include_router(auth_router)
 app.include_router(telegram_router)
 app.include_router(admin_router)

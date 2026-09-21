@@ -4,7 +4,8 @@ from app.models.trading import Position
 
 class PositionManager:
     def __init__(self, exit_engine, audit=None, on_realized=None, db=None,
-                 evaluate_local_exits=True, owner_user_id=None):
+                 evaluate_local_exits=True, owner_user_id=None, owner_mode=None,
+                 on_closed=None):
         self.exit_engine = exit_engine
         self.positions = {}
         self.audit = audit
@@ -12,6 +13,8 @@ class PositionManager:
         self.db = db
         self.evaluate_local_exits = evaluate_local_exits
         self.owner_user_id = owner_user_id
+        self.owner_mode = owner_mode
+        self.on_closed = on_closed
 
     def add(self, position):
         if position.remaining_quantity is None:
@@ -65,6 +68,8 @@ class PositionManager:
                 p.remaining_quantity = 0.0
                 p.unrealized_pnl = 0.0
                 self._persist(p)
+                if self.on_closed:
+                    self.on_closed(p)
                 continue
 
             entry = float(row.get('openPrice') or row.get('avgPrice') or p.entry_price)
@@ -135,6 +140,8 @@ class PositionManager:
             if self.on_realized:
                 self.on_realized(p, gross, qty, price)
             self._audit(action, p, price, qty, gross)
+            if self.on_closed:
+                self.on_closed(p)
         self._persist(p)
 
     @staticmethod
@@ -150,6 +157,8 @@ class PositionManager:
             document = dict(p.__dict__)
             if self.owner_user_id:
                 document['user_id'] = self.owner_user_id
+            if self.owner_mode:
+                document['mode'] = self.owner_mode
             self.db.upsert('positions', {'position_id': p.position_id}, document)
 
     def _audit(self, event, p, price, qty, gross):

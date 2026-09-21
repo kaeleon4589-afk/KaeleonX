@@ -7,6 +7,7 @@ from typing import Optional
 from app.referrals import new_referral_code, attach_referral
 
 E164_MAX = 15
+SCRYPT_MAXMEM = 64 * 1024 * 1024
 
 
 def normalize_phone(phone: str, country_code: str = "") -> str:
@@ -28,7 +29,7 @@ def hash_password(password: str) -> str:
     if len(password) < 8:
         raise ValueError("password_too_short")
     salt = secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**15, r=8, p=1)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**15, r=8, p=1, maxmem=SCRYPT_MAXMEM)
     return f"scrypt$32768$8$1${salt.hex()}${digest.hex()}"
 
 
@@ -37,7 +38,14 @@ def verify_password(password: str, encoded: str) -> bool:
         algorithm, n, r, p, salt_hex, digest_hex = encoded.split("$")
         if algorithm != "scrypt":
             return False
-        digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex), n=int(n), r=int(r), p=int(p))
+        digest = hashlib.scrypt(
+            password.encode(),
+            salt=bytes.fromhex(salt_hex),
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            maxmem=SCRYPT_MAXMEM,
+        )
         return hmac.compare_digest(digest.hex(), digest_hex)
     except (ValueError, TypeError):
         return False

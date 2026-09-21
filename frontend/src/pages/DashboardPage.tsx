@@ -19,7 +19,31 @@ export default function DashboardPage({user,onSignedOut}:{user:User;onSignedOut:
   const [loading,setLoading]=useState(true); const [error,setError]=useState(''); const [notice,setNotice]=useState(''); const [busy,setBusy]=useState(''); const [drawer,setDrawer]=useState(false);
   const [capital,setCapital]=useState(''); const [apiKey,setApiKey]=useState(''); const [apiSecret,setApiSecret]=useState('');
 
-  const load=useCallback(async(silent=false)=>{if(!silent)setLoading(true);setError('');try{const [c,e,p,o,en]=await Promise.all([api.config(),api.execution(),api.performance(),api.operations(),api.entitlement()]);setConfig(c);setExec(e);setPerf(p);setOps(o);setEnt(en);setCapital(String(c.operating_capital));}catch(err){const msg=humanizeError(err);setError(msg);if(!session.get())onSignedOut();}finally{setLoading(false)}},[onSignedOut]);
+  const load=useCallback(async(silent=false)=>{
+    if(!silent)setLoading(true);
+    setError('');
+    const requests = [
+      ['config', api.config()],
+      ['execution', api.execution()],
+      ['performance', api.performance()],
+      ['operations', api.operations()],
+      ['entitlement', api.entitlement()],
+    ] as const;
+    const results = await Promise.allSettled(requests.map(([,promise])=>promise));
+    const failures:string[]=[];
+    results.forEach((result,index)=>{
+      const name=requests[index][0];
+      if(result.status==='rejected'){failures.push(`${name}: ${humanizeError(result.reason)}`);return;}
+      if(name==='config'){const c=result.value as TradingConfig;setConfig(c);setCapital(String(c.operating_capital));}
+      else if(name==='execution')setExec(result.value as Execution);
+      else if(name==='performance')setPerf(result.value as Performance);
+      else if(name==='operations')setOps(result.value as Operations);
+      else if(name==='entitlement')setEnt(result.value as Entitlement);
+    });
+    if(failures.length)setError(failures.join(' · '));
+    if(!session.get())onSignedOut();
+    setLoading(false);
+  },[onSignedOut]);
   useEffect(()=>{load(); const id=window.setInterval(()=>load(true),15000); return()=>clearInterval(id)},[load]);
 
   const equity=useMemo(()=>{let cur=config?.operating_capital||0;const values=[cur];[...ops.closed].reverse().forEach(p=>{cur+=pnl(p);values.push(cur)});return values},[ops.closed,config?.operating_capital]);

@@ -12,6 +12,7 @@ from app.api.telegram_api import router as telegram_router
 from app.auth.service import AuthService
 from app.config.settings import get_settings
 from app.storage.database import Database
+from app.security.credential_vault import CredentialVault
 from app.telegram.bot import TelegramBotService, TelegramBotError
 
 logger = logging.getLogger("kaeleon.api")
@@ -25,6 +26,13 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("mongodb_uri_required_in_production")
         if not settings.credential_encryption_key.strip():
             raise RuntimeError("credential_encryption_key_required_in_production")
+        # A non-empty value is not enough: Fernet requires a valid urlsafe
+        # base64-encoded 32-byte key. Validate it at boot so a bad secret does
+        # not surface later as a misleading dashboard/CORS failure.
+        try:
+            CredentialVault(settings.credential_encryption_key)
+        except ValueError as exc:
+            raise RuntimeError("invalid_credential_encryption_key_in_production") from exc
     if settings.telegram_enabled:
         if not settings.telegram_registration_configured:
             logger.error("Telegram registration verification is enabled but the required Telegram configuration is incomplete")
@@ -71,10 +79,15 @@ app.include_router(user_router)
 def health():
     settings = get_settings()
     telegram_configured = bool(settings.telegram_enabled and settings.telegram_registration_configured)
+    try:
+        CredentialVault(settings.credential_encryption_key)
+        vault_status = "configured"
+    except ValueError:
+        vault_status = "invalid_or_unconfigured"
     return {
         "status": "ok",
         "service": "kaeleon",
         "version": "0.12.0",
         "telegram_verification": "configured" if telegram_configured else "disabled_or_unconfigured",
-        "credential_vault": "configured" if settings.credential_encryption_key else "unconfigured",
+        "credential_vault": vault_status,
     }

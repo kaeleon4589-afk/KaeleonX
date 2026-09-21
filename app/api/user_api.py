@@ -28,9 +28,16 @@ def deps():
     if _auth is None:
         _auth = AuthService(_db)
     if _profiles is None:
+        try:
+            vault = CredentialVault(s.credential_encryption_key)
+        except ValueError as exc:
+            # Do not let a malformed server-side Fernet key escape as an
+            # unhandled 500.  The browser otherwise reports it as a generic
+            # network/CORS failure, which hides the real deployment problem.
+            raise HTTPException(503, str(exc)) from exc
         _profiles = UserTradingProfileService(
             _db,
-            CredentialVault(s.credential_encryption_key),
+            vault,
             minimum_operating_capital=s.min_operating_capital,
         )
     if _billing is None:

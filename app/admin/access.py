@@ -1,6 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
 def now_utc(): return datetime.now(timezone.utc)
+
+def as_utc(value):
+    if value is None: return None
+    if isinstance(value, str): value=datetime.fromisoformat(value.replace('Z','+00:00'))
+    if value.tzinfo is None: return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 def find_user(db, phone=None, telegram_user_id=None):
     if phone: return db.find_one('users', {'phone': phone})
     if telegram_user_id: return db.find_one('users', {'telegram_user_id': str(telegram_user_id)})
@@ -8,11 +14,11 @@ def find_user(db, phone=None, telegram_user_id=None):
 
 def grant_live_days(db, user, days, admin_user_id, audit):
     if days <= 0: raise ValueError('days_must_be_positive')
-    now=now_utc(); current=user.get('live_access_until')
-    if isinstance(current,str): current=datetime.fromisoformat(current.replace('Z','+00:00'))
-    if not current or current < now: current=now
+    now=now_utc()
+    expiries = [as_utc(user.get(k)) for k in ('live_access_until','subscription_expires_at','live_trial_expires_at') if user.get(k)]
+    current = max([now, *expiries])
     new_until=current+timedelta(days=days)
-    db.upsert('users', {'user_id':user['user_id']}, {'live_access_until':new_until,'live_access_source':'ADMIN_MANUAL_GRANT'})
+    db.upsert('users', {'user_id':user['user_id']}, {'live_access_until':new_until,'live_access_source':'ADMIN_MANUAL_GRANT','live_state':'granted'})
     audit.event('ADMIN_LIVE_DAYS_GRANTED', user_id=admin_user_id, target_user_id=user['user_id'], phone=user.get('phone'), days=days, live_access_until=new_until.isoformat())
     return new_until
 

@@ -12,8 +12,15 @@ export type TradingConfig = {
   execution_mode: 'demo' | 'live';
   trading_enabled: boolean;
   operating_capital: number;
+  demo_operating_capital: number;
+  live_operating_capital: number;
   minimum_operating_capital: number;
+  demo_available_equity: number;
+  live_available_equity: number;
+  available_equity: number;
   coinw_configured: boolean;
+  coinw_verified: boolean;
+  coinw_verified_at?: string | null;
   coinw_api_key?: string | null;
   live_allowed: boolean;
   live_state?: string;
@@ -24,6 +31,7 @@ export type Execution = {
   status: string;
   capital: number;
   configured_capital: number;
+  available_equity: number;
   markets_scanned: number;
   candidates: number;
   coinw_connected: boolean;
@@ -34,6 +42,7 @@ export type Execution = {
 };
 
 export type Performance = {
+  mode: 'demo' | 'live';
   capital: number;
   configured_capital: number;
   pnl: number;
@@ -48,6 +57,7 @@ export type Performance = {
 
 export type Position = Record<string, unknown> & {
   position_id?: string;
+  mode?: 'demo' | 'live';
   symbol?: string;
   side?: string;
   direction?: string;
@@ -65,12 +75,16 @@ export type Position = Record<string, unknown> & {
   closed_at?: string | number;
   created_at?: string | number;
   stop_loss?: number;
+  stop_price?: number;
   take_profit?: number;
+  target_price?: number;
   tp1?: number;
+  tp1_price?: number;
   tp2?: number;
+  tp2_price?: number;
 };
 
-export type Operations = { open: Position[]; closed: Position[] };
+export type Operations = { mode?: 'demo'|'live'; open: Position[]; closed: Position[] };
 export type Entitlement = {
   demo_allowed: boolean;
   live_allowed: boolean;

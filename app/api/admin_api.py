@@ -1,15 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
-from datetime import timedelta
-from pydantic import BaseModel, Field
-from datetime import timedelta
 from app.auth.service import AuthService
 from app.config.settings import get_settings
 from app.logging.logger import AuditLogger
 from app.storage.database import Database
-from app.auth.service import normalize_phone
-from app.admin.access import find_user, grant_live_days, set_user_status
 from app.auth.service import normalize_phone
 from app.admin.access import find_user, grant_live_days, set_user_status
 
@@ -208,37 +203,6 @@ def restore_user(req: UserLookup, authorization: str | None = Header(default=Non
     set_user_status(db, user, "active", admin["user_id"], audit, "ADMIN_RESTORE")
     updated = db.find_one("users", {"user_id": user["user_id"]})
     return {"success": True, "user": clean(updated)}
-
-@router.post("/users/live-days")
-def grant_live_days_admin(req: GrantLiveDaysRequest, authorization: str | None = Header(default=None)):
-    admin=current_admin(authorization); db,_,audit=deps(); user=require_target(req)
-    until=grant_live_days(db,user,req.days,admin['user_id'],audit)
-    return {'success':True,'user':clean(db.find_one('users',{'user_id':user['user_id']})),'live_access_until':until.isoformat(),'days_added':req.days}
-
-@router.post("/users/ban")
-def ban_user(req: BanUserRequest, authorization: str | None = Header(default=None)):
-    admin=current_admin(authorization); db,_,audit=deps(); user=require_target(req)
-    until=datetime.now(timezone.utc)+timedelta(days=req.days) if req.days else None
-    set_user_status(db,user,'suspended' if until else 'blocked',admin['user_id'],audit,req.reason,until)
-    return {'success':True,'user':clean(db.find_one('users',{'user_id':user['user_id']})),'ban_until':until.isoformat() if until else None}
-
-@router.post("/users/unban")
-def unban_user(req: UserLookup, authorization: str | None = Header(default=None)):
-    admin=current_admin(authorization); db,_,audit=deps(); user=require_target(req)
-    set_user_status(db,user,'active',admin['user_id'],audit,'ADMIN_UNBAN')
-    return {'success':True,'user':clean(db.find_one('users',{'user_id':user['user_id']}))}
-
-@router.delete("/users")
-def delete_user(req: UserLookup, authorization: str | None = Header(default=None)):
-    admin=current_admin(authorization); db,_,audit=deps(); user=require_target(req)
-    set_user_status(db,user,'deleted',admin['user_id'],audit,'ADMIN_DELETE')
-    return {'success':True,'reversible':True,'user':clean(db.find_one('users',{'user_id':user['user_id']}))}
-
-@router.post("/users/restore")
-def restore_user(req: UserLookup, authorization: str | None = Header(default=None)):
-    admin=current_admin(authorization); db,_,audit=deps(); user=require_target(req)
-    set_user_status(db,user,'active',admin['user_id'],audit,'ADMIN_RESTORE')
-    return {'success':True,'user':clean(db.find_one('users',{'user_id':user['user_id']}))}
 
 @router.get("/system/events")
 def system_events(authorization: str | None = Header(default=None), limit: int = 200):

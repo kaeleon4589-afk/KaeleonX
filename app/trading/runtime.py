@@ -19,6 +19,9 @@ from app.market.signal_factory import SignalFactory
 from app.billing.service import BillingService
 from app.orchestrator import TradingOrchestrator
 from app.trading.profile import UserTradingProfileService
+from app.trading.metrics import calculate_performance
+from app.models.trading import Position
+from app.models.enums import Direction
 
 
 @dataclass
@@ -96,6 +99,41 @@ class UserTradingRuntimeManager:
         )
         if hasattr(execution, "on_realized"):
             position_manager.on_realized = execution.on_realized
+
+        # Recover persisted open positions after worker restarts so duplicate entries
+        # are not created before the exchange/local state is reconciled.
+        for row in self.db.find_many("positions", {"user_id": user_id, "status": "OPEN"}, limit=1000):
+            try:
+                direction = row.get("direction")
+                if not isinstance(direction, Direction):
+                    direction = Direction(str(direction))
+                position_manager.positions[str(row["position_id"])] = Position(
+                    position_id=str(row["position_id"]),
+                    decision_id=str(row.get("decision_id", "RECOVERED")),
+                    symbol=str(row.get("symbol", "")),
+                    direction=direction,
+                    quantity=float(row.get("quantity", 0)),
+                    entry_price=float(row.get("entry_price", 0)),
+                    stop_price=float(row.get("stop_price", 0)),
+                    target_price=float(row.get("target_price", 0)),
+                    status=str(row.get("status", "OPEN")),
+                    realized_pnl=float(row.get("realized_pnl", 0)),
+                    unrealized_pnl=float(row.get("unrealized_pnl", 0)),
+                    tp1_price=row.get("tp1_price"),
+                    tp2_price=row.get("tp2_price"),
+                    remaining_quantity=row.get("remaining_quantity"),
+                    tp1_hit=bool(row.get("tp1_hit", False)),
+                    stop_moved_to_breakeven=bool(row.get("stop_moved_to_breakeven", False)),
+                    entry_fee=float(row.get("entry_fee", 0)),
+                    exit_fee=float(row.get("exit_fee", 0)),
+                    funding_pnl=float(row.get("funding_pnl", 0)),
+                    opened_at=row.get("opened_at"),
+                    closed_at=row.get("closed_at"),
+                    exit_price=row.get("exit_price"),
+                    exit_reason=row.get("exit_reason"),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                self.audit.event("POSITION_RESTORE_ERROR", user_id, position_id=row.get("position_id"), error=str(exc))
 
         orchestrator = TradingOrchestrator(
             RegimeEngine(),
@@ -197,6 +235,8 @@ class UserTradingRuntimeManager:
             (p.__dict__ for p in runtime.position_manager.positions.values() if p.status == "OPEN"),
             None,
         )
+        positions = self.db.find_many("positions", {"user_id": runtime.user_id}, limit=10000)
+        metrics = calculate_performance(positions, runtime.configured_capital)
         self.db.upsert("user_engine_state", {"user_id": runtime.user_id}, {
             "user_id": runtime.user_id,
             "mode": runtime.mode.upper(),
@@ -207,4 +247,5 @@ class UserTradingRuntimeManager:
             "trading_enabled": runtime.trading_enabled,
             "coinw_connected": runtime.mode == "live" and available_equity > 0,
             "open_position": open_position,
+            **metrics,
         })

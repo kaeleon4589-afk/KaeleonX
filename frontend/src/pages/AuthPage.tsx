@@ -1,12 +1,15 @@
-import { FormEvent, useState } from 'react';
+import { FormEvent, useMemo, useState } from 'react';
 import Brand from '../components/Brand';
+import { EyeIcon } from '../components/Icons';
 import { api, humanizeError, session } from '../lib/api';
+import { countries, flagEmoji } from '../lib/countries';
 import type { User } from '../types';
 
 export default function AuthPage({onAuthenticated}:{onAuthenticated:(user:User)=>void}) {
   const [mode,setMode]=useState<'login'|'register'|'verify'>('login');
-  const [phone,setPhone]=useState(''); const [country,setCountry]=useState('+52'); const [password,setPassword]=useState(''); const [referral,setReferral]=useState('');
+  const [phone,setPhone]=useState(''); const [country,setCountry]=useState('+52'); const [password,setPassword]=useState(''); const [showPassword,setShowPassword]=useState(false); const [referral,setReferral]=useState('');
   const [challenge,setChallenge]=useState(''); const [telegramUrl,setTelegramUrl]=useState(''); const [error,setError]=useState(''); const [busy,setBusy]=useState(false);
+  const countryValue=useMemo(()=>countries.find(c=>c.dial===country)?.iso||'MX',[country]);
 
   async function submit(e:FormEvent){e.preventDefault();setError('');setBusy(true);try{
     if(mode==='login'){
@@ -27,8 +30,8 @@ export default function AuthPage({onAuthenticated}:{onAuthenticated:(user:User)=
         <div className="auth-tabs"><button className={mode==='login'?'active':''} onClick={()=>{setMode('login');setError('')}}>Iniciar sesión</button><button className={mode==='register'?'active':''} onClick={()=>{setMode('register');setError('')}}>Crear cuenta</button></div>
         <div className="auth-title"><h2>{mode==='login'?'Bienvenido de nuevo':'Crea tu cuenta'}</h2><p>{mode==='login'?'Accede a tu panel de ejecución.':'El teléfono debe coincidir con el que compartirás con Telegram.'}</p></div>
         <form onSubmit={submit} className="auth-form">
-          <label>Teléfono<div className="phone-row"><input className="country" value={country} onChange={e=>setCountry(e.target.value)} aria-label="Código de país"/><input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="442 123 4567" required minLength={7}/></div></label>
-          <label>Contraseña<input type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Mínimo 8 caracteres" required minLength={8}/></label>
+          <label>Teléfono<div className="phone-row"><select className="country country-select" value={countryValue} onChange={e=>{const c=countries.find(x=>x.iso===e.target.value); if(c)setCountry(c.dial)}} aria-label="País">{countries.map(c=><option key={`${c.iso}-${c.dial}`} value={c.iso}>{flagEmoji(c.iso)} {c.name} {c.dial}</option>)}</select><input value={phone} onChange={e=>setPhone(e.target.value.replace(/[^0-9\s-]/g,''))} placeholder="59494299" inputMode="tel" required minLength={7}/></div></label>
+          <label>Contraseña<div className="password-field"><input type={showPassword?'text':'password'} value={password} onChange={e=>setPassword(e.target.value)} placeholder="Mínimo 8 caracteres" required minLength={8}/><button type="button" className="password-eye" onClick={()=>setShowPassword(v=>!v)} aria-label={showPassword?'Ocultar contraseña':'Mostrar contraseña'} aria-pressed={showPassword}><EyeIcon/></button></div></label>
           {mode==='register' && <label>Código de referido <span>(opcional)</span><input value={referral} onChange={e=>setReferral(e.target.value)} placeholder="KAELEON-..."/></label>}
           {error && <div className={error.startsWith('Verificación')?'form-success':'form-error'}>{error}</div>}
           <button className="primary-btn auth-submit" disabled={busy}>{busy?'Procesando…':mode==='login'?'Entrar a KAELEON':'Continuar con Telegram'}</button>

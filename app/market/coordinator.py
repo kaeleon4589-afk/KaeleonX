@@ -65,9 +65,14 @@ class MultiMarketCoordinator:
                 self._cursor=(self._cursor+len(batch))%max(len(symbols),1)
                 if self.audit:self.audit.event('MARKET_BATCH_START','system',level='DEBUG',persist=False,batch=batch)
                 snaps=await asyncio.gather(*(base.snapshot(s,self._btc) for s in batch),return_exceptions=True)
-                for snap in snaps:
+                for requested_symbol, snap in zip(batch, snaps):
                     if isinstance(snap,Exception):
-                        if self.audit:self.audit.event('MARKET_SNAPSHOT_ERROR','system',error=str(snap)); continue
+                        if self.audit:
+                            self.audit.event(
+                                'MARKET_SNAPSHOT_ERROR','system',
+                                symbol=requested_symbol, error=str(snap),
+                            )
+                        continue
                     snap.markets_scanned=len(symbols)
                     snap.candidates=len(ranked)
                     snap.scan_batch=list(batch)

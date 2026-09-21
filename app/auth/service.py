@@ -14,12 +14,23 @@ def normalize_phone(phone: str, country_code: str = "") -> str:
     raw = (phone or "").strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
     if not raw:
         raise ValueError("phone_required")
-    if not raw.startswith("+"):
-        cc = (country_code or "").strip()
-        if not cc.startswith("+"):
-            cc = "+" + cc if cc else ""
-        raw = cc + raw.lstrip("+")
-    digits = raw[1:]
+
+    # Telegram's Bot API commonly sends contact.phone_number as digits only
+    # (for example ``5359494299``) even when the registered E.164 value is
+    # ``+5359494299``.  When no explicit country code is supplied, a digits-only
+    # value is therefore treated as an already-complete international number.
+    if raw.startswith("+"):
+        digits = raw[1:]
+    else:
+        cc = (country_code or "").strip().replace(" ", "").replace("-", "")
+        cc_digits = cc.lstrip("+")
+        if cc_digits:
+            if not cc_digits.isdigit():
+                raise ValueError("invalid_phone")
+            digits = cc_digits + raw.lstrip("+")
+        else:
+            digits = raw.lstrip("+")
+
     if not digits.isdigit() or not (7 <= len(digits) <= E164_MAX):
         raise ValueError("invalid_phone")
     return "+" + digits
@@ -81,31 +92,53 @@ class AuthService:
     def create_registration(self, phone: str, password: str, country_code: str = "", referral_code: str = "") -> dict:
         normalized = normalize_phone(phone, country_code)
         existing = self.db.find_one("users", {"phone": normalized})
-        if existing:
-            raise ValueError("phone_already_registered")
+
         if referral_code:
             code = referral_code.strip().upper()
             referrer = self.db.find_one("users", {"referral_code": code})
             if not referrer:
                 raise ValueError("invalid_referral_code")
-        user_id = secrets.token_hex(16)
-        user = {
-            "user_id": user_id,
-            "phone": normalized,
-            "password_hash": hash_password(password),
-            "status": "pending_verification",
-            "role": "USER",
-            "plan": "TRIAL",
-            "demo_status": "active",
-            "live_state": "not_started",
-            "telegram_verified": False,
-            "telegram_user_id": None,
-            "referral_code": new_referral_code(self.db),
-            "created_at": datetime.now(timezone.utc),
-        }
-        self.db.write("users", user)
-        if referral_code:
-            attach_referral(self.db, user_id, referral_code)
+
+        # A failed/abandoned Telegram verification must not permanently lock the
+        # phone number.  Active (or suspended) accounts remain protected, while
+        # a pending account can safely restart registration and receive a fresh
+        # one-hour challenge.
+        if existing:
+            if existing.get("status") != "pending_verification":
+                raise ValueError("phone_already_registered")
+            user_id = existing["user_id"]
+            self.db.upsert("users", {"user_id": user_id}, {
+                "password_hash": hash_password(password),
+                "telegram_verified": False,
+                "telegram_user_id": None,
+            })
+            self.db.update_many(
+                "registration_challenges",
+                {"user_id": user_id, "used": False},
+                {"used": True, "invalidated_at": datetime.now(timezone.utc)},
+            )
+            if referral_code and not existing.get("referred_by_user_id"):
+                attach_referral(self.db, user_id, referral_code)
+        else:
+            user_id = secrets.token_hex(16)
+            user = {
+                "user_id": user_id,
+                "phone": normalized,
+                "password_hash": hash_password(password),
+                "status": "pending_verification",
+                "role": "USER",
+                "plan": "TRIAL",
+                "demo_status": "active",
+                "live_state": "not_started",
+                "telegram_verified": False,
+                "telegram_user_id": None,
+                "referral_code": new_referral_code(self.db),
+                "created_at": datetime.now(timezone.utc),
+            }
+            self.db.write("users", user)
+            if referral_code:
+                attach_referral(self.db, user_id, referral_code)
+
         challenge = new_token()
         self.db.write("registration_challenges", {
             "challenge_hash": token_hash(challenge),

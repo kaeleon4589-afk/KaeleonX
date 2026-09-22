@@ -83,6 +83,8 @@ class TradingOrchestrator:
         self.inflight.add(key)
 
         decision_id = uuid4().hex
+        accepted_signal = False
+        terminal_event_emitted = False
         self.audit.event(
             "DECISION_START", decision_id, level="DEBUG", persist=False,
             user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
@@ -194,6 +196,7 @@ class TradingOrchestrator:
                 execution_rr=round(execution_rr, 4), structural_rr=structural_rr,
                 risk_multiplier=intent.risk_multiplier,
             )
+            accepted_signal = True
             try:
                 risk = self.risk.evaluate(
                     intent,
@@ -202,6 +205,7 @@ class TradingOrchestrator:
                 )
             except Exception as exc:
                 self.last_decision[key] = now
+                terminal_event_emitted = True
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id, mode=self.execution_mode,
                     symbol=snapshot.symbol, stage="risk_evaluate",
@@ -246,6 +250,7 @@ class TradingOrchestrator:
 
             if not risk.approved:
                 self.last_decision[key] = now
+                terminal_event_emitted = True
                 self.audit.event(
                     "RISK_REJECTED", decision_id, user_id=user_id, mode=self.execution_mode,
                     symbol=snapshot.symbol, reason=str(risk.reason)
@@ -268,6 +273,7 @@ class TradingOrchestrator:
                     decision_id, {"execution": result, "status": "EXECUTION_REJECTED"},
                     user_id=user_id, symbol=snapshot.symbol,
                 )
+                terminal_event_emitted = True
                 self.audit.event(
                     "EXECUTION_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -289,6 +295,7 @@ class TradingOrchestrator:
                     result = await result
             except Exception as exc:
                 self.last_decision[key] = now
+                terminal_event_emitted = True
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id, mode=self.execution_mode,
                     symbol=snapshot.symbol, stage="execution_submit",
@@ -313,6 +320,7 @@ class TradingOrchestrator:
                     decision_id, {"execution": result, "status": "EXECUTION_REJECTED"},
                     user_id=user_id, symbol=snapshot.symbol,
                 )
+                terminal_event_emitted = True
                 self.audit.event(
                     "EXECUTION_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -320,6 +328,16 @@ class TradingOrchestrator:
                 )
                 self.last_decision[key] = now
                 return result
+
+            if result.get("filled") and not result.get("position"):
+                terminal_event_emitted = True
+                self.audit.event(
+                    "PIPELINE_ERROR", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, stage="execution_result",
+                    error="filled_result_missing_position",
+                )
+                self.last_decision[key] = now
+                return {**result, "filled": False, "reason": "filled_result_missing_position"}
 
             if result.get("filled") and result.get("position"):
                 raw = result["position"]
@@ -351,16 +369,33 @@ class TradingOrchestrator:
                 position.execution_rr = round(execution_rr, 4)
                 if structural_rr is not None:
                     position.structural_rr = structural_rr
+                # Persist the filled position before announcing it. The dashboard reads
+                # MongoDB, so POSITION_OPENED must mean both execution and platform
+                # visibility succeeded. A persistence failure is surfaced explicitly.
+                try:
+                    position_doc = {**position.__dict__, "user_id": user_id, "mode": self.execution_mode}
+                    order_doc = {k: v for k, v in result.items() if k != "position"}
+                    order_doc.update({"decision_id": decision_id, "user_id": user_id, "mode": self.execution_mode})
+                    self.db.upsert(
+                        "positions", {"position_id": position.position_id}, position_doc,
+                    )
+                    self.db.upsert(
+                        "orders",
+                        {"order_id": result.get("order_id", position.position_id)},
+                        order_doc,
+                    )
+                except Exception as exc:
+                    terminal_event_emitted = True
+                    self.audit.event(
+                        "PIPELINE_ERROR", decision_id, user_id=user_id, mode=self.execution_mode,
+                        symbol=snapshot.symbol, stage="position_persist",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    self.last_decision[key] = now
+                    return {"accepted": True, "filled": False, "reason": "position_persist_error"}
+
                 self.position_manager.add(position)
-                self.db.upsert(
-                    "positions", {"position_id": position.position_id},
-                    {**position.__dict__, "user_id": user_id, "mode": self.execution_mode},
-                )
-                self.db.upsert(
-                    "orders",
-                    {"order_id": result.get("order_id", position.position_id)},
-                    {**result, "decision_id": decision_id, "user_id": user_id, "mode": self.execution_mode},
-                )
+                terminal_event_emitted = True
                 self.audit.event(
                     "POSITION_OPENED", decision_id, user_id=user_id, mode=self.execution_mode,
                     symbol=position.symbol, position_id=position.position_id,
@@ -369,9 +404,24 @@ class TradingOrchestrator:
                     target_price=position.target_price, strategy=strategy_name, execution_rr=round(execution_rr, 4),
                 )
                 if self.on_position_opened:
-                    self.on_position_opened(position)
+                    try:
+                        self.on_position_opened(position)
+                    except Exception as exc:
+                        # Telegram notification is best effort and must never turn a
+                        # successfully persisted/opened trade into a pipeline failure.
+                        self.audit.event(
+                            "TELEGRAM_NOTIFY_FAILED", decision_id, level="ERROR",
+                            user_id=user_id, mode=self.execution_mode, symbol=position.symbol,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
 
             self.last_decision[key] = now
             return result
         finally:
+            if accepted_signal and not terminal_event_emitted:
+                self.audit.event(
+                    "PIPELINE_ERROR", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=getattr(snapshot, "symbol", None), stage="terminal_guard",
+                    error="accepted_signal_without_terminal_event",
+                )
             self.inflight.discard(key)

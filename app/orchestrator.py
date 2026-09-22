@@ -27,6 +27,23 @@ class TradingOrchestrator:
         self.execution_mode = execution_mode or getattr(execution, "mode", "demo")
         self.on_position_opened = on_position_opened
 
+    def _safe_decision_update(self, decision_id, document, *, user_id=None, symbol=None):
+        """Persist compact decision state without allowing telemetry persistence to stop trading.
+
+        The decisions collection is diagnostic. A transient BSON/DB serialization issue must
+        never cut an accepted signal before risk/execution.
+        """
+        try:
+            self.db.upsert("decisions", {"decision_id": decision_id}, document)
+            return True
+        except Exception as exc:
+            self.audit.event(
+                "DECISION_PERSIST_ERROR", decision_id, level="ERROR",
+                user_id=user_id, mode=self.execution_mode, symbol=symbol,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
     def _has_open_position(self, symbol, user_id=None):
         return any(
             p.status == "OPEN" and (user_id is not None or p.symbol == symbol)
@@ -177,35 +194,63 @@ class TradingOrchestrator:
                 execution_rr=round(execution_rr, 4), structural_rr=structural_rr,
                 risk_multiplier=intent.risk_multiplier,
             )
-            risk = self.risk.evaluate(
-                intent,
-                equity,
-                leverage=getattr(self.execution, "leverage", 1),
-            )
-            self.db.upsert("decisions", {"decision_id": decision_id}, {
-                "decision_id": decision_id,
-                "symbol": snapshot.symbol,
-                "timeframe": snapshot.timeframe,
-                "user_id": user_id,
-                "mode": self.execution_mode,
-                "regime": getattr(self.regime_engine, "last_metadata", {}) or {},
-                "intent": intent.__dict__,
-                "risk": risk.__dict__,
-                "status": "RISK_EVALUATED",
-            })
+            try:
+                risk = self.risk.evaluate(
+                    intent,
+                    equity,
+                    leverage=getattr(self.execution, "leverage", 1),
+                )
+            except Exception as exc:
+                self.last_decision[key] = now
+                self.audit.event(
+                    "PIPELINE_ERROR", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, stage="risk_evaluate",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return {"accepted": False, "filled": False, "reason": "risk_evaluation_error"}
+
+            # Emit the risk result before diagnostic persistence. This guarantees that
+            # the accepted signal always has a visible continuation in Railway.
             self.audit.event(
                 "RISK_EVALUATED", decision_id, user_id=user_id, mode=self.execution_mode,
-                symbol=snapshot.symbol, approved=risk.approved, reason=risk.reason,
-                equity=equity, quote_notional=risk.quantity, base_quantity=risk.base_quantity,
-                margin_required=risk.margin_required, leverage=risk.leverage,
+                symbol=snapshot.symbol, approved=bool(risk.approved), reason=str(risk.reason),
+                equity=float(equity), quote_notional=float(risk.quantity),
+                base_quantity=float(risk.base_quantity), margin_required=float(risk.margin_required),
+                leverage=int(risk.leverage),
             )
+
+            # Keep Mongo lean and BSON-safe: store only primitives needed to reconstruct
+            # the accepted decision instead of full indicator/regime/metadata payloads.
+            self._safe_decision_update(decision_id, {
+                "decision_id": decision_id,
+                "symbol": str(snapshot.symbol),
+                "timeframe": str(snapshot.timeframe),
+                "user_id": user_id,
+                "mode": str(self.execution_mode),
+                "strategy": getattr(intent.strategy, "value", str(intent.strategy)),
+                "direction": getattr(intent.direction, "value", str(intent.direction)),
+                "quality": float(intent.quality),
+                "entry_price": entry,
+                "stop_price": stop,
+                "target_price": target,
+                "execution_rr": float(execution_rr),
+                "structural_rr": float(structural_rr) if structural_rr is not None else None,
+                "risk_approved": bool(risk.approved),
+                "risk_reason": str(risk.reason),
+                "quote_notional": float(risk.quantity),
+                "base_quantity": float(risk.base_quantity),
+                "margin_required": float(risk.margin_required),
+                "leverage": int(risk.leverage),
+                "status": "RISK_EVALUATED",
+            }, user_id=user_id, symbol=snapshot.symbol)
+
             if not risk.approved:
                 self.last_decision[key] = now
                 self.audit.event(
                     "RISK_REJECTED", decision_id, user_id=user_id, mode=self.execution_mode,
-                    symbol=snapshot.symbol, reason=risk.reason
+                    symbol=snapshot.symbol, reason=str(risk.reason)
                 )
-                return None
+                return {"accepted": False, "filled": False, "reason": str(risk.reason)}
 
             # Execution requires a usable live order book even in DEMO because
             # demo fills are simulated against CoinW bid/ask. Missing depth must
@@ -219,9 +264,9 @@ class TradingOrchestrator:
             if market_bid <= 0 or market_ask <= 0:
                 self.last_decision[key] = now
                 result = {'accepted': False, 'filled': False, 'reason': 'market_unavailable'}
-                self.db.upsert(
-                    "decisions", {"decision_id": decision_id},
-                    {"execution": result, "status": "EXECUTION_REJECTED"},
+                self._safe_decision_update(
+                    decision_id, {"execution": result, "status": "EXECUTION_REJECTED"},
+                    user_id=user_id, symbol=snapshot.symbol,
                 )
                 self.audit.event(
                     "EXECUTION_REJECTED", decision_id, user_id=user_id,
@@ -230,21 +275,30 @@ class TradingOrchestrator:
                 )
                 return result
 
-            result = self.execution.submit(
-                intent, risk.quantity,
-                {
-                    "bid": market_bid,
-                    "ask": market_ask,
-                    "last": snapshot.last,
-                    "ts": now_ms,
-                },
-            )
-            if inspect.isawaitable(result):
-                result = await result
+            try:
+                result = self.execution.submit(
+                    intent, risk.quantity,
+                    {
+                        "bid": market_bid,
+                        "ask": market_ask,
+                        "last": snapshot.last,
+                        "ts": now_ms,
+                    },
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                self.last_decision[key] = now
+                self.audit.event(
+                    "PIPELINE_ERROR", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, stage="execution_submit",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return {"accepted": False, "filled": False, "reason": "execution_error"}
 
-            self.db.upsert(
-                "decisions", {"decision_id": decision_id},
-                {"execution": result, "status": "EXECUTION_RESULT"},
+            self._safe_decision_update(
+                decision_id, {"execution": result, "status": "EXECUTION_RESULT"},
+                user_id=user_id, symbol=snapshot.symbol,
             )
             self.audit.event("EXECUTION_RESULT", decision_id, user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol, **result)
 
@@ -255,9 +309,9 @@ class TradingOrchestrator:
             # pipeline appeared to stop after SIGNAL_ACCEPTED.
             if not result.get("filled"):
                 reason = str(result.get("reason") or "not_filled")
-                self.db.upsert(
-                    "decisions", {"decision_id": decision_id},
-                    {"execution": result, "status": "EXECUTION_REJECTED"},
+                self._safe_decision_update(
+                    decision_id, {"execution": result, "status": "EXECUTION_REJECTED"},
+                    user_id=user_id, symbol=snapshot.symbol,
                 )
                 self.audit.event(
                     "EXECUTION_REJECTED", decision_id, user_id=user_id,

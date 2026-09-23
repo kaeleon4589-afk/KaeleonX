@@ -16,6 +16,11 @@ _ALWAYS_INFO = {
     'SIGNAL_ACCEPTED',
     'POSITION_OPENED',
     'POSITION_CLOSED',
+    'RISK_REJECTED',
+    'EXECUTION_REJECTED',
+    'EXECUTION_PENDING',
+    'EXECUTION_PENDING_CLEARED',
+    'PIPELINE_ERROR',
     'WORKER_STARTED',
     'WORKER_STOPPED',
     'ENGINE_HEARTBEAT',
@@ -24,8 +29,6 @@ _STATE_INFO = {
     'REGIME_EVALUATED',
     'STRATEGY_EVALUATED',
     'SIGNAL_REJECTED',
-    'RISK_REJECTED',
-    'EXECUTION_REJECTED',
 }
 _ALWAYS_ERROR = {
     'MARKET_SCAN_ERROR',
@@ -37,9 +40,15 @@ _ALWAYS_ERROR = {
     'USER_RUNTIME_CONFIG_ERROR',
     'POSITION_RESTORE_ERROR',
     'TELEGRAM_NOTIFY_FAILED',
+    'POSITION_PERSIST_ERROR',
+    'ORDER_PERSIST_ERROR',
+    'DECISION_PERSIST_ERROR',
+    'POSITION_OPEN_CALLBACK_ERROR',
+    'POSITION_CLOSE_CALLBACK_ERROR',
 }
 _THROTTLED_WARNING = {
     'MARKET_SNAPSHOT_ERROR',
+    'MARKET_SCAN_FAILSAFE_CACHE',
 }
 _DEBUG_ONLY = {
     'DECISION_START',
@@ -118,7 +127,7 @@ class AuditLogger:
             selected = data.get('strategy') or (trace.get('selected') if isinstance(trace, dict) else None)
             reason = trace.get('reason') if isinstance(trace, dict) else None
             return f'{selected or "NONE"}|{reason or ""}'
-        if event in {'SIGNAL_REJECTED', 'RISK_REJECTED', 'EXECUTION_REJECTED'}:
+        if event in {'SIGNAL_REJECTED'}:
             return str(data.get('reason') or 'unknown')
         if event == 'MARKET_SNAPSHOT_ERROR':
             return str(data.get('error') or 'market_snapshot_error')
@@ -134,7 +143,7 @@ class AuditLogger:
         signature = self._state_signature(event, data)
         now = time.monotonic()
         previous = self._last_state.get(key)
-        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'RISK_REJECTED', 'EXECUTION_REJECTED', 'MARKET_SNAPSHOT_ERROR'} else self.state_repeat_seconds
+        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'MARKET_SNAPSHOT_ERROR'} else self.state_repeat_seconds
         if previous and previous[0] == signature and now - previous[1] < repeat:
             return False
         self._last_state[key] = (signature, now)

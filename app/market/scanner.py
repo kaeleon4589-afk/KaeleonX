@@ -39,6 +39,9 @@ class CoinWMarketScanner:
         self.audit = audit
         self._cache: list[dict] = []
         self._ts = 0.0
+        self._online_symbols: set[str] | None = None
+        self._instruments_ts = 0.0
+        self._instruments_ttl = 600.0
 
     @staticmethod
     def _rows(raw):
@@ -67,6 +70,44 @@ class CoinWMarketScanner:
         # as 3%.  Some ticker variants already return percent units such as 3.0.
         return raw * 100.0 if abs(raw) <= 1.0 else raw
 
+    async def _get_online_usdt_symbols(self, now: float):
+        # Tickers may contain instruments in pretest, settlement or offline
+        # states. Metadata is cached separately so a scan does not issue an
+        # instruments request every 30 seconds. A metadata outage is fail-open
+        # to ticker discovery, but never authorizes a new LIVE fill by itself.
+        if not hasattr(self.client, 'instruments'):
+            return None
+        if self._instruments_ts and now - self._instruments_ts < self._instruments_ttl:
+            return self._online_symbols
+        try:
+            rows = self._rows(await self.client.instruments())
+            catalog = set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get('status', '')).lower() != 'online':
+                    continue
+                if str(row.get('quote', 'usdt')).lower() != 'usdt':
+                    continue
+                base = str(row.get('base') or row.get('name') or '').upper().strip()
+                if base.endswith('USDT'):
+                    base = base[:-4]
+                if base:
+                    catalog.add(base)
+            if not catalog:
+                raise ValueError('online_usdt_instrument_catalog_empty')
+            self._online_symbols = catalog
+            self._instruments_ts = now
+            self._instruments_ttl = 600.0
+        except Exception as exc:
+            # Keep a previously validated catalog, otherwise use ticker data.
+            self._instruments_ts = now
+            self._instruments_ttl = 120.0
+            if self.audit:
+                self.audit.event('MARKET_INSTRUMENTS_ERROR', 'system',
+                                 error=str(exc), fallback='cached' if self._online_symbols else 'tickers')
+        return self._online_symbols
+
     @classmethod
     def _score_row(cls, row: dict):
         symbol = str(
@@ -76,12 +117,21 @@ class CoinWMarketScanner:
         if not symbol:
             return None
 
-        base = symbol.replace('USDT', '').replace('_PERP', '').replace('PERP', '')
+        base = symbol[:-4] if symbol.endswith('USDT') else symbol
+        base = base.removesuffix('_PERP').removesuffix('PERP')
         if not base:
             return None
 
         last = cls._float(row, 'last_price', 'last', 'lastPrice', 'close', 'price', 'markPx', default=0.0)
-        volume = cls._float(row, 'total_volume', 'amount24h', 'quoteVolume', 'volume', 'vol', 'dayNtlVlm', default=0.0)
+        # Where CoinW supplies total_volume but not quote-notional volume,
+        # treat it as base turnover and estimate USDT notional using last price.
+        # Explicit quote-notional fields from alternate adapters are already
+        # denominated in quote and must not be multiplied again.
+        quote_volume = cls._float(row, 'quoteVolume', 'amount24h', 'dayNtlVlm', default=0.0)
+        base_volume = cls._float(row, 'total_volume', 'volume', 'vol', default=0.0)
+        volume = quote_volume if quote_volume > 0 else (
+            base_volume * last if row.get('total_volume') is not None else base_volume
+        )
         oi = cls._float(row, 'openInterest', 'open_interest', 'open_interest_value', 'oi', default=0.0)
         change_pct = cls._change_percent(row)
         if last <= 0.0 or volume <= 0.0:
@@ -121,8 +171,9 @@ class CoinWMarketScanner:
             if self.audit:
                 self.audit.event('MARKET_SCAN_ERROR', 'system', error=str(exc))
 
+        online_symbols = await self._get_online_usdt_symbols(now)
         scored = []
-        rejected = {'blocked': 0, 'invalid': 0, 'zero_liquidity': 0}
+        rejected = {'blocked': 0, 'unavailable': 0, 'invalid': 0, 'zero_liquidity': 0}
         for row in rows:
             if not isinstance(row, dict):
                 rejected['invalid'] += 1
@@ -135,7 +186,12 @@ class CoinWMarketScanner:
             if not raw_symbol:
                 rejected['invalid'] += 1
                 continue
-            base = raw_symbol.replace('USDT', '').replace('_PERP', '').replace('PERP', '')
+            base = raw_symbol[:-4] if raw_symbol.endswith('USDT') else raw_symbol
+            base = base.removesuffix('_PERP').removesuffix('PERP')
+            quote = str(row.get('quote_coin', 'usdt')).lower()
+            if (quote != 'usdt' or (online_symbols is not None and base not in online_symbols)):
+                rejected['unavailable'] += 1
+                continue
             if any(token in base for token in self.blocked):
                 rejected['blocked'] += 1
                 continue

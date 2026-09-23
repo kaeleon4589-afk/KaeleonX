@@ -59,19 +59,31 @@ class TelegramTradeNotifier:
 
     def _schedule(self, user_id: str, text: str) -> None:
         if not self.bot:
-            if self.audit:self.audit.event('TELEGRAM_NOTIFY_SKIPPED', user_id, level='DEBUG', user_id=user_id, reason='bot_disabled')
-            return
-        chat_id = self._chat_id(user_id)
-        if not chat_id:
-            if self.audit:self.audit.event('TELEGRAM_NOTIFY_SKIPPED', user_id, user_id=user_id, reason='chat_id_missing')
+            if self.audit:
+                self.audit.event('TELEGRAM_NOTIFY_SKIPPED', user_id, level='DEBUG', user_id=user_id, reason='bot_disabled')
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             logger.warning("No running loop for Telegram trade notification user=%s", user_id)
             return
-        if self.audit:self.audit.event('TELEGRAM_NOTIFY_QUEUED', user_id, level='DEBUG', user_id=user_id, message_type='trade')
-        loop.create_task(self._send(chat_id, text, user_id))
+        if self.audit:
+            self.audit.event('TELEGRAM_NOTIFY_QUEUED', user_id, level='DEBUG', user_id=user_id, message_type='trade')
+        # Do not perform a synchronous Mongo lookup in the trading coroutine.
+        loop.create_task(self._deliver_for_user(user_id, text))
+
+    async def _deliver_for_user(self, user_id: str, text: str) -> None:
+        try:
+            chat_id = await asyncio.to_thread(self._chat_id, user_id)
+        except Exception as exc:
+            if self.audit:
+                self.audit.event('TELEGRAM_NOTIFY_FAILED', user_id, level='ERROR', user_id=user_id, status='failed', error=f'chat_lookup:{exc}')
+            return
+        if not chat_id:
+            if self.audit:
+                self.audit.event('TELEGRAM_NOTIFY_SKIPPED', user_id, level='DEBUG', user_id=user_id, reason='chat_id_missing')
+            return
+        await self._send(chat_id, text, user_id)
 
     async def _send(self, chat_id: str, text: str, user_id: str) -> None:
         try:

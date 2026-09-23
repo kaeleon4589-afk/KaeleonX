@@ -215,10 +215,15 @@ class CoinWExecutor:
 
         order_row, position_row = await self._confirm_order(intent, order_id)
         if not position_row:
+            # CoinW code=0 only means the request was received; it does not prove
+            # execution. Keep this as PENDING rather than mis-labelling it as a
+            # rejected trade. The next position reconciliation can promote a
+            # delayed fill into POSITION_OPENED.
             return {
                 "accepted": True,
                 "filled": False,
                 "order_id": str(order_id),
+                "reason": "order_pending_confirmation",
                 "exchange_response": response,
                 "order_state": order_row,
                 "next": "confirm_on_next_sync",
@@ -264,6 +269,19 @@ class CoinWExecutor:
             "exchange_response": response,
             "order_state": order_row,
         }
+
+    async def pending_order_status(self, order_id):
+        """Return CoinW's current status for an accepted-but-unconfirmed order."""
+        if not order_id:
+            return {"status": "unknown", "order": None}
+        try:
+            response = await self.orders.information([order_id], position_type="execute")
+            rows = self._rows(response)
+            row = rows[0] if rows else None
+            status = str((row or {}).get("orderStatus", "")).lower() or "unknown"
+            return {"status": status, "order": row}
+        except Exception as exc:
+            return {"status": "unknown", "order": None, "error": f"{type(exc).__name__}: {exc}"}
 
     async def confirm(self, instrument, order_id=None, position_ids=None):
         result = {"orders": None, "positions": None}

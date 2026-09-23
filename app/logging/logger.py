@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -84,7 +85,7 @@ def _redact(value, key: str | None = None):
     if isinstance(value, dict):
         return {k: _redact(v, k) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        # Never dump long indicator/candle/EMA series into Railway logs.  They
+        # Never dump long indicator/candle/EMA series into Railway logs. They
         # can contain hundreds of values and add cost without operational value.
         if len(value) > 12:
             return {"_sequence_omitted": True, "count": len(value)}
@@ -94,11 +95,71 @@ def _redact(value, key: str | None = None):
     return value
 
 
+def _railway_level(effective: str) -> str:
+    """Return one of Railway's canonical structured-log severities."""
+    level = str(effective or 'INFO').upper()
+    if level == 'DEBUG':
+        return 'debug'
+    if level in {'WARNING', 'WARN'}:
+        return 'warn'
+    if level in {'ERROR', 'CRITICAL'}:
+        return 'error'
+    return 'info'
+
+
+def _message_value(value, *, limit: int = 260) -> str:
+    if isinstance(value, (list, tuple)):
+        text = ','.join(str(v) for v in value[:8])
+        if len(value) > 8:
+            text += f',…(+{len(value) - 8})'
+    elif isinstance(value, dict):
+        text = json.dumps(value, default=str, separators=(',', ':'))
+    else:
+        text = str(value)
+    if len(text) > limit:
+        return text[:limit] + '…'
+    return text
+
+
+def _build_message(event: str, data: dict) -> str:
+    """Build a compact human-readable message for Railway exports.
+
+    Railway displays the ``message`` field as the visible log text. Keep it
+    concise while retaining the fields needed to diagnose the trading pipeline.
+    All values passed here have already gone through secret redaction.
+    """
+    preferred = (
+        'symbol', 'mode', 'strategy', 'direction', 'state', 'candidate',
+        'reason', 'stage', 'api_code', 'endpoint', 'markets_scanned', 'market',
+        'quality', 'execution_rr', 'orderbook_valid', 'error',
+    )
+    parts = [str(event)]
+    for key in preferred:
+        value = data.get(key)
+        if value is None or value == '':
+            continue
+        parts.append(f'{key}={_message_value(value)}')
+
+    top_symbols = data.get('top_symbols')
+    if top_symbols:
+        parts.append(f'top_symbols={_message_value(top_symbols)}')
+
+    return ' | '.join(parts)
+
+
 def get_logger(name):
+    """Return a lean logger that writes application output to stdout.
+
+    Python's StreamHandler defaults to stderr, which Railway classifies as an
+    error stream. KAELEON operational logs are normal application output, so
+    they must go to stdout; severity is carried explicitly by structured audit
+    records.
+    """
     logger = logging.getLogger(name)
     if not logger.handlers:
-        h = logging.StreamHandler()
+        h = logging.StreamHandler(stream=sys.stdout)
         h.setFormatter(logging.Formatter('%(message)s'))
+        h._kaeleon_stdout_handler = True  # type: ignore[attr-defined]
         logger.addHandler(h)
         logger.propagate = False
     logger.setLevel(_level())
@@ -106,12 +167,15 @@ def get_logger(name):
 
 
 class AuditLogger:
-    """Lean structured logs for Railway.
+    """Lean Railway-native structured logs.
 
-    Operational logs are written to stdout only. They are deliberately *not*
-    persisted to MongoDB: business data already lives in positions/orders and
-    the latest engine state is an upsert, so duplicating logs in Mongo would add
-    cost without improving recovery.
+    Every audit record is emitted as a single JSON line with Railway's expected
+    ``message`` and ``level`` fields. Remaining fields stay queryable as custom
+    attributes (for example ``@decision_id:...`` or ``@symbol:BTC``).
+
+    Operational logs are deliberately *not* persisted to MongoDB: business data
+    already lives in positions/orders and the latest engine state is an upsert,
+    so duplicating logs in Mongo would add cost without improving recovery.
     """
 
     def __init__(self, db=None):
@@ -174,12 +238,18 @@ class AuditLogger:
         else:
             effective = 'DEBUG'
 
+        safe_data = _redact(data)
         record = {
+            **safe_data,
             'ts': datetime.now(timezone.utc).isoformat(),
             'event': event,
             'decision_id': decision_id,
-            **_redact(data),
+            'level': _railway_level(effective),
+            'message': _build_message(event, safe_data),
         }
         numeric = getattr(logging, effective, logging.INFO)
+        # One minified JSON object per line is required for Railway structured
+        # logging. The handler writes to stdout, so INFO records no longer appear
+        # as empty/red stderr entries in exported logs.
         self.logger.log(numeric, json.dumps(record, default=str, separators=(',', ':')))
         return record

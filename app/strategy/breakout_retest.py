@@ -1,55 +1,329 @@
 from __future__ import annotations
+
+from app.models.enums import Direction, Strategy
 from app.models.trading import TradeIntent
-from app.models.enums import Direction,Strategy
-from app.market.indicators import atr,adx,ema_metrics,relative_volume,clamp
+from app.strategy.source_math import adx, atr, candle_quality, clamp, ema, extract, pct_change
 
-H1_ADX_MIN=12.0; M15_ADX_MIN=11.0; M5_ADX_MIN=9.5; ATR_PCT_MIN=.00075; ATR_PCT_MAX=.0180; RESET_LOOKBACK_BARS=5; RESET_TOUCH_TOL_ATR=.38; RESET_BREAK_TOL_ATR=.48; TRIGGER_MAX_EMA20_EXTENSION_ATR=.95; SL_MIN=.0045; SL_MAX=.0068; SL_ATR_MULT=.88; SL_BUFFER_ATR=.10; TP_MIN=.0060; TP_MAX=.0085; MIN_SCORE=69.0
+EMA_FAST = 20
+EMA_MID = 50
+EMA_SLOW = 200
+ADX_PERIOD = 14
+EMA_SLOPE_LOOKBACK = 6
+MIN_CANDLES_REQUIRED = 260
+MIN_NONZERO_VOLUME_RATIO = 0.92
 
-def _bias(cs,adx_min):
-    if len(cs)<60:return 'none',{'reason':'insufficient_bars','bars':len(cs),'required':60}
-    e=ema_metrics(cs); a=adx(cs); p=cs[-1].close; spread=abs(e.get('ema20',p)-e.get('ema200',p))/max(p,1e-12)
-    if a<adx_min:return 'none',{'reason':'adx_below_threshold','adx':a,'adx_min':adx_min,'stack_spread':spread}
-    if e.get('bullish') or (p>e.get('ema20',p)>e.get('ema50',p) and e.get('slope20',0)>0): return 'long',{'adx':a,'stack_spread':spread}
-    if e.get('bearish') or (p<e.get('ema20',p)<e.get('ema50',p) and e.get('slope20',0)<0): return 'short',{'adx':a,'stack_spread':spread}
-    return 'none',{'reason':'ema_alignment_missing','adx':a,'stack_spread':spread}
+H1_ADX_MIN = 12.0
+M15_ADX_MIN = 11.0
+M5_ADX_MIN = 9.5
+ATR_PCT_MIN = 0.00075
+ATR_PCT_MAX = 0.0180
+TREND_STACK_MIN_PCT = 0.00030
+RESET_LOOKBACK_BARS = 5
+RESET_TOUCH_TOL_ATR = 0.38
+RESET_BREAK_TOL_ATR = 0.48
+TRIGGER_MAX_EMA20_EXTENSION_ATR = 0.95
+CONTINUATION_CONFIRM_TOL_ATR = 0.10
+MTF_SL_MIN_PCT = 0.0045
+MTF_SL_MAX_PCT = 0.0068
+MTF_SL_ATR_MULT = 0.88
+MTF_SL_BUFFER_ATR = 0.10
+MTF_TP_MIN_PCT = 0.0060
+MTF_TP_MAX_PCT = 0.0085
+MTF_RR_MIN = 1.05
+MTF_RR_MAX = 1.30
+MIN_RR_TO_SIGNAL = 0.95
+MIN_SCORE_TO_SIGNAL = 69.0
+MAX_SCORE = 100.0
+STRENGTH_MIN = 0.20
+STRENGTH_MAX = 0.97
+
+
+def _tf_values(candles):
+    o, h, l, c, v = extract(candles)
+    return {
+        "o": o,
+        "h": h,
+        "l": l,
+        "c": c,
+        "v": v,
+        "ema20": ema(c, EMA_FAST),
+        "ema50": ema(c, EMA_MID),
+        "ema200": ema(c, EMA_SLOW),
+        "adx": adx(h, l, c, ADX_PERIOD),
+        "atr": atr(h, l, c, ADX_PERIOD),
+    }
+
+
+def _bias(tf: dict, *, adx_min: float) -> tuple[str, dict]:
+    c = tf["c"]
+    ema20 = tf["ema20"]
+    ema50 = tf["ema50"]
+    ema200 = tf["ema200"]
+    if not c or not ema20 or not ema50 or not ema200:
+        return "none", {"reason": "NO_TF_DATA"}
+    close = float(c[-1])
+    adx_value = float(tf["adx"])
+    atr_pct = float(tf["atr"]) / max(close, 1e-12)
+    slope_idx20 = max(0, len(ema20) - 1 - EMA_SLOPE_LOOKBACK)
+    slope_idx50 = max(0, len(ema50) - 1 - EMA_SLOPE_LOOKBACK)
+    slope20 = pct_change(float(ema20[-1]), float(ema20[slope_idx20] or ema20[-1]))
+    slope50 = pct_change(float(ema50[-1]), float(ema50[slope_idx50] or ema50[-1]))
+    stack_spread = abs(float(ema20[-1]) - float(ema50[-1])) / max(close, 1e-12)
+    long_bias = (
+        close > ema20[-1] > ema50[-1] > ema200[-1]
+        and slope20 > 0.0
+        and slope50 >= -0.00010
+        and adx_value >= adx_min
+        and stack_spread >= TREND_STACK_MIN_PCT
+        and close >= ema20[-1]
+    )
+    short_bias = (
+        close < ema20[-1] < ema50[-1] < ema200[-1]
+        and slope20 < 0.0
+        and slope50 <= 0.00010
+        and adx_value >= adx_min
+        and stack_spread >= TREND_STACK_MIN_PCT
+        and close <= ema20[-1]
+    )
+    direction = "long" if long_bias else "short" if short_bias else "none"
+    return direction, {
+        "adx": round(adx_value, 2),
+        "atr_pct": round(atr_pct, 6),
+        "slope20": round(slope20, 6),
+        "slope50": round(slope50, 6),
+        "stack_spread": round(stack_spread, 6),
+        "close": round(close, 8),
+        "ema20": round(float(ema20[-1]), 8),
+        "ema50": round(float(ema50[-1]), 8),
+        "ema200": round(float(ema200[-1]), 8),
+    }
+
+
+def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
+    o, h, l, c = tf["o"], tf["h"], tf["l"], tf["c"]
+    ema20, ema50 = tf["ema20"], tf["ema50"]
+    atr_value = float(tf["atr"])
+    if len(c) < max(EMA_SLOW + 5, 80):
+        return False, "NOT_ENOUGH_BARS", {}
+    i = len(c) - 1
+    recent_idx = list(range(max(0, i - RESET_LOOKBACK_BARS), i))
+    if not recent_idx:
+        return False, "NO_RESET_WINDOW", {}
+    reset_low = min(l[j] for j in recent_idx)
+    reset_high = max(h[j] for j in recent_idx)
+    min_ema20 = min(float(ema20[j]) for j in recent_idx)
+    max_ema20 = max(float(ema20[j]) for j in recent_idx)
+    min_ema50 = min(float(ema50[j]) for j in recent_idx)
+    max_ema50 = max(float(ema50[j]) for j in recent_idx)
+    extension_atr = abs(float(c[i]) - float(ema20[i])) / max(atr_value, 1e-12)
+    prev_high = float(h[i - 1]) if i >= 1 else float(h[i])
+    prev_low = float(l[i - 1]) if i >= 1 else float(l[i])
+    confirm_tol = atr_value * CONTINUATION_CONFIRM_TOL_ATR
+
+    if direction == "long":
+        diag = {
+            "reset_low": reset_low,
+            "ema20_ref": max_ema20,
+            "ema50_ref": min_ema50,
+            "extension_atr": extension_atr,
+            "prev_high": prev_high,
+        }
+        if reset_low > max_ema20 + atr_value * RESET_TOUCH_TOL_ATR:
+            return False, "NO_5M_RESET_TOUCH", diag
+        if reset_low < min_ema50 - atr_value * RESET_BREAK_TOL_ATR:
+            return False, "RESET_TOO_DEEP", diag
+        reclaim_ok = (
+            float(c[i]) > float(ema20[i])
+            and float(c[i]) > float(o[i])
+            and (float(c[i]) >= prev_high - confirm_tol or float(h[i]) >= prev_high)
+        )
+        if not reclaim_ok:
+            return False, "NO_5M_CONTINUATION_CONFIRM", diag
+    else:
+        diag = {
+            "reset_high": reset_high,
+            "ema20_ref": min_ema20,
+            "ema50_ref": max_ema50,
+            "extension_atr": extension_atr,
+            "prev_low": prev_low,
+        }
+        if reset_high < min_ema20 - atr_value * RESET_TOUCH_TOL_ATR:
+            return False, "NO_5M_RESET_TOUCH", diag
+        if reset_high > max_ema50 + atr_value * RESET_BREAK_TOL_ATR:
+            return False, "RESET_TOO_DEEP", diag
+        reclaim_ok = (
+            float(c[i]) < float(ema20[i])
+            and float(c[i]) < float(o[i])
+            and (float(c[i]) <= prev_low + confirm_tol or float(l[i]) <= prev_low)
+        )
+        if not reclaim_ok:
+            return False, "NO_5M_CONTINUATION_CONFIRM", diag
+
+    if extension_atr > TRIGGER_MAX_EMA20_EXTENSION_ATR:
+        return False, "TOO_EXTENDED_AFTER_CONFIRM", diag
+    return True, "OK", diag
+
+
+def _fixed_tp_pct(*, score: float, atr_pct: float, sl_pct: float) -> tuple[float, float]:
+    rr_target = 1.14
+    rr_target += clamp((float(score) - 82.0) * 0.0048, -0.08, 0.10)
+    rr_target += clamp((float(atr_pct) - 0.0060) * 6.0, -0.04, 0.04)
+    rr_target = clamp(rr_target, MTF_RR_MIN, MTF_RR_MAX)
+    tp_pct = clamp(float(sl_pct) * rr_target, MTF_TP_MIN_PCT, MTF_TP_MAX_PCT)
+    rr_real = tp_pct / max(float(sl_pct), 1e-12)
+    return round(tp_pct, 6), round(rr_real, 4)
+
+
+def _break_even(score: float, strength: float, sl_pct: float, tp_pct: float) -> tuple[float, float, str]:
+    if score >= 88.0 or strength >= 0.88:
+        bucket, be_ratio, be_offset = "strong", 0.56, 0.00070
+    elif score >= 79.0 or strength >= 0.76:
+        bucket, be_ratio, be_offset = "base", 0.50, 0.00060
+    else:
+        bucket, be_ratio, be_offset = "weak", 0.45, 0.00055
+    activation = clamp(min(tp_pct * be_ratio, sl_pct * 0.95), 0.0028, 0.0049)
+    return round(activation, 6), round(be_offset, 6), bucket
+
 
 class BreakoutRetestStrategy:
-    def __init__(self): self.last_trace={}
-    def _reject(self,reason,**metrics): self.last_trace={'accepted':False,'reason':reason,**metrics}; return None
-    def evaluate(self,regime,candles,decision_id,symbol,timeframe,current_price=None,snapshot=None):
-        self.last_trace={'accepted':False,'reason':'not_evaluated'}
-        if regime.hard_block:return self._reject('regime_hard_block')
-        if not regime.breakout_allowed:return self._reject('regime_breakout_not_allowed')
-        tfs=getattr(snapshot,'timeframes',{}) if snapshot is not None else {}; c5=tfs.get('5m',candles); c15=tfs.get('15m',[]); c1=tfs.get('1h',[])
-        if len(c5)<60 or len(c15)<60 or len(c1)<60:return self._reject('insufficient_mtf_bars',bars_5m=len(c5),bars_15m=len(c15),bars_1h=len(c1))
-        p=float(current_price or c5[-1].close); a=atr(c5); ap=a/max(p,1e-12); a5=adx(c5)
-        if not (ATR_PCT_MIN<=ap<=ATR_PCT_MAX):return self._reject('atr_pct_out_of_range',atr_pct=ap,min=ATR_PCT_MIN,max=ATR_PCT_MAX)
-        if a5<M5_ADX_MIN:return self._reject('adx_5m_below_threshold',adx_5m=a5,min=M5_ADX_MIN)
-        b1,d1=_bias(c1,H1_ADX_MIN); b15,d15=_bias(c15,M15_ADX_MIN)
-        if b1=='none':return self._reject('bias_1h_missing',details=d1)
-        if b15=='none':return self._reject('bias_15m_missing',details=d15)
-        if b1!=b15:return self._reject('mtf_bias_mismatch',bias_1h=b1,bias_15m=b15,adx_1h=d1.get('adx'),adx_15m=d15.get('adx'))
-        e=ema_metrics(c5); e20=e.get('ema20',p); e50=e.get('ema50',p); e200=e.get('ema200',p); last=c5[-1]; prev=c5[-2]
-        recent=c5[-(RESET_LOOKBACK_BARS+2):-1]
-        if b1=='long':
-            touched=any(x.low<=e20+a*RESET_TOUCH_TOL_ATR and x.low>=e50-a*RESET_BREAK_TOL_ATR for x in recent); continuation=last.close>prev.high-a*.10 and last.close>e20; extension=(last.close-e20)/max(a,1e-12); stack_ok=last.close>e20>e50>e200
-            if not touched:return self._reject('retest_not_found',side='long')
-            if not continuation:return self._reject('continuation_not_confirmed',side='long')
-            if extension>TRIGGER_MAX_EMA20_EXTENSION_ATR:return self._reject('ema20_extension_too_high',extension_atr=extension,max=TRIGGER_MAX_EMA20_EXTENSION_ATR)
-            if not stack_ok:return self._reject('ema_stack_invalid',side='long',ema20=e20,ema50=e50,ema200=e200,price=last.close)
-            extreme=min(x.low for x in recent); structural=(p-extreme)/max(p,1e-12); direction=Direction.LONG
+    def __init__(self):
+        self.last_trace = {}
+
+    def _reject(self, reason, **metrics):
+        self.last_trace = {"accepted": False, "reason": reason, **metrics}
+        return None
+
+    def evaluate(self, regime, candles, decision_id, symbol, timeframe, current_price=None, snapshot=None):
+        self.last_trace = {"accepted": False, "reason": "not_evaluated"}
+        if regime.hard_block:
+            return self._reject("regime_hard_block")
+        if not regime.breakout_allowed:
+            return self._reject("regime_breakout_not_allowed")
+
+        timeframes = getattr(snapshot, "timeframes", {}) if snapshot is not None else {}
+        c5 = list(timeframes.get("5m", candles) or [])
+        c15 = list(timeframes.get("15m", []) or [])
+        c1h = list(timeframes.get("1h", []) or [])
+        ok5, diag5q = candle_quality(c5, MIN_CANDLES_REQUIRED, MIN_NONZERO_VOLUME_RATIO)
+        if not ok5:
+            return self._reject("bad_5m_candle_quality", **diag5q)
+        if len(c15) < 200 or len(c1h) < 200:
+            return self._reject("insufficient_mtf_bars", bars_5m=len(c5), bars_15m=len(c15), bars_1h=len(c1h))
+
+        tf5, tf15, tf1h = _tf_values(c5), _tf_values(c15), _tf_values(c1h)
+        close5 = float(tf5["c"][-1])
+        atr5 = float(tf5["atr"])
+        atr_pct = atr5 / max(close5, 1e-12)
+        adx5 = float(tf5["adx"])
+        if atr_pct < ATR_PCT_MIN:
+            return self._reject("atr_too_low", atr_pct=atr_pct, min=ATR_PCT_MIN)
+        if atr_pct > ATR_PCT_MAX:
+            return self._reject("atr_too_high", atr_pct=atr_pct, max=ATR_PCT_MAX)
+        if adx5 < M5_ADX_MIN:
+            return self._reject("adx_5m_below_threshold", adx_5m=adx5, min=M5_ADX_MIN)
+
+        bias1h, diag1h = _bias(tf1h, adx_min=H1_ADX_MIN)
+        bias15, diag15 = _bias(tf15, adx_min=M15_ADX_MIN)
+        if bias1h == "none":
+            return self._reject("bias_1h_missing", details=diag1h)
+        if bias15 == "none":
+            return self._reject("bias_15m_missing", details=diag15)
+        if bias1h != bias15:
+            return self._reject("mtf_bias_mismatch", bias_1h=bias1h, bias_15m=bias15)
+
+        ok_trigger, trigger_reason, trigger_diag = _trigger(bias1h, tf5)
+        if not ok_trigger:
+            return self._reject(trigger_reason.lower(), **trigger_diag)
+
+        if bias1h == "long":
+            reset_extreme = min(tf5["l"][max(0, len(tf5["l"]) - 1 - RESET_LOOKBACK_BARS): len(tf5["l"]) - 1])
+            structural_pct = max(0.0, (close5 - reset_extreme) / max(close5, 1e-12))
+            direction = Direction.LONG
         else:
-            touched=any(x.high>=e20-a*RESET_TOUCH_TOL_ATR and x.high<=e50+a*RESET_BREAK_TOL_ATR for x in recent); continuation=last.close<prev.low+a*.10 and last.close<e20; extension=(e20-last.close)/max(a,1e-12); stack_ok=last.close<e20<e50<e200
-            if not touched:return self._reject('retest_not_found',side='short')
-            if not continuation:return self._reject('continuation_not_confirmed',side='short')
-            if extension>TRIGGER_MAX_EMA20_EXTENSION_ATR:return self._reject('ema20_extension_too_high',extension_atr=extension,max=TRIGGER_MAX_EMA20_EXTENSION_ATR)
-            if not stack_ok:return self._reject('ema_stack_invalid',side='short',ema20=e20,ema50=e50,ema200=e200,price=last.close)
-            extreme=max(x.high for x in recent); structural=(extreme-p)/max(p,1e-12); direction=Direction.SHORT
-        h1q=clamp((d1['adx']-H1_ADX_MIN)/15,0,1); m15q=clamp((d15['adx']-M15_ADX_MIN)/14,0,1); m5q=clamp((a5-M5_ADX_MIN)/13,0,1); align=clamp((d1['stack_spread']+d15['stack_spread'])/(.00030*6),0,1); resetq=clamp(1-extension/TRIGGER_MAX_EMA20_EXTENSION_ATR,0,1); rv=relative_volume(c5)
-        quality=clamp(.30*h1q+.25*m15q+.20*m5q+.15*align+.10*resetq,0,1); score=min(100,69+28*quality+min(max(rv-1,0)*2,3))
-        if score<MIN_SCORE:return self._reject('score_too_low',score=score,min=MIN_SCORE,rvol=rv,adx_5m=a5,adx_15m=d15['adx'],adx_1h=d1['adx'])
-        sl_pct=clamp(max(ap*SL_ATR_MULT,structural+ap*SL_BUFFER_ATR),SL_MIN,SL_MAX); tp_pct=clamp(.0060+(score-69)*.00007,TP_MIN,TP_MAX)
-        stop=p*(1-sl_pct) if direction==Direction.LONG else p*(1+sl_pct); target=p*(1+tp_pct) if direction==Direction.LONG else p*(1-tp_pct)
-        risk_distance=abs(p-stop); reward_distance=abs(target-p); execution_rr=reward_distance/max(risk_distance,1e-12)
-        self.last_trace={'accepted':True,'reason':'setup_valid','score':score,'direction':direction.value,'atr_pct':ap,'adx_5m':a5,'adx_15m':d15['adx'],'adx_1h':d1['adx'],'rvol':rv,'sl_pct':sl_pct,'tp_pct':tp_pct,'entry':p,'stop':stop,'target':target,'execution_rr':execution_rr,'structural_stop_pct':structural}
-        return TradeIntent(decision_id,symbol,Strategy.BREAKOUT_RETEST,direction,p,stop,target,score,regime.risk_multiplier,timeframe,('mtf_1h_15m_alignment','5m_reset_retest','continuation_confirmed'),{'strategy_model':'mtf_simple_continuation_5m_v3_pure','score':score,'atr_pct':ap,'adx5':a5,'adx15':d15['adx'],'adx1h':d1['adx'],'rvol':rv,'sl_pct':sl_pct,'tp_pct':tp_pct,'execution_rr':execution_rr,'structural_stop_pct':structural,'partial_tp_enabled':False,'tp2_price':target,'break_even_activation_pct':clamp(max(sl_pct*.45,tp_pct*.38),.0028,.0042)})
+            reset_extreme = max(tf5["h"][max(0, len(tf5["h"]) - 1 - RESET_LOOKBACK_BARS): len(tf5["h"]) - 1])
+            structural_pct = max(0.0, (reset_extreme - close5) / max(close5, 1e-12))
+            direction = Direction.SHORT
+
+        sl_from_atr = atr_pct * MTF_SL_ATR_MULT
+        sl_from_structure = structural_pct + (atr_pct * MTF_SL_BUFFER_ATR)
+        sl_pct = clamp(max(sl_from_atr, sl_from_structure), MTF_SL_MIN_PCT, MTF_SL_MAX_PCT)
+        extension_atr = float(trigger_diag.get("extension_atr", 0.0) or 0.0)
+        h1_strength = clamp((float(diag1h.get("adx", 0.0)) - H1_ADX_MIN) / 15.0, 0.0, 1.0)
+        m15_strength = clamp((float(diag15.get("adx", 0.0)) - M15_ADX_MIN) / 14.0, 0.0, 1.0)
+        m5_strength = clamp((adx5 - M5_ADX_MIN) / 13.0, 0.0, 1.0)
+        trend_alignment_quality = clamp(
+            (float(diag1h.get("stack_spread", 0.0)) + float(diag15.get("stack_spread", 0.0)))
+            / max(TREND_STACK_MIN_PCT * 6.0, 1e-12),
+            0.0,
+            1.0,
+        )
+        reset_quality = clamp(1.0 - clamp(extension_atr / max(TRIGGER_MAX_EMA20_EXTENSION_ATR, 1e-12), 0.0, 1.0), 0.0, 1.0)
+        quality = clamp(
+            0.30 * h1_strength
+            + 0.25 * m15_strength
+            + 0.20 * m5_strength
+            + 0.15 * trend_alignment_quality
+            + 0.10 * reset_quality,
+            0.0,
+            1.0,
+        )
+        score = round(min(MAX_SCORE, 69.0 + 28.0 * quality), 2)
+        if score < MIN_SCORE_TO_SIGNAL:
+            return self._reject("score_too_low", score=score, min=MIN_SCORE_TO_SIGNAL)
+
+        tp_pct, execution_rr = _fixed_tp_pct(score=score, atr_pct=atr_pct, sl_pct=sl_pct)
+        if execution_rr < MIN_RR_TO_SIGNAL:
+            return self._reject("rr_too_low", execution_rr=execution_rr, min=MIN_RR_TO_SIGNAL)
+        stop = close5 * (1.0 - sl_pct) if direction == Direction.LONG else close5 * (1.0 + sl_pct)
+        target = close5 * (1.0 + tp_pct) if direction == Direction.LONG else close5 * (1.0 - tp_pct)
+        strength = clamp(score / 100.0, STRENGTH_MIN, STRENGTH_MAX)
+        be_activation, be_offset, bucket = _break_even(score, strength, sl_pct, tp_pct)
+
+        self.last_trace = {
+            "accepted": True,
+            "reason": "setup_valid",
+            "score": score,
+            "direction": direction.value,
+            "atr_pct": atr_pct,
+            "adx_5m": adx5,
+            "adx_15m": diag15["adx"],
+            "adx_1h": diag1h["adx"],
+            "sl_pct": sl_pct,
+            "tp_pct": tp_pct,
+            "entry": close5,
+            "stop": stop,
+            "target": target,
+            "execution_rr": execution_rr,
+            "structural_stop_pct": structural_pct,
+        }
+        return TradeIntent(
+            decision_id,
+            symbol,
+            Strategy.BREAKOUT_RETEST,
+            direction,
+            close5,
+            stop,
+            target,
+            score,
+            regime.risk_multiplier,
+            timeframe,
+            ("mtf_1h_15m_alignment", "5m_reset_retest", "continuation_confirmed"),
+            {
+                "strategy_model": "mtf_simple_continuation_5m_v2",
+                "score": score,
+                "strength": strength,
+                "atr_pct": atr_pct,
+                "adx5": adx5,
+                "adx15": diag15["adx"],
+                "adx1h": diag1h["adx"],
+                "sl_pct": sl_pct,
+                "tp_pct": tp_pct,
+                "execution_rr": execution_rr,
+                "structural_stop_pct": structural_pct,
+                "partial_tp_enabled": False,
+                "tp2_price": target,
+                "break_even_activation_pct": be_activation,
+                "break_even_offset_pct": be_offset,
+                "management_bucket": bucket,
+            },
+        )

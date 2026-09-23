@@ -132,6 +132,8 @@ async def save_trading_config(req: TradingConfigRequest, authorization: str | No
         # leave a too-large allocation stored in the profile.
         if req.operating_capital is not None:
             requested = float(req.operating_capital)
+            if requested < settings.min_operating_capital:
+                raise ValueError("operating_capital_below_platform_minimum")
             before = profiles.public(uid)
             if not before.coinw_verified:
                 raise ValueError("coinw_verification_required_for_capital")

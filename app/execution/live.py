@@ -31,5 +31,8 @@ class LiveExecutionEngine:
             self._position_cache_ts[symbol] = now
         return list(self._position_cache.get(symbol, []))
 
+    async def pending_order_status(self, order_id):
+        return await self.coinw.pending_order_status(order_id)
+
     async def sync(self, instruments):
         return await self.coinw.sync_positions(instruments)

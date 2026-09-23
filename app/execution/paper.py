@@ -36,6 +36,9 @@ class PaperExecutionEngine:
         if self.audit: self.audit.event('PAPER_FILL',intent.decision_id,position_id=pid,quantity=base_quantity,notional=quantity,price=fill,fee=fee)
         return {'accepted':True,'filled':True,'position_id':pid,'fill_price':fill,'fee':fee,'mode':'demo','position':p}
 
+    async def get_equity(self, max_age_seconds=0.0):
+        return float(self.equity)
+
     def on_realized(self, position, gross_pnl, quantity, price):
         exit_fee=price*quantity*self.fee_rate
         position.exit_fee += exit_fee

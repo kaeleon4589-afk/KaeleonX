@@ -37,6 +37,9 @@ def setup_function():
     TEST_SETTINGS = settings
     auth_api.get_settings = lambda: settings
     user_api_module.get_settings = lambda: settings
+    async def fake_equity(profiles, user_id):
+        return 100.0
+    user_api_module._coinw_equity = fake_equity
 
 
 def register_and_login(phone):
@@ -60,28 +63,22 @@ def test_user_coinw_credentials_and_capital_are_isolated_and_secret_never_return
     h1 = {'Authorization': f'Bearer {t1}'}
     h2 = {'Authorization': f'Bearer {t2}'}
 
+    # LIVE is still entitlement-gated.
     r = c1.put('/user/trading-config', headers=h1, json={
-        'execution_mode': 'live',
-        'trading_enabled': True,
-        'operating_capital': 10,
-        'coinw_api_key': 'key-user-1-123456',
-        'coinw_api_secret': 'secret-user-1-abcdef',
+        'execution_mode': 'live', 'trading_enabled': True,
+        'coinw_api_key': 'key-user-1-123456', 'coinw_api_secret': 'secret-user-1-abcdef',
     })
-    assert r.status_code == 403  # live entitlement is not active
+    assert r.status_code == 403
 
+    # Credentials are saved first, then explicitly verified, then capital/trading.
     r = c1.put('/user/trading-config', headers=h1, json={
-        'execution_mode': 'demo',
-        'trading_enabled': True,
-        'operating_capital': 10,
+        'execution_mode': 'demo', 'trading_enabled': False,
+        'coinw_api_key': 'key-user-1-123456', 'coinw_api_secret': 'secret-user-1-abcdef',
     })
     assert r.status_code == 200
-
+    user_api_module._profiles.mark_verified(u1, 100.0)
     r = c1.put('/user/trading-config', headers=h1, json={
-        'execution_mode': 'demo',
-        'trading_enabled': False,
-        'operating_capital': 12,
-        'coinw_api_key': 'key-user-1-123456',
-        'coinw_api_secret': 'secret-user-1-abcdef',
+        'execution_mode': 'demo', 'trading_enabled': True, 'operating_capital': 12,
     })
     assert r.status_code == 200
     body = r.json()
@@ -105,7 +102,6 @@ def test_user_coinw_credentials_and_capital_are_isolated_and_secret_never_return
     assert stored['coinw_api_secret_encrypted'] != 'secret-user-1-abcdef'
     assert auth_api._db.find_one('user_trading_profiles', {'user_id': u2}) is None
 
-
 def test_operating_capital_minimum_is_enforced():
     c, token, _ = register_and_login('5553030303')
     r = c.put('/user/trading-config', headers={'Authorization': f'Bearer {token}'}, json={
@@ -122,11 +118,16 @@ def test_live_credentials_cannot_change_or_switch_while_open_position_exists():
     billing = BillingService(db, trial_days=TEST_SETTINGS.live_trial_days)
     billing.activate_live_first_time(uid)
     r = c.put('/user/trading-config', headers=h, json={
-        'execution_mode': 'live', 'trading_enabled': False, 'operating_capital': 10,
+        'execution_mode': 'live', 'trading_enabled': False,
         'coinw_api_key': 'key-12345678', 'coinw_api_secret': 'secret-12345678',
     })
     assert r.status_code == 200
-    db.upsert('positions', {'position_id': 'p-live-1'}, {'user_id': uid, 'status': 'OPEN', 'symbol': 'BTC'})
+    user_api_module._profiles.mark_verified(uid, 100.0)
+    r = c.put('/user/trading-config', headers=h, json={
+        'execution_mode': 'live', 'trading_enabled': False, 'operating_capital': 10,
+    })
+    assert r.status_code == 200
+    db.upsert('positions', {'position_id': 'p-live-1'}, {'user_id': uid, 'status': 'OPEN', 'symbol': 'BTC', 'mode': 'live'})
     r = c.put('/user/trading-config', headers=h, json={
         'execution_mode': 'demo', 'trading_enabled': False, 'operating_capital': 10,
     })

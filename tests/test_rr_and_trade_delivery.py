@@ -43,6 +43,6 @@ def test_breakout_strategy_exposes_execution_rr_in_trace_and_metadata():
     # as liquidity sweep once a setup is accepted.
     src = Path(__file__).resolve().parents[1] / "app" / "strategy" / "breakout_retest.py"
     text = src.read_text(encoding="utf-8")
-    assert "'execution_rr':execution_rr" in text
-    assert "'structural_stop_pct':structural" in text
+    assert '"execution_rr": execution_rr' in text
+    assert '"structural_stop_pct": structural_pct' in text
     assert "Strategy.BREAKOUT_RETEST" in text

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio,time
+import asyncio,time,math
 from app.models.market import Candle,MarketSnapshot
 
 class MarketCoordinator:
@@ -20,20 +20,48 @@ class MarketCoordinator:
         return sorted(out,key=lambda x:x.timestamp)
     @staticmethod
     def _parse_depth(raw):
-        data=raw.get('data',raw) if isinstance(raw,dict) else raw; bids=data.get('bids',[]) if isinstance(data,dict) else []; asks=data.get('asks',[]) if isinstance(data,dict) else []
-        def parse(xs):
-            out=[]
-            for x in xs:
-                try: out.append((float(x[0] if not isinstance(x,dict) else x.get('price')),float(x[1] if not isinstance(x,dict) else x.get('quantity',x.get('qty')))))
-                except Exception: pass
-            return out
-        return parse(bids),parse(asks)
+        """Parse actual CoinW futures depth levels (``p`` price, ``m`` size).
+
+        Prior code expected ``price``/``quantity``, discarded every level of
+        CoinW's documented ``{"p": ..., "m": ...}`` response, and made all
+        executable signals fail with ``orderbook_valid=false``. Accept generic
+        aliases for fixtures and future API adaptations, but never fabricate a
+        quote when one side is absent or contains invalid prices/sizes.
+        """
+        data = raw.get('data', raw) if isinstance(raw, dict) else raw
+        if isinstance(data, dict) and isinstance(data.get('data'), dict):
+            data = data['data']
+        if not isinstance(data, dict):
+            return [], []
+
+        def parse(rows, reverse):
+            levels = []
+            for item in rows if isinstance(rows, (list, tuple)) else []:
+                try:
+                    if isinstance(item, dict):
+                        price = item.get('p')
+                        if price is None: price = item.get('price')
+                        size = item.get('m')
+                        if size is None: size = item.get('quantity')
+                        if size is None: size = item.get('qty')
+                    else:
+                        price, size = item[0], item[1]
+                    price, size = float(price), float(size)
+                    if math.isfinite(price) and math.isfinite(size) and price > 0 and size > 0:
+                        levels.append((price, size))
+                except (TypeError, ValueError, IndexError, KeyError):
+                    continue
+            # Using the true best quotes protects execution if depth arrives
+            # unsorted; an empty or crossed book is still rejected downstream.
+            return sorted(levels, key=lambda level: level[0], reverse=reverse)
+
+        return parse(data.get('bids'), True), parse(data.get('asks'), False)
     async def snapshot(self,symbol=None,btc_candles=None):
         sym=symbol or self.symbol
         k5,k15,k1h,depth=await asyncio.gather(self.client.klines(sym,'5m',320),self.client.klines(sym,'15m',240),self.client.klines(sym,'1h',240),self.client.depth(sym))
         c5=self._parse_klines(k5); c15=self._parse_klines(k15); c1h=self._parse_klines(k1h); bids,asks=self._parse_depth(depth); bid=bids[0][0] if bids else None; ask=asks[0][0] if asks else None
         if not c5: raise RuntimeError(f'no_candles:{sym}')
-        return type('RuntimeSnapshot',(object,),{'symbol':sym,'timeframe':'5m','candles':c5,'timeframes':{'5m':c5,'15m':c15,'1h':c1h},'btc_candles':btc_candles,'bid':bid,'ask':ask,'orderbook_valid':bool(bids and asks),'data_complete':len(c5)>=260 and len(c15)>=100 and len(c1h)>=100,'bids':bids,'asks':asks,'last':c5[-1].close})()
+        return type('RuntimeSnapshot',(object,),{'symbol':sym,'timeframe':'5m','candles':c5,'timeframes':{'5m':c5,'15m':c15,'1h':c1h},'btc_candles':btc_candles,'bid':bid,'ask':ask,'orderbook_valid':bool(bids and asks and bid < ask),'data_complete':len(c5)>=260 and len(c15)>=100 and len(c1h)>=100,'bids':bids,'asks':asks,'last':c5[-1].close})()
     async def run(self,on_snapshot):
         while True:
             started=time.monotonic()

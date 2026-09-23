@@ -381,6 +381,31 @@ class TradingOrchestrator:
                 )
                 return None
 
+            # A valid strategy setup is not yet executable if CoinW has not
+            # supplied both sides of a real order book. Fail closed *before*
+            # SIGNAL_ACCEPTED: that event should represent a signal ready to
+            # pass through risk and execution, not a candle-only candidate.
+            try:
+                quote_bid = float(snapshot.bid)
+                quote_ask = float(snapshot.ask)
+            except (TypeError, ValueError, OverflowError):
+                quote_bid, quote_ask = 0.0, 0.0
+            quote_valid = (
+                math.isfinite(quote_bid) and math.isfinite(quote_ask)
+                and quote_bid > 0 and quote_ask > quote_bid
+                and getattr(snapshot, "orderbook_valid", True) is not False
+            )
+            if not quote_valid:
+                self.last_decision[key] = now
+                self.audit.event(
+                    "MARKET_DATA_SKIPPED", decision_id, user_id=user_id,
+                    mode=self.execution_mode, symbol=snapshot.symbol,
+                    strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    reason="invalid_orderbook",
+                    orderbook_valid=getattr(snapshot, "orderbook_valid", None),
+                )
+                return {"accepted": False, "filled": False, "reason": "invalid_orderbook"}
+
             structural_rr = (getattr(intent, "metadata", {}) or {}).get(
                 "structural_rr_estimate"
             )
@@ -440,14 +465,19 @@ class TradingOrchestrator:
 
             # ----------------------- EXECUTION STAGE ------------------------
             # No Mongo/Telegram work has run between SIGNAL_ACCEPTED and here.
+            # Keep the market guard as a second fail-closed safety boundary.
+            # The coordinator normally supplies this validated snapshot; never
+            # silently substitute last candle price when book data is missing.
             try:
                 market_bid = float(snapshot.bid)
                 market_ask = float(snapshot.ask)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 market_bid = 0.0
                 market_ask = 0.0
 
-            if market_bid <= 0 or market_ask <= 0:
+            if (not math.isfinite(market_bid) or not math.isfinite(market_ask)
+                    or market_bid <= 0 or market_ask <= market_bid
+                    or getattr(snapshot, "orderbook_valid", True) is False):
                 result = {"accepted": False, "filled": False, "reason": "market_unavailable"}
                 terminal_event_emitted = True
                 self.last_decision[key] = now

@@ -32,10 +32,8 @@ _STATE_INFO = {
     'MARKET_DATA_SKIPPED',
 }
 _ALWAYS_ERROR = {
-    'MARKET_SCAN_ERROR',
     'MARKET_LOOP_ERROR',
     'WORKER_CRASHED',
-    'BTC_CONTEXT_ERROR',
     'POSITION_SYNC_ERROR',
     'USER_RUNTIME_ERROR',
     'USER_RUNTIME_CONFIG_ERROR',
@@ -50,6 +48,10 @@ _ALWAYS_ERROR = {
 _THROTTLED_WARNING = {
     'MARKET_SNAPSHOT_ERROR',
     'MARKET_SCAN_FAILSAFE_CACHE',
+    'MARKET_SCAN_ERROR',
+    'BTC_CONTEXT_ERROR',
+    'MARKET_DEPTH_ERROR',
+    'MARKET_INSTRUMENTS_ERROR',
 }
 _DEBUG_ONLY = {
     'DECISION_START',
@@ -130,8 +132,9 @@ class AuditLogger:
             return f'{selected or "NONE"}|{reason or ""}'
         if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED'}:
             return str(data.get('reason') or 'unknown')
-        if event == 'MARKET_SNAPSHOT_ERROR':
-            return str(data.get('error') or 'market_snapshot_error')
+        if event in {'MARKET_SNAPSHOT_ERROR', 'MARKET_DEPTH_ERROR',
+                     'MARKET_INSTRUMENTS_ERROR', 'BTC_CONTEXT_ERROR', 'MARKET_SCAN_ERROR'}:
+            return '|'.join(str(data.get(k) or '') for k in ('stage', 'api_code', 'endpoint', 'error'))
         return ''
 
     def _should_emit_state(self, event: str, data: dict) -> bool:
@@ -144,7 +147,7 @@ class AuditLogger:
         signature = self._state_signature(event, data)
         now = time.monotonic()
         previous = self._last_state.get(key)
-        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED', 'MARKET_SNAPSHOT_ERROR'} else self.state_repeat_seconds
+        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED', 'MARKET_SNAPSHOT_ERROR', 'MARKET_DEPTH_ERROR', 'MARKET_INSTRUMENTS_ERROR', 'BTC_CONTEXT_ERROR', 'MARKET_SCAN_ERROR'} else self.state_repeat_seconds
         if previous and previous[0] == signature and now - previous[1] < repeat:
             return False
         self._last_state[key] = (signature, now)

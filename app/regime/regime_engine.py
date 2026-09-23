@@ -10,7 +10,8 @@ class RegimeEngine:
         f=features(snapshot.candles,getattr(snapshot,'btc_candles',None)); cand,conf,scores=classify(f); state=advance(cand,self._states.get(snapshot.symbol)); self._states[snapshot.symbol]=state; active=state['active']
         bias=f.get('trend_bias','neutral'); direction=Direction.BULLISH if bias=='long' else (Direction.BEARISH if bias=='short' else Direction.NEUTRAL)
         hard=active==UNKNOWN; breakout=active==TREND and not hard; sweep=active==VOLATILE and not hard
-        if active==RANGE: sweep=True
+        # Source enforced router keeps RANGE shadow-only: no executable sweep.
+        if active==RANGE: sweep=False
         rs=RegimeState.TRENDING if active==TREND else (RegimeState.RANGING if active==RANGE else (RegimeState.EXTREME if active==VOLATILE else RegimeState.TRANSITION))
         risk=1.0 if active==TREND else (.80 if active==VOLATILE else (.65 if active==RANGE else .0))
         self.last_metadata={'candidate':cand,'active':active,'confidence':conf,'scores':scores,'features':f,'state':state}

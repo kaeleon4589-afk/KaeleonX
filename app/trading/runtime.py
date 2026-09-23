@@ -21,7 +21,8 @@ from app.auth.service import AuthService
 from app.telegram.notifications import TelegramTradeNotifier
 from app.orchestrator import TradingOrchestrator
 from app.trading.profile import UserTradingProfileService
-from app.trading.metrics import calculate_performance
+from app.trading.persistence import TradePersistence
+from app.trading.metrics import calculate_performance, position_net_pnl
 from app.models.trading import Position
 from app.models.enums import Direction
 
@@ -36,6 +37,10 @@ class UserRuntime:
     execution: object
     position_manager: PositionManager
     orchestrator: TradingOrchestrator
+    coinw_verified: bool = False
+    live_allowed: bool = True
+    last_state_persist: float = 0.0
+    last_state_signature: str = ""
 
 
 class UserTradingRuntimeManager:
@@ -74,7 +79,7 @@ class UserTradingRuntimeManager:
         enabled = bool(row.get("trading_enabled", False))
         capital = float(row.get("operating_capital", self.settings.min_operating_capital))
         if mode == TradingEnvironment.LIVE.value:
-            creds = self.profiles.credentials(user_id)
+            creds = await asyncio.to_thread(self.profiles.credentials, user_id)
             adapter = build_live_adapter_from_credentials(
                 creds.api_key,
                 creds.api_secret,
@@ -101,13 +106,25 @@ class UserTradingRuntimeManager:
             owner_mode=mode,
             evaluate_local_exits=local_exits,
             on_closed=lambda position: self.notifier.position_closed(user_id, mode, position),
+            on_opened=lambda position: self.notifier.position_opened(user_id, mode, position),
+            persist_interval_seconds=self.settings.engine_state_persist_seconds,
         )
         if hasattr(execution, "on_realized"):
             position_manager.on_realized = execution.on_realized
 
-        # Recover persisted open positions after worker restarts so duplicate entries
-        # are not created before the exchange/local state is reconciled.
-        for row in self.db.find_many("positions", {"user_id": user_id, "status": "OPEN", "mode": mode}, limit=1000):
+        # Recover product state before the market loop starts. DEMO equity is also
+        # reconstructed from persisted PnL/fees so a worker restart does not reset
+        # the virtual wallet back to 100 USDT.
+        persisted_positions = await asyncio.to_thread(
+            self.db.find_many, "positions", {"user_id": user_id, "mode": mode}, limit=10000
+        )
+        if mode == TradingEnvironment.DEMO.value and hasattr(execution, "equity"):
+            execution.equity = max(
+                0.0,
+                float(self.settings.paper_initial_equity)
+                + sum(position_net_pnl(item) for item in persisted_positions),
+            )
+        for row in (x for x in persisted_positions if str(x.get("status", "OPEN")).upper() == "OPEN"):
             try:
                 direction = row.get("direction")
                 if not isinstance(direction, Direction):
@@ -159,6 +176,12 @@ class UserTradingRuntimeManager:
             self.signal_factory,
             execution_mode=mode,
             on_position_opened=lambda position: self.notifier.position_opened(user_id, mode, position),
+            on_position_closed=lambda position: self.notifier.position_closed(user_id, mode, position),
+            persistence=TradePersistence(
+                self.db, self.audit,
+                timeout_seconds=self.settings.trade_persist_timeout_seconds,
+                retries=self.settings.trade_persist_retries,
+            ),
         )
         return UserRuntime(
             user_id=user_id,
@@ -169,6 +192,8 @@ class UserTradingRuntimeManager:
             execution=execution,
             position_manager=position_manager,
             orchestrator=orchestrator,
+            coinw_verified=bool(row.get("coinw_verified", False)),
+            live_allowed=True,
         )
 
     async def refresh(self) -> None:
@@ -179,24 +204,35 @@ class UserTradingRuntimeManager:
             now = time.monotonic()
             if now - self._last_refresh < self.settings.user_runtime_refresh_seconds:
                 return
-            users = self.db.find_many("users", {"status": "active"}, limit=self.settings.max_active_users)
+            users = await asyncio.to_thread(
+                self.db.find_many, "users", {"status": "active"}, limit=self.settings.max_active_users
+            )
             live_user_ids = set()
             for user in users:
                 uid = str(user["user_id"])
-                profile = self.profiles.get(uid)
+                profile = await asyncio.to_thread(self.profiles.get, uid)
                 if not profile:
                     continue
                 live_user_ids.add(uid)
                 fp = self._fingerprint(profile)
+                mode = str(profile.get("execution_mode", "demo"))
+                live_allowed = True
+                if mode == TradingEnvironment.LIVE.value:
+                    entitlement = await asyncio.to_thread(self.billing.entitlement, uid)
+                    live_allowed = bool(entitlement.live_allowed)
                 current = self._runtimes.get(uid)
                 if current and current.fingerprint == fp:
                     # Keep the execution/position state intact while applying
                     # user setting changes such as capital or enable/disable.
                     current.trading_enabled = bool(profile.get("trading_enabled", False))
                     current.configured_capital = float(profile.get("operating_capital", self.settings.min_operating_capital))
+                    current.coinw_verified = bool(profile.get("coinw_verified", False))
+                    current.live_allowed = live_allowed
                     continue
                 try:
-                    self._runtimes[uid] = await self._build_runtime(uid, profile, fp)
+                    built = await self._build_runtime(uid, profile, fp)
+                    built.live_allowed = live_allowed
+                    self._runtimes[uid] = built
                 except Exception as exc:
                     self.audit.event("USER_RUNTIME_CONFIG_ERROR", uid, user_id=uid, error=str(exc))
                     self._runtimes.pop(uid, None)
@@ -211,13 +247,10 @@ class UserTradingRuntimeManager:
         for runtime in list(self._runtimes.values()):
             try:
                 self.audit.event('USER_MARKET_ANALYSIS_START', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, trading_enabled=runtime.trading_enabled, configured_capital=runtime.configured_capital)
-                live_allowed = True
-                if runtime.mode == TradingEnvironment.LIVE.value:
-                    live_allowed = self.billing.entitlement(runtime.user_id).live_allowed
+                live_allowed = runtime.live_allowed
 
                 if hasattr(runtime.execution, "get_equity"):
                     available_equity = await runtime.execution.get_equity()
-                    self.profiles.update_available_equity(runtime.user_id, available_equity)
                 else:
                     # DEMO always owns a fixed virtual wallet. The configured
                     # capital is only the portion allocated to KAELEON.
@@ -226,7 +259,7 @@ class UserTradingRuntimeManager:
                 effective_capital = min(runtime.configured_capital, float(available_equity))
                 if effective_capital < self.settings.min_operating_capital:
                     self.audit.event('ENTRY_BLOCKED', runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='insufficient_capital', effective_capital=effective_capital, minimum=self.settings.min_operating_capital)
-                    self._persist_state(runtime, available_equity, effective_capital, "INSUFFICIENT_CAPITAL", snapshot)
+                    await self._persist_state(runtime, available_equity, effective_capital, "INSUFFICIENT_CAPITAL", snapshot)
                     continue
 
                 allow_entries = runtime.trading_enabled and live_allowed
@@ -244,39 +277,84 @@ class UserTradingRuntimeManager:
                     status = "ACTIVO" if runtime.trading_enabled else "PAUSADO"
                 if result and result.get("filled"):
                     status = "OPERANDO"
-                self._persist_state(runtime, available_equity, effective_capital, status, snapshot)
+                state_changed = runtime.position_manager.consume_state_changed()
+                await self._persist_state(
+                    runtime, available_equity, effective_capital, status, snapshot,
+                    force=bool(state_changed or (result and result.get("filled"))),
+                )
             except Exception as exc:
                 self.audit.event("USER_RUNTIME_ERROR", runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, error=str(exc))
-                self._persist_state(runtime, 0.0, 0.0, "ERROR", snapshot)
+                await self._persist_state(runtime, 0.0, 0.0, "ERROR", snapshot)
 
-    def _persist_state(self, runtime: UserRuntime, available_equity: float, effective_capital: float, status: str, snapshot=None) -> None:
-        open_position = next(
-            (p.__dict__ for p in runtime.position_manager.positions.values() if p.status == "OPEN"),
+    async def _persist_state(self, runtime: UserRuntime, available_equity: float, effective_capital: float, status: str, snapshot=None, *, force: bool = False) -> None:
+        """Persist dashboard state at a bounded cadence without blocking the market loop.
+
+        Symbol rotation is intentionally *not* allowed to bypass the cadence.  The
+        previous implementation included ``last_symbol`` in its signature and could
+        therefore write to Mongo on every scanner tick.  Fills/position state changes
+        still force an immediate durable update.
+        """
+        now = time.monotonic()
+        interval = float(self.settings.engine_state_persist_seconds)
+        if not force and runtime.last_state_persist > 0 and now - runtime.last_state_persist < interval:
+            return
+
+        open_obj = next(
+            (p for p in runtime.position_manager.positions.values() if p.status == "OPEN"),
             None,
         )
-        positions = self.db.find_many("positions", {"user_id": runtime.user_id, "mode": runtime.mode}, limit=10000)
-        metrics = calculate_performance(positions, runtime.configured_capital)
-        state_key = {"user_id": runtime.user_id, "mode": runtime.mode.upper()}
-        regime_meta = getattr(runtime.orchestrator.regime_engine, 'last_metadata', {}) or {}
-        strategy_trace = getattr(runtime.orchestrator.router, 'last_trace', {}) or {}
-        self.db.upsert("user_engine_state", state_key, {
-            "user_id": runtime.user_id,
-            "mode": runtime.mode.upper(),
-            "status": status,
-            "configured_capital": runtime.configured_capital,
-            "capital": effective_capital,
-            "available_equity": float(available_equity),
-            "trading_enabled": runtime.trading_enabled,
-            "coinw_connected": self.profiles.public(runtime.user_id).coinw_verified,
-            "open_position": open_position,
-            "markets_scanned": int(getattr(snapshot, 'markets_scanned', 0) or 0),
-            "candidates": int(getattr(snapshot, 'candidates', 0) or 0),
-            "last_symbol": getattr(snapshot, 'symbol', None),
-            "last_price": getattr(snapshot, 'last', None),
-            "regime": regime_meta.get('active'),
-            "regime_candidate": regime_meta.get('candidate'),
-            "regime_confidence": regime_meta.get('confidence'),
-            "strategy": strategy_trace.get('selected'),
-            "last_strategy_trace": strategy_trace,
-            **metrics,
-        })
+        regime_meta = getattr(runtime.orchestrator.regime_engine, "last_metadata", {}) or {}
+        strategy_trace = getattr(runtime.orchestrator.router, "last_trace", {}) or {}
+        signature = "|".join([
+            str(status),
+            str(getattr(open_obj, "position_id", "")),
+            str(regime_meta.get("active") or ""),
+            str(strategy_trace.get("selected") or ""),
+        ])
+        open_position = dict(open_obj.__dict__) if open_obj is not None else None
+
+        try:
+            positions = await asyncio.to_thread(
+                self.db.find_many,
+                "positions",
+                {"user_id": runtime.user_id, "mode": runtime.mode},
+                limit=10000,
+            )
+            metrics = calculate_performance(positions, runtime.configured_capital)
+            state_key = {"user_id": runtime.user_id, "mode": runtime.mode.upper()}
+            state_doc = {
+                "user_id": runtime.user_id,
+                "mode": runtime.mode.upper(),
+                "status": status,
+                "configured_capital": runtime.configured_capital,
+                "capital": effective_capital,
+                "available_equity": float(available_equity),
+                "trading_enabled": runtime.trading_enabled,
+                "coinw_connected": runtime.coinw_verified,
+                "open_position": open_position,
+                "markets_scanned": int(getattr(snapshot, 'markets_scanned', 0) or 0),
+                "candidates": int(getattr(snapshot, 'candidates', 0) or 0),
+                "last_symbol": getattr(snapshot, 'symbol', None),
+                "last_price": getattr(snapshot, 'last', None),
+                "regime": regime_meta.get('active'),
+                "regime_candidate": regime_meta.get('candidate'),
+                "regime_confidence": regime_meta.get('confidence'),
+                "strategy": strategy_trace.get('selected'),
+                "last_strategy_trace": strategy_trace,
+                **metrics,
+            }
+            await asyncio.to_thread(self.db.upsert, "user_engine_state", state_key, state_doc)
+            # Equity is product state too, but it does not need a write on every
+            # symbol.  Keep it on the same bounded cadence as engine state.
+            await asyncio.to_thread(
+                self.profiles.update_available_equity, runtime.user_id, available_equity
+            )
+            runtime.last_state_persist = now
+            runtime.last_state_signature = signature
+        except Exception as exc:
+            self.audit.event(
+                "ENGINE_STATE_PERSIST_ERROR", runtime.user_id, level="ERROR",
+                user_id=runtime.user_id, mode=runtime.mode,
+                symbol=getattr(snapshot, "symbol", None),
+                error=f"{type(exc).__name__}: {exc}",
+            )

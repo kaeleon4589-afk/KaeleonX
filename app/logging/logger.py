@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -33,8 +32,10 @@ _STATE_INFO = {
     'MARKET_DATA_SKIPPED',
 }
 _ALWAYS_ERROR = {
+    'MARKET_SCAN_ERROR',
     'MARKET_LOOP_ERROR',
     'WORKER_CRASHED',
+    'BTC_CONTEXT_ERROR',
     'POSITION_SYNC_ERROR',
     'USER_RUNTIME_ERROR',
     'USER_RUNTIME_CONFIG_ERROR',
@@ -49,10 +50,6 @@ _ALWAYS_ERROR = {
 _THROTTLED_WARNING = {
     'MARKET_SNAPSHOT_ERROR',
     'MARKET_SCAN_FAILSAFE_CACHE',
-    'MARKET_SCAN_ERROR',
-    'BTC_CONTEXT_ERROR',
-    'MARKET_DEPTH_ERROR',
-    'MARKET_INSTRUMENTS_ERROR',
 }
 _DEBUG_ONLY = {
     'DECISION_START',
@@ -85,7 +82,7 @@ def _redact(value, key: str | None = None):
     if isinstance(value, dict):
         return {k: _redact(v, k) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        # Never dump long indicator/candle/EMA series into Railway logs. They
+        # Never dump long indicator/candle/EMA series into Railway logs.  They
         # can contain hundreds of values and add cost without operational value.
         if len(value) > 12:
             return {"_sequence_omitted": True, "count": len(value)}
@@ -95,71 +92,11 @@ def _redact(value, key: str | None = None):
     return value
 
 
-def _railway_level(effective: str) -> str:
-    """Return one of Railway's canonical structured-log severities."""
-    level = str(effective or 'INFO').upper()
-    if level == 'DEBUG':
-        return 'debug'
-    if level in {'WARNING', 'WARN'}:
-        return 'warn'
-    if level in {'ERROR', 'CRITICAL'}:
-        return 'error'
-    return 'info'
-
-
-def _message_value(value, *, limit: int = 260) -> str:
-    if isinstance(value, (list, tuple)):
-        text = ','.join(str(v) for v in value[:8])
-        if len(value) > 8:
-            text += f',…(+{len(value) - 8})'
-    elif isinstance(value, dict):
-        text = json.dumps(value, default=str, separators=(',', ':'))
-    else:
-        text = str(value)
-    if len(text) > limit:
-        return text[:limit] + '…'
-    return text
-
-
-def _build_message(event: str, data: dict) -> str:
-    """Build a compact human-readable message for Railway exports.
-
-    Railway displays the ``message`` field as the visible log text. Keep it
-    concise while retaining the fields needed to diagnose the trading pipeline.
-    All values passed here have already gone through secret redaction.
-    """
-    preferred = (
-        'symbol', 'mode', 'strategy', 'direction', 'state', 'candidate',
-        'reason', 'stage', 'api_code', 'endpoint', 'markets_scanned', 'market',
-        'quality', 'execution_rr', 'orderbook_valid', 'error',
-    )
-    parts = [str(event)]
-    for key in preferred:
-        value = data.get(key)
-        if value is None or value == '':
-            continue
-        parts.append(f'{key}={_message_value(value)}')
-
-    top_symbols = data.get('top_symbols')
-    if top_symbols:
-        parts.append(f'top_symbols={_message_value(top_symbols)}')
-
-    return ' | '.join(parts)
-
-
 def get_logger(name):
-    """Return a lean logger that writes application output to stdout.
-
-    Python's StreamHandler defaults to stderr, which Railway classifies as an
-    error stream. KAELEON operational logs are normal application output, so
-    they must go to stdout; severity is carried explicitly by structured audit
-    records.
-    """
     logger = logging.getLogger(name)
     if not logger.handlers:
-        h = logging.StreamHandler(stream=sys.stdout)
+        h = logging.StreamHandler()
         h.setFormatter(logging.Formatter('%(message)s'))
-        h._kaeleon_stdout_handler = True  # type: ignore[attr-defined]
         logger.addHandler(h)
         logger.propagate = False
     logger.setLevel(_level())
@@ -167,15 +104,12 @@ def get_logger(name):
 
 
 class AuditLogger:
-    """Lean Railway-native structured logs.
+    """Lean structured logs for Railway.
 
-    Every audit record is emitted as a single JSON line with Railway's expected
-    ``message`` and ``level`` fields. Remaining fields stay queryable as custom
-    attributes (for example ``@decision_id:...`` or ``@symbol:BTC``).
-
-    Operational logs are deliberately *not* persisted to MongoDB: business data
-    already lives in positions/orders and the latest engine state is an upsert,
-    so duplicating logs in Mongo would add cost without improving recovery.
+    Operational logs are written to stdout only. They are deliberately *not*
+    persisted to MongoDB: business data already lives in positions/orders and
+    the latest engine state is an upsert, so duplicating logs in Mongo would add
+    cost without improving recovery.
     """
 
     def __init__(self, db=None):
@@ -196,9 +130,8 @@ class AuditLogger:
             return f'{selected or "NONE"}|{reason or ""}'
         if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED'}:
             return str(data.get('reason') or 'unknown')
-        if event in {'MARKET_SNAPSHOT_ERROR', 'MARKET_DEPTH_ERROR',
-                     'MARKET_INSTRUMENTS_ERROR', 'BTC_CONTEXT_ERROR', 'MARKET_SCAN_ERROR'}:
-            return '|'.join(str(data.get(k) or '') for k in ('stage', 'api_code', 'endpoint', 'error'))
+        if event == 'MARKET_SNAPSHOT_ERROR':
+            return str(data.get('error') or 'market_snapshot_error')
         return ''
 
     def _should_emit_state(self, event: str, data: dict) -> bool:
@@ -211,7 +144,7 @@ class AuditLogger:
         signature = self._state_signature(event, data)
         now = time.monotonic()
         previous = self._last_state.get(key)
-        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED', 'MARKET_SNAPSHOT_ERROR', 'MARKET_DEPTH_ERROR', 'MARKET_INSTRUMENTS_ERROR', 'BTC_CONTEXT_ERROR', 'MARKET_SCAN_ERROR'} else self.state_repeat_seconds
+        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED', 'MARKET_SNAPSHOT_ERROR'} else self.state_repeat_seconds
         if previous and previous[0] == signature and now - previous[1] < repeat:
             return False
         self._last_state[key] = (signature, now)
@@ -238,18 +171,12 @@ class AuditLogger:
         else:
             effective = 'DEBUG'
 
-        safe_data = _redact(data)
         record = {
-            **safe_data,
             'ts': datetime.now(timezone.utc).isoformat(),
             'event': event,
             'decision_id': decision_id,
-            'level': _railway_level(effective),
-            'message': _build_message(event, safe_data),
+            **_redact(data),
         }
         numeric = getattr(logging, effective, logging.INFO)
-        # One minified JSON object per line is required for Railway structured
-        # logging. The handler writes to stdout, so INFO records no longer appear
-        # as empty/red stderr entries in exported logs.
         self.logger.log(numeric, json.dumps(record, default=str, separators=(',', ':')))
         return record

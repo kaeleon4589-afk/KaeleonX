@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     paper_slippage_bps: float = Field(2.0, ge=0)
     paper_max_spread_bps: float = Field(30.0, ge=0)
     market_poll_seconds: float = Field(2.0, gt=0)
-    coinw_public_max_rps: float = Field(6.0, ge=1.0, le=10.0)
     market_scanner_depth: int = Field(12, ge=1, le=50)
     market_scanner_parallel: int = Field(3, ge=1, le=10)
     market_scanner_cache_seconds: float = Field(30.0, gt=0)

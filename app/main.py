@@ -33,7 +33,7 @@ async def run():
         minimum_operating_capital=s.min_operating_capital,
     )
     runtimes = UserTradingRuntimeManager(s, db, audit, profiles)
-    client = CoinWMarketClient(s.coinw_rest_base_url, max_rps=s.coinw_public_max_rps)
+    client = CoinWMarketClient(s.coinw_rest_base_url)
     scanner = CoinWMarketScanner(
         client, depth=s.market_scanner_depth, cache_seconds=s.market_scanner_cache_seconds, audit=audit
     )
@@ -45,10 +45,7 @@ async def run():
     async def on_snapshot(snapshot):
         await runtimes.run_snapshot(snapshot)
 
-    try:
-        await market.run(on_snapshot)
-    finally:
-        await client.aclose()
+    await market.run(on_snapshot)
 
 
 def main():

@@ -29,7 +29,6 @@ _STATE_INFO = {
     'REGIME_EVALUATED',
     'STRATEGY_EVALUATED',
     'SIGNAL_REJECTED',
-    'MARKET_DATA_SKIPPED',
 }
 _ALWAYS_ERROR = {
     'MARKET_SCAN_ERROR',
@@ -128,7 +127,7 @@ class AuditLogger:
             selected = data.get('strategy') or (trace.get('selected') if isinstance(trace, dict) else None)
             reason = trace.get('reason') if isinstance(trace, dict) else None
             return f'{selected or "NONE"}|{reason or ""}'
-        if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED'}:
+        if event in {'SIGNAL_REJECTED'}:
             return str(data.get('reason') or 'unknown')
         if event == 'MARKET_SNAPSHOT_ERROR':
             return str(data.get('error') or 'market_snapshot_error')
@@ -144,7 +143,7 @@ class AuditLogger:
         signature = self._state_signature(event, data)
         now = time.monotonic()
         previous = self._last_state.get(key)
-        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'MARKET_DATA_SKIPPED', 'MARKET_SNAPSHOT_ERROR'} else self.state_repeat_seconds
+        repeat = self.reject_repeat_seconds if event in {'SIGNAL_REJECTED', 'MARKET_SNAPSHOT_ERROR'} else self.state_repeat_seconds
         if previous and previous[0] == signature and now - previous[1] < repeat:
             return False
         self._last_state[key] = (signature, now)

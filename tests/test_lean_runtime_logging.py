@@ -5,7 +5,9 @@ from app.logging.logger import AuditLogger
 def test_execution_rejected_is_info(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     a = AuditLogger()
-    assert "EXECUTION_REJECTED" in __import__("app.logging.logger", fromlist=["_STATE_INFO"])._STATE_INFO
+    mod = __import__("app.logging.logger", fromlist=["_ALWAYS_INFO", "_STATE_INFO"])
+    assert "EXECUTION_REJECTED" in mod._ALWAYS_INFO
+    assert "EXECUTION_REJECTED" not in mod._STATE_INFO
 
 
 def test_market_snapshot_error_is_throttled_warning():

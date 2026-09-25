@@ -207,3 +207,14 @@ ELIMINADOS: ninguno
 
 NOTA:
 Railpack ya instala dependencias antes del build. Se eliminó el segundo `npm ci` del buildCommand porque intentaba borrar el cache/mount de `/app/node_modules` y podía fallar con `EBUSY` sobre `/app/node_modules/.vite`.
+
+AJUSTE — Transparencia de tarjeta compartible / visibilidad del camaleón
+BASE COMPARADA: KaeleonX-fix-railway-ebusy.zip
+
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+frontend/src/lib/tradeShare.ts
+frontend/src/styles.css
+
+NUEVOS: ninguno
+ELIMINADOS: ninguno

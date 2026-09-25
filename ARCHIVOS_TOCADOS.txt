@@ -19,6 +19,17 @@ tests/test_entry_geometry_risk.py
 
 ELIMINADOS: ninguno
 
+AMPLIACIÓN — Imagen de marca suministrada por el usuario
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+frontend/src/pages/AuthPage.tsx
+frontend/src/pages/DashboardPage.tsx
+frontend/src/styles.css
+NUEVO:
+frontend/public/images/kaeleon-trading-art.jpg
+ELIMINADOS: ninguno
+
 AMPLIACIÓN — Capital configurado completo y niveles estructurales
 MODIFICADOS:
 .env.example

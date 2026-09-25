@@ -102,6 +102,130 @@ def normalize_rest_candle(row: Any) -> dict[str, float | int] | None:
         return None
 
 
+
+def _unwrap_data(raw: Any) -> Any:
+    return raw.get("data", raw) if isinstance(raw, dict) else raw
+
+
+def normalize_depth(raw: Any, limit: int = 20) -> dict[str, Any]:
+    data = _unwrap_data(raw)
+    if not isinstance(data, dict):
+        return {"asks": [], "bids": [], "timestamp": None}
+
+    def side_rows(value: Any, reverse: bool) -> list[dict[str, float]]:
+        rows: list[dict[str, float]] = []
+        if not isinstance(value, list):
+            return rows
+        for item in value:
+            try:
+                if isinstance(item, dict):
+                    price = _finite_number(item.get("p", item.get("price")))
+                    quantity = max(0.0, _finite_number(item.get("m", item.get("quantity", 0))))
+                else:
+                    price = _finite_number(item[0])
+                    quantity = max(0.0, _finite_number(item[1]))
+                if price > 0 and quantity >= 0:
+                    rows.append({"price": price, "quantity": quantity})
+            except (TypeError, ValueError, IndexError):
+                continue
+        rows.sort(key=lambda row: row["price"], reverse=reverse)
+        return rows[: max(1, min(int(limit), 100))]
+
+    timestamp = data.get("ts") or data.get("timestamp") or data.get("time")
+    try:
+        timestamp = int(timestamp) if timestamp is not None else None
+    except (TypeError, ValueError):
+        timestamp = None
+    return {
+        "asks": side_rows(data.get("ask", data.get("asks")), reverse=False),
+        "bids": side_rows(data.get("bids", data.get("bid")), reverse=True),
+        "timestamp": timestamp,
+    }
+
+
+def normalize_trades(raw: Any, limit: int = 40) -> list[dict[str, Any]]:
+    data = _unwrap_data(raw)
+    if isinstance(data, dict):
+        for key in ("data", "rows", "list", "items"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+    if not isinstance(data, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            price = _finite_number(item.get("price"))
+            quantity = max(0.0, _finite_number(item.get("quantity", item.get("m", 0))))
+            timestamp = int(item.get("createdDate") or item.get("timestamp") or item.get("ts") or 0)
+            direction = str(item.get("direction") or "").lower()
+            if direction not in {"long", "short"}:
+                direction = "unknown"
+            if price <= 0:
+                continue
+            rows.append({
+                "id": str(item.get("id") or f"{timestamp}:{price}:{quantity}"),
+                "timestamp": timestamp,
+                "price": price,
+                "quantity": quantity,
+                "piece": float(item.get("piece") or 0),
+                "direction": direction,
+            })
+        except (TypeError, ValueError):
+            continue
+    rows.sort(key=lambda row: row["timestamp"], reverse=True)
+    return rows[: max(1, min(int(limit), 100))]
+
+
+def normalize_ticker(raw: Any) -> dict[str, Any]:
+    data = _unwrap_data(raw)
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        return {}
+
+    def optional_number(*keys: str) -> float | None:
+        for key in keys:
+            if data.get(key) is None:
+                continue
+            try:
+                return _finite_number(data[key])
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    return {
+        "last": optional_number("last", "last_price", "price"),
+        "index_price": optional_number("fair_price", "indexPrice", "index_price"),
+        "high": optional_number("high"),
+        "low": optional_number("low"),
+        "open": optional_number("open"),
+        "change_rate": optional_number("changeRate", "rise_fall_rate", "rose"),
+        "volume": optional_number("vol", "total_volume"),
+        "volume_quote": optional_number("volUsdt", "volValue"),
+        "max_leverage": optional_number("max_leverage", "maxLeverage"),
+        "contract_size": optional_number("contract_size", "contractSize"),
+    }
+
+
+def normalize_funding(raw: Any) -> dict[str, Any]:
+    data = _unwrap_data(raw)
+    if not isinstance(data, dict):
+        return {}
+    try:
+        rate = _finite_number(data.get("value", data.get("r")))
+    except (TypeError, ValueError):
+        rate = None
+    timestamp = data.get("ts") or data.get("timestamp")
+    try:
+        timestamp = int(timestamp) if timestamp is not None else None
+    except (TypeError, ValueError):
+        timestamp = None
+    return {"rate": rate, "timestamp": timestamp, "kind": "last_settlement"}
+
+
 @dataclass(frozen=True)
 class MarketInstrument:
     symbol: str
@@ -213,3 +337,34 @@ class ChartMarketService:
             if candle:
                 dedup[int(candle["timestamp"])] = candle
         return [dedup[key] for key in sorted(dedup)]
+
+
+    async def snapshot(self, symbol: str) -> dict[str, Any]:
+        """Return a REST bootstrap snapshot for the live market panel.
+
+        The websocket remains the real-time source. This snapshot makes the
+        order book/trades/market data useful immediately and acts as a safe
+        reconnect fallback without exposing private exchange credentials.
+        """
+        canonical = canonical_symbol(symbol)
+        instrument = await self.instrument(canonical)
+        if instrument is None:
+            raise ValueError("market_symbol_not_found")
+        pair = instrument["pair_code"]
+        depth_raw, trades_raw, ticker_raw, funding_raw = await asyncio.gather(
+            self.client.depth(pair),
+            self.client.trades(pair),
+            self.client.ticker(pair),
+            self.client.funding_rate(pair),
+            return_exceptions=True,
+        )
+        return {
+            "symbol": canonical,
+            "display": instrument["display"],
+            "price_precision": instrument["price_precision"],
+            "order_book": normalize_depth(depth_raw) if not isinstance(depth_raw, Exception) else {"asks": [], "bids": [], "timestamp": None},
+            "trades": normalize_trades(trades_raw) if not isinstance(trades_raw, Exception) else [],
+            "ticker": normalize_ticker(ticker_raw) if not isinstance(ticker_raw, Exception) else {},
+            "funding": normalize_funding(funding_raw) if not isinstance(funding_raw, Exception) else {},
+            "source": "coinw_futures",
+        }

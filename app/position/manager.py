@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import math
+from app.coinw.normalization import base_quantity
 
 from app.models.enums import Direction
 from app.models.trading import Position
@@ -28,6 +30,8 @@ class PositionManager:
         self.on_opened = on_opened
         self.persist_interval_seconds = max(1.0, float(persist_interval_seconds))
         self._last_persist: dict[str, float] = {}
+        self.persistence = None
+        self.exit_slippage_bps = 0.0
         self.state_changed = False
 
     def add(self, position, *, persist=True):
@@ -44,10 +48,17 @@ class PositionManager:
             self.add(p, persist=False)
         self.state_changed = False
 
-    def mark(self, symbol, price, timestamp):
+    def mark(self, symbol, price, timestamp, bid=None, ask=None):
         for p in list(self.positions.values()):
             if p.symbol != symbol or p.status != "OPEN":
                 continue
+            mark_price = (bid if p.direction == Direction.LONG else ask)
+            mark_price = price if mark_price is None else mark_price
+            if not math.isfinite(float(mark_price)) or float(mark_price) <= 0:
+                continue
+            price = float(mark_price)
+            p.current_price = price
+            p.revision += 1
             qty = p.remaining_quantity or p.quantity
             p.unrealized_pnl = self._pnl(p, price, qty)
             if self.evaluate_local_exits:
@@ -70,7 +81,7 @@ class PositionManager:
         return left == right
 
     def reconcile_exchange(self, exchange_positions, timestamp, *, symbol=None,
-                           persist=True, notify=True):
+                           persist=True, notify=True, settlements=None):
         """Reconcile one CoinW symbol without touching positions of other symbols.
 
         `sync_symbol()` returns only the requested instrument. The former logic
@@ -102,8 +113,20 @@ class PositionManager:
         for pid, p in local_open.items():
             row = exchange.get(pid)
             if row is None:
+                settlement = (settlements or {}).get(pid)
+                if settlements is not None and settlement is None:
+                    p.settlement_pending = True
+                    p.revision += 1
+                    changes['updated'].append(p)
+                    continue
+                if settlement:
+                    p.exit_price = settlement['exit_price']
+                    p.net_pnl = settlement['net_pnl']
+                    p.closed_at = settlement['closed_at']
+                    p.settlement_pending = False
+                p.revision += 1
                 p.status = "CLOSED"
-                p.closed_at = timestamp
+                p.closed_at = p.closed_at or timestamp
                 p.exit_reason = "EXCHANGE_CLOSED"
                 p.remaining_quantity = 0.0
                 p.unrealized_pnl = 0.0
@@ -135,11 +158,8 @@ class PositionManager:
             p.entry_price = entry
             p.stop_price = self._float(row.get("stopLossPrice"), p.stop_price)
             p.target_price = self._float(row.get("stopProfitPrice"), p.target_price)
-            qty = self._float(row.get("baseSize"), 0.0)
-            if not qty:
-                unit = int(row.get("quantityUnit") or 0)
-                q = self._float(row.get("quantity"), 0.0)
-                qty = q / max(entry, 1e-12) if unit == 0 else q
+            qty = base_quantity(row, entry)
+            p.settlement_pending = False
             if qty > 0:
                 p.remaining_quantity = qty
                 p.quantity = max(p.quantity, qty)
@@ -148,6 +168,7 @@ class PositionManager:
                 p.quantity, p.remaining_quantity,
             )
             if after != before:
+                p.revision += 1
                 self.state_changed = True
                 changes["updated"].append(p)
                 if persist:
@@ -160,11 +181,7 @@ class PositionManager:
             if entry <= 0:
                 continue
             direction = Direction.LONG if str(row.get("direction", "")).lower() == "long" else Direction.SHORT
-            unit = int(row.get("quantityUnit") or 0)
-            q = self._float(row.get("quantity"), 0.0)
-            qty = self._float(row.get("baseSize"), 0.0)
-            if not qty:
-                qty = q / max(entry, 1e-12) if unit == 0 else q
+            qty = base_quantity(row, entry)
             if qty <= 0:
                 continue
             recovered = Position(
@@ -179,6 +196,7 @@ class PositionManager:
                 remaining_quantity=qty,
                 opened_at=int(row.get("createdDate") or row.get("updatedDate") or timestamp),
                 entry_fee=self._float(row.get("fee"), 0.0),
+                leverage=int(row.get("leverage") or 10),
             )
             if row.get("strategy") is not None:
                 recovered.strategy = row.get("strategy")
@@ -204,6 +222,10 @@ class PositionManager:
         return changes
 
     def close_or_reduce(self, p, action, price, timestamp):
+        if self.evaluate_local_exits:
+            slip = self.exit_slippage_bps / 10000
+            price *= (1 - slip) if p.direction == Direction.LONG else (1 + slip)
+        p.revision += 1
         qty = p.remaining_quantity or p.quantity
         if action == "TP1" and not p.tp1_hit:
             close_qty = qty * 0.5
@@ -268,6 +290,11 @@ class PositionManager:
         now = time.monotonic()
         previous = self._last_persist.get(p.position_id, 0.0)
         if not force and previous and now - previous < self.persist_interval_seconds:
+            return True
+        if self.persistence is not None:
+            self.persistence.schedule_position_save(position=p, user_id=self.owner_user_id,
+                                                    mode=self.owner_mode, symbol=p.symbol)
+            self._last_persist[p.position_id] = now
             return True
         document = dict(p.__dict__)
         if self.owner_user_id:

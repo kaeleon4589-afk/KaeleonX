@@ -193,3 +193,8 @@ def test_frontend_chart_contract_contains_live_coinw_features():
     assert "/market/candles" in api
     assert "/market/snapshot" in api
     assert '"klinecharts": "10.0.3"' in package
+    assert "marketPressure={marketPressure}" in chart
+    assert "publishLiveMarketQuote(selected.symbol, lastPrice, lastPriceSource, selected.price_precision)" in chart
+    assert "ticker_swap still feeds 24h market statistics" in chart
+    assert "marketPressure={marketPressure}" in micro
+    assert "quote?.precision" in dashboard

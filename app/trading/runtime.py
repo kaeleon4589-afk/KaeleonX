@@ -114,6 +114,9 @@ class UserTradingRuntimeManager:
             on_closed=lambda position: self.notifier.position_closed(user_id, mode, position),
             on_opened=lambda position: self.notifier.position_opened(user_id, mode, position),
             persist_interval_seconds=self.settings.engine_state_persist_seconds,
+            estimated_exit_fee_rate=(self.settings.paper_taker_fee if mode == TradingEnvironment.DEMO.value
+                                     else self.settings.trade_exit_fee_rate_estimate),
+            break_even_buffer_bps=self.settings.trade_break_even_buffer_bps,
         )
         if hasattr(execution, "on_realized"):
             position_manager.on_realized = execution.on_realized
@@ -162,6 +165,19 @@ class UserTradingRuntimeManager:
                     net_pnl=row.get('net_pnl'),
                     leverage=int(row.get('leverage', self.settings.fixed_leverage)),
                     protected=bool(row.get('protected', True)),
+                    initial_stop_price=row.get('initial_stop_price'),
+                    structural_target_price=row.get('structural_target_price'),
+                    target_front_run_ratio=row.get('target_front_run_ratio'),
+                    break_even_price=row.get('break_even_price'),
+                    break_even_activation_ratio=float(row.get('break_even_activation_ratio', self.settings.trade_break_even_activation_ratio) or self.settings.trade_break_even_activation_ratio),
+                    profit_lock_activation_ratio=float(row.get('profit_lock_activation_ratio', self.settings.trade_profit_lock_activation_ratio) or self.settings.trade_profit_lock_activation_ratio),
+                    profit_lock_capture_ratio=float(row.get('profit_lock_capture_ratio', self.settings.trade_profit_lock_capture_ratio) or self.settings.trade_profit_lock_capture_ratio),
+                    profit_lock_price=row.get('profit_lock_price'),
+                    management_stage=str(row.get('management_stage', 'INITIAL') or 'INITIAL'),
+                    best_price=row.get('best_price'),
+                    estimated_exit_fee_rate=float(row.get('estimated_exit_fee_rate', self.settings.trade_exit_fee_rate_estimate) or self.settings.trade_exit_fee_rate_estimate),
+                    break_even_buffer_bps=float(row.get('break_even_buffer_bps', self.settings.trade_break_even_buffer_bps) or self.settings.trade_break_even_buffer_bps),
+                    protection_update_pending=bool(row.get('protection_update_pending', False)),
                     exit_trigger_price=row.get('exit_trigger_price'),
                     stop_gap_bps=row.get('stop_gap_bps'),
                     exit_quote_delay_ms=row.get('exit_quote_delay_ms'),
@@ -169,7 +185,7 @@ class UserTradingRuntimeManager:
                 for attr in ("strategy", "quality", "execution_rr", "structural_rr"):
                     if row.get(attr) is not None:
                         setattr(restored, attr, row.get(attr))
-                position_manager.positions[str(row["position_id"])] = restored
+                position_manager.add(restored, persist=False)
             except (KeyError, TypeError, ValueError) as exc:
                 self.audit.event("POSITION_RESTORE_ERROR", user_id, user_id=user_id, mode=mode, position_id=row.get("position_id"), error=str(exc))
 

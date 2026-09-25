@@ -143,3 +143,20 @@ app/position/protection.py
 tests/test_adaptive_exit_management.py
 
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — Neutralidad direccional LONG/SHORT
+BASE COMPARADA: KaeleonX-gestion-adaptativa-TP-BE-profit-lock.zip
+
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+REVISION_LOGICA_OPERACIONES.md
+app/market/scanner.py
+app/orchestrator.py
+app/regime/advanced.py
+tests/test_core_pipeline_refactor.py
+tests/test_live_core_v0107.py
+
+NUEVO:
+tests/test_directional_symmetry.py
+
+ELIMINADOS: ninguno

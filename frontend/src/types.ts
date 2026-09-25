@@ -186,3 +186,34 @@ export interface StatisticsPeriod {
   reset_id: string; started_at: number; label: string; actor: string;
   previous_metrics: AdminStatistics['metrics'];
 }
+
+
+export type MarketInstrument = {
+  symbol: string;
+  display: string;
+  base: string;
+  quote: string;
+  pair_code: string;
+  price_precision: number;
+  status: string;
+  icon_url?: string | null;
+};
+
+export type MarketCandle = {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+export type MarketCandlesResponse = {
+  symbol: string;
+  display: string;
+  timeframe: string;
+  price_precision: number;
+  items: MarketCandle[];
+  count: number;
+  source: string;
+};

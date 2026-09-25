@@ -14,9 +14,9 @@ def test_risk_returns_quote_notional_for_coinw():
     })()
     r = RiskManager(.01, 5).evaluate(intent, equity=1000, leverage=5)
     assert r.approved
-    assert r.quantity == 200.0
-    assert r.base_quantity == 2.0
-    assert r.margin_required == 40.0
+    assert 4980 < r.quantity < 5000
+    assert r.base_quantity == r.quantity / 100
+    assert r.margin_required + r.quantity * .0006 <= 1000
 
 
 def test_breakout_strategy_never_inverts_bearish_regime():

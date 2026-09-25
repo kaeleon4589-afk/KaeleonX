@@ -34,19 +34,23 @@ def test_short_stop_from_old_candle_does_not_open_trade(mode, close, quote, stop
                for event, _, data in audit.events)
 
 
-def test_fees_and_expected_slip_fit_net_loss_budget_for_long_and_short():
+def test_full_configured_margin_with_entry_fee_reserve_for_long_and_short():
     for side, stop in [(Direction.LONG, 99.55), (Direction.SHORT, 100.45)]:
         intent = TradeIntent('d', 'BTC', Strategy.BREAKOUT_RETEST, side,
                              100, stop, 101 if side == Direction.LONG else 99,
                              85, 1, '5m')
         decision = RiskManager(.01, 10, fee_rate=.0006, exit_slippage_bps=2).evaluate(intent, 100, 10)
         assert decision.approved
-        per_unit = abs(100-stop) + .0006*(100+stop) + .0002*stop
-        assert decision.base_quantity*per_unit <= 1.0 + 1e-9
-        assert decision.quantity <= 900
+        assert decision.margin_required + decision.quantity * .0006 <= 100
+        assert decision.margin_required > 99
+        assert decision.quantity > 990
+        with_spare_wallet = RiskManager(.01, 10, fee_rate=.0006).evaluate(
+            intent, 50, 10, available_equity=100)
+        assert with_spare_wallet.quantity == 500
+        assert with_spare_wallet.margin_required == 50
 
 
-def test_breakout_rejects_stop_that_would_be_clipped_inside_volatility(monkeypatch):
+def test_breakout_keeps_structural_stop_and_rejects_weak_target(monkeypatch):
     import app.strategy.breakout_retest as breakout
     monkeypatch.setattr(breakout, 'candle_quality', lambda *a: (True, {}))
     def tf(candles):
@@ -62,8 +66,38 @@ def test_breakout_rejects_stop_that_would_be_clipped_inside_volatility(monkeypat
     strategy = breakout.BreakoutRetestStrategy()
     assert strategy.evaluate(regime, frames['5m'], 'd', 'BTC', '5m',
                              snapshot=SimpleNamespace(timeframes=frames)) is None
-    assert strategy.last_trace['reason'] == 'stop_exceeds_model_limit'
-    assert strategy.last_trace['required_sl_pct'] > breakout.MTF_SL_MAX_PCT
+    assert strategy.last_trace['reason'] == 'rr_too_low'
+    assert strategy.last_trace['execution_rr'] < breakout.MIN_RR_TO_SIGNAL
+
+
+def test_breakout_target_comes_from_swing_or_measured_range():
+    from app.strategy.breakout_retest import _structure_target
+    highs = [101.5] * 35 + [101.0]
+    lows = [99.0] * 36
+    assert _structure_target(Direction.LONG, 100, highs, lows, [102] * 26, lows) == 101.5
+    assert _structure_target(Direction.LONG, 103, highs, lows, [102] * 26, lows) == 105.5
+
+
+def test_sweep_keeps_liquidity_swing_target_and_sweep_extreme_stop(monkeypatch):
+    import app.strategy.liquidity_sweep as sweep
+    monkeypatch.setattr(sweep, 'candle_quality', lambda *a: (True, {}))
+    monkeypatch.setattr(sweep, 'extract', lambda _: ([100]*260, [101]*260,
+                                                    [99]*260, [100]*260, [1]*260))
+    monkeypatch.setattr(sweep, 'atr', lambda *a: .5)
+    candidate = dict(direction='long', score=85, stop_price=98.8,
+                     target_level=105, rr_estimate=4, liquidity_level=99,
+                     sweep_depth_atr=.5, sweep_wick_ratio=.5, sweep_rvol=1,
+                     trigger_rvol=1, trigger_body_ratio=.5, trigger_close_pos=.8,
+                     bars_since_sweep=2)
+    monkeypatch.setattr(sweep, '_detect', lambda direction, **kw:
+                        candidate if direction == 'long' else None)
+    regime = SimpleNamespace(hard_block=False, sweep_allowed=True, risk_multiplier=.8)
+    intent = sweep.LiquiditySweepStrategy().evaluate(
+        regime, [object()]*260, 'd', 'BTC', '5m')
+    assert intent.stop_price == 98.8
+    assert intent.target_price == 105
+    assert intent.metadata['sl_pct'] == pytest.approx(.012)
+    assert intent.metadata['tp_pct'] == pytest.approx(.05)
 
 
 @pytest.mark.parametrize('side,stop,observed', [

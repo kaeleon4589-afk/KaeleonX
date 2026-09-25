@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+import pytest
 
 from app.execution.paper import PaperExecutionEngine
 from app.models.enums import Direction, RegimeState, Strategy
@@ -217,6 +218,20 @@ def test_paper_fill_execution_result_context_does_not_duplicate_mode_keyword():
     assert "EXECUTION_RESULT" in names
     assert "POSITION_OPENED" in names
     assert "PIPELINE_ERROR" not in names
+
+
+def test_configured_margin_is_fully_allocated_and_second_symbol_waits_for_close():
+    db = Database()
+    execution = PaperExecutionEngine(initial_equity=100, leverage=10)
+    orchestrator, manager, _, _, _ = build_orchestrator(execution, db=db, mode='demo')
+    first = asyncio.run(orchestrator.on_snapshot(
+        snapshot('BTC'), 50, user_id='u1', available_equity=100))
+    assert first['filled'] is True
+    held = next(iter(manager.positions.values()))
+    assert held.quantity * held.entry_price == pytest.approx(500)
+    assert asyncio.run(orchestrator.on_snapshot(
+        snapshot('ETH'), 50, user_id='u1', available_equity=execution.equity)) is None
+    assert len([p for p in manager.positions.values() if p.status == 'OPEN']) == 1
 
 
 def test_scanner_uses_source_volume_oi_directional_trend_score_and_failsafe():

@@ -6,6 +6,8 @@ from typing import Literal
 
 from app.execution.environments import CoinWCredentials, TradingEnvironment
 from app.security.credential_vault import CredentialVault
+from app.trading.demo_account import DemoAccount
+import math
 
 
 TradingMode = Literal["demo", "live"]
@@ -25,13 +27,16 @@ class UserTradingProfile:
     coinw_verified_at: object | None = None
     coinw_available_equity: float = 0.0
     updated_at: object | None = None
+    demo_available_equity: float = 100.0
+    demo_auto_compound: bool = False
 
 
 class UserTradingProfileService:
     COLLECTION = "user_trading_profiles"
 
-    def __init__(self, db, vault: CredentialVault, minimum_operating_capital: float = 3.0):
+    def __init__(self, db, vault: CredentialVault, minimum_operating_capital: float = 3.0, initial_demo_equity: float = 100.0):
         self.db = db
+        self.demo_account = DemoAccount(db, initial_demo_equity)
         self.vault = vault
         self.minimum_operating_capital = float(minimum_operating_capital)
 
@@ -53,7 +58,14 @@ class UserTradingProfileService:
         return 0.0
 
     def get(self, user_id: str) -> dict:
-        return self.db.find_one(self.COLLECTION, {"user_id": user_id}) or {}
+        row = self.db.find_one(self.COLLECTION, {"user_id": user_id}) or {}
+        if row and 'demo_auto_compound' not in row:
+            # Existing users that allocated the original entire virtual account retain that intent.
+            initial = self.demo_account.opening_balance(user_id)
+            auto = abs(self._capital_for_mode(row, 'demo') - initial) < .011
+            self.db.upsert(self.COLLECTION, {'user_id': user_id}, {'demo_auto_compound': auto})
+            row['demo_auto_compound'] = auto
+        return row
 
     def public(self, user_id: str) -> UserTradingProfile:
         row = self.get(user_id)
@@ -62,11 +74,14 @@ class UserTradingProfileService:
         masked = None
         if api_key_encrypted:
             masked = self.vault.mask(self.vault.decrypt(api_key_encrypted))
-        demo_capital = self._capital_for_mode(row, "demo")
+        demo_balance = self.demo_account.balance(user_id)
+        demo_capital = demo_balance if row.get("demo_auto_compound", False) else self._capital_for_mode(row, "demo")
         live_capital = self._capital_for_mode(row, "live")
         configured = bool(row.get("coinw_api_key_encrypted") and row.get("coinw_api_secret_encrypted"))
         return UserTradingProfile(
             user_id=user_id,
+            demo_available_equity=demo_balance,
+            demo_auto_compound=bool(row.get("demo_auto_compound", False)),
             execution_mode=mode,
             trading_enabled=bool(row.get("trading_enabled", False)),
             operating_capital=demo_capital if mode == "demo" else live_capital,
@@ -99,6 +114,11 @@ class UserTradingProfileService:
             "positions", {"user_id": user_id, "status": "OPEN", "mode": existing_mode}, limit=1
         )
 
+        pending = self.db.find_one('execution_pending', {'user_id': user_id, 'active': True})
+        if pending and (mode != existing_mode or api_key is not None or api_secret is not None):
+            raise ValueError('resolve_pending_execution_before_changing_account')
+        if existing_mode == 'demo' and mode != 'demo' and open_positions:
+            raise ValueError('close_demo_position_before_switching_to_live')
         if existing_mode == "live" and mode != "live" and open_positions:
             raise ValueError("close_live_position_before_switching_to_demo")
 
@@ -116,13 +136,20 @@ class UserTradingProfileService:
 
         demo_capital = self._capital_for_mode(existing, "demo")
         live_capital = self._capital_for_mode(existing, "live")
+        auto_compound = bool(existing.get("demo_auto_compound", False))
         if operating_capital is not None:
             capital = float(operating_capital)
+            if not math.isfinite(capital):
+                raise ValueError("invalid_operating_capital")
             if capital < self.minimum_operating_capital:
                 raise ValueError("operating_capital_below_platform_minimum")
             if not verified:
                 raise ValueError("coinw_verification_required_for_capital")
             if mode == "demo":
+                balance = self.demo_account.balance(user_id)
+                if capital > balance + 1e-8:
+                    raise ValueError('demo_capital_exceeds_virtual_balance')
+                auto_compound = abs(capital - balance) < 0.011
                 demo_capital = capital
             else:
                 live_capital = capital
@@ -140,6 +167,7 @@ class UserTradingProfileService:
             "trading_enabled": bool(trading_enabled),
             "operating_capital": active_capital,  # compatibility with older readers
             "demo_operating_capital": demo_capital,
+            "demo_auto_compound": auto_compound,
             "live_operating_capital": live_capital,
             "coinw_api_key_encrypted": key_enc,
             "coinw_api_secret_encrypted": secret_enc,
@@ -186,6 +214,10 @@ class UserTradingProfileService:
         existing = self.get(user_id)
         if not existing:
             return {}
+        if self.db.find_many('positions', {'user_id': user_id, 'status': 'OPEN'}, limit=1):
+            raise ValueError('close_positions_before_removing_credentials')
+        if self.db.find_one('execution_pending', {'user_id': user_id, 'active': True}):
+            raise ValueError('resolve_pending_execution_before_changing_account')
         if str(existing.get("execution_mode", "demo")) == "live" and bool(existing.get("trading_enabled")):
             raise ValueError("pause_live_before_removing_credentials")
         self.db.upsert(self.COLLECTION, {"user_id": user_id}, {

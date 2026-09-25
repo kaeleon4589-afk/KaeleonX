@@ -15,6 +15,8 @@ def position_net_pnl(position: dict) -> float:
     accounts fees separately, so API metrics normalize both demo and live records
     by subtracting persisted entry/exit fees and adding funding PnL.
     """
+    if position.get("net_pnl") is not None:
+        return _num(position["net_pnl"])
     return (
         _num(position.get("realized_pnl"))
         - _num(position.get("entry_fee"))

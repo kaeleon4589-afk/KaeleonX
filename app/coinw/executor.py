@@ -6,6 +6,7 @@ from uuid import uuid4
 from app.models.trading import Position
 from app.models.enums import Direction
 from app.coinw.normalization import base_quantity
+from app.position.protection import apply_intent_management
 
 
 class CoinWExecutor:
@@ -25,6 +26,32 @@ class CoinWExecutor:
 
     def _instrument(self, symbol):
         return symbol.upper().replace("USDT", "")
+
+    @staticmethod
+    def _round_price(value, precision, mode="nearest"):
+        try:
+            numeric = float(value)
+            digits = max(0, int(precision))
+        except (TypeError, ValueError):
+            return float(value)
+        factor = 10 ** digits
+        if mode == "up":
+            return math.ceil(numeric * factor - 1e-12) / factor
+        if mode == "down":
+            return math.floor(numeric * factor + 1e-12) / factor
+        return round(numeric, digits)
+
+    def _protection_prices(self, direction, stop, target, precision):
+        if direction == Direction.LONG:
+            # Long: a higher SL and lower TP are the conservative/tighter sides.
+            return (
+                self._round_price(stop, precision, "up"),
+                self._round_price(target, precision, "down"),
+            )
+        return (
+            self._round_price(stop, precision, "down"),
+            self._round_price(target, precision, "up"),
+        )
 
     @staticmethod
     def _data(response):
@@ -108,7 +135,7 @@ class CoinWExecutor:
             or row.get("openId")
             or f"LIVE-{uuid4().hex[:16]}"
         )
-        return Position(
+        position = Position(
             position_id=position_id,
             decision_id=intent.decision_id,
             symbol=intent.symbol,
@@ -126,6 +153,7 @@ class CoinWExecutor:
             opened_at=int(row.get("updatedDate") or row.get("createdDate") or 0),
             entry_fee=float(row.get("fee") or 0),
         )
+        return apply_intent_management(position, intent)
 
     async def submit_intent(self, intent, quantity, leverage=10, position_model=0):
         if not self.enabled:
@@ -142,6 +170,10 @@ class CoinWExecutor:
         min_size = float(info.get("minSize") or 0)
         instrument_status = str(info.get("status") or "online").lower()
         max_leverage = float(info.get("maxLeverage") or leverage)
+        price_precision = int(info.get("pricePrecision") or info.get("price_precision") or 8)
+        normalized_stop, normalized_target = self._protection_prices(
+            intent.direction, intent.stop_price, intent.target_price, price_precision
+        )
         if instrument_status not in {"online", "1", "true", ""}:
             return {
                 "accepted": False,
@@ -182,8 +214,8 @@ class CoinWExecutor:
             "positionModel": int(position_model),
             "positionType": "execute",
             "thirdOrderId": intent.decision_id,
-            "stopLossPrice": float(intent.stop_price),
-            "stopProfitPrice": float(intent.target_price),
+            "stopLossPrice": normalized_stop,
+            "stopProfitPrice": normalized_target,
         }
 
         response = await self.orders.place(payload)
@@ -223,14 +255,17 @@ class CoinWExecutor:
 
         position = self._position_from_exchange(intent, position_row)
         position.leverage = int(leverage)
+        position.stop_price = normalized_stop
+        position.target_price = normalized_target
+        position.tp2_price = normalized_target
 
         # Reassert exchange-native protection against an entry/fill race.
         try:
             await self.orders.set_tpsl(
                 position.position_id,
                 instrument,
-                stop_loss=intent.stop_price,
-                take_profit=intent.target_price,
+                stop_loss=normalized_stop,
+                take_profit=normalized_target,
             )
         except Exception as exc:
             if self.audit:
@@ -262,6 +297,23 @@ class CoinWExecutor:
             "exchange_response": response,
             "order_state": order_row,
         }
+
+    async def ensure_protection(self, position):
+        instrument = self._instrument(position.symbol)
+        info = await self._instrument_info(instrument)
+        precision = int(info.get("pricePrecision") or info.get("price_precision") or 8)
+        stop, target = self._protection_prices(
+            position.direction, position.stop_price, position.target_price, precision
+        )
+        await self.orders.set_tpsl(
+            position.position_id, instrument,
+            stop_loss=stop, take_profit=target,
+        )
+        position.stop_price = stop
+        position.target_price = target
+        if position.tp2_price is not None:
+            position.tp2_price = target
+        return position
 
     async def pending_order_status(self, order_id):
         """Return CoinW's current status for an accepted-but-unconfirmed order."""

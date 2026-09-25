@@ -5,9 +5,14 @@ from app.regime.advanced import features,classify,TREND,VOLATILE,RANGE,UNKNOWN
 from app.regime.state_machine import advance
 
 class RegimeEngine:
-    def __init__(self,*args,**kwargs): self._states={}; self.last_metadata={}
+    def __init__(self,*args,**kwargs): self._states={}; self.last_metadata={}; self._bar_times={}
     def evaluate_snapshot(self,snapshot):
-        f=features(snapshot.candles,getattr(snapshot,'btc_candles',None)); cand,conf,scores=classify(f); state=advance(cand,self._states.get(snapshot.symbol)); self._states[snapshot.symbol]=state; active=state['active']
+        f=features(snapshot.candles,getattr(snapshot,'btc_candles',None)); cand,conf,scores=classify(f)
+        stamp = snapshot.candles[-1].timestamp if snapshot.candles else None
+        if snapshot.symbol not in self._states or self._bar_times.get(snapshot.symbol) != stamp:
+            self._states[snapshot.symbol] = advance(cand, self._states.get(snapshot.symbol))
+            self._bar_times[snapshot.symbol] = stamp
+        state = self._states[snapshot.symbol]; active=state['active']
         bias=f.get('trend_bias','neutral'); direction=Direction.BULLISH if bias=='long' else (Direction.BEARISH if bias=='short' else Direction.NEUTRAL)
         hard=active==UNKNOWN; breakout=active==TREND and not hard; sweep=active==VOLATILE and not hard
         # Source enforced router keeps RANGE shadow-only: no executable sweep.

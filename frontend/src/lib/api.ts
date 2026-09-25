@@ -1,4 +1,4 @@
-import type { AdminStatistics, ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
+import type { AdminStatistics, ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, MarketCandlesResponse, MarketInstrument, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
@@ -73,6 +73,9 @@ export const api = {
   submitBillingTx: (payment_order_id: string, tx_hash: string) => request<PaymentOrder>('/billing/orders/tx', {method:'POST', body:JSON.stringify({payment_order_id,tx_hash})}),
   verifyBillingPayment: (payment_order_id: string, tx_hash: string) => request<{confirmed:boolean;live_state:string;live_expires_at?:string|null}>('/billing/orders/verify', {method:'POST', body:JSON.stringify({payment_order_id,tx_hash})}),
 
+  marketInstruments: (q = '', limit = 100) => request<{items: MarketInstrument[]; count: number; source: string}>(`/market/instruments?q=${encodeURIComponent(q)}&limit=${Math.max(1, Math.min(limit, 500))}`),
+  marketCandles: (symbol: string, timeframe = '5m', limit = 400) => request<MarketCandlesResponse>(`/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${Math.max(50, Math.min(limit, 1000))}`),
+
   referrals: () => request<ReferralSummary>('/user/referrals'),
   adminMe: () => request<User>('/admin/me'),
   adminDashboard: () => request<AdminDashboard>('/admin/dashboard'),
@@ -137,6 +140,8 @@ export function humanizeError(error: unknown): string {
     wrong_network: 'La transacción no pertenece a BNB Smart Chain.',
     amount_or_destination_mismatch: 'El importe o la wallet receptora no coinciden con la orden.',
     bsc_verification_error: 'No se pudo validar la transacción en BNB Smart Chain. Inténtalo nuevamente.',
+    market_symbol_not_found: 'Ese par no está disponible actualmente en CoinW Futures.',
+    unsupported_chart_timeframe: 'Esa temporalidad no está disponible en el gráfico.',
   };
   if (detail.startsWith('backend_unreachable:')) {
     const route = detail.slice('backend_unreachable:'.length);
@@ -144,5 +149,7 @@ export function humanizeError(error: unknown): string {
   }
   if (detail.startsWith('coinw_balance_check_failed:')) return `No se pudo verificar el saldo de CoinW: ${detail.slice('coinw_balance_check_failed:'.length)}`;
   if (detail.startsWith('coinw_connection_failed:')) return `CoinW rechazó la conexión: ${detail.slice('coinw_connection_failed:'.length)}`;
+  if (detail.startsWith('coinw_market_instruments_failed:')) return 'No se pudo cargar el catálogo de mercados de CoinW en este momento.';
+  if (detail.startsWith('coinw_market_candles_failed:')) return 'No se pudieron cargar las velas de CoinW en este momento.';
   return map[detail] || detail.replaceAll('_', ' ');
 }

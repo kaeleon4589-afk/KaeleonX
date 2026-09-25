@@ -5,6 +5,7 @@ import LiveMarketChart from '../components/trading/LiveMarketChart';
 import StatCard from '../components/StatCard';
 import { BellIcon, BoltIcon, ChartIcon, CheckIcon, GearIcon, HomeIcon, PauseIcon, PlayIcon, RefreshIcon, ShieldIcon, SwapIcon, UserIcon, WalletIcon } from '../components/Icons';
 import { api, humanizeError, session } from '../lib/api';
+import { useLiveMarketQuote } from '../lib/liveMarketPriceStore';
 import type { Entitlement, Execution, Operations, Performance, Position, ReferralSummary, TradingConfig, User } from '../types';
 
 const money=(n:unknown)=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2}).format(Number(n)||0);
@@ -105,13 +106,23 @@ function PanelTitle({icon,title,badge,badgeTone}:{icon:ReactNode;title:string;ba
 function EngineMetric({label,value}:{label:string;value:string}){return <div className="engine-metric"><span>{label}</span><strong>{value}</strong></div>}
 function Empty({text}:{text:string}){return <div className="empty-state"><span>◇</span><p>{text}</p></div>}
 function OpenPosition({p}:{p:Position}){
+  const quote=useLiveMarketQuote(p.symbol);
   const tp1=p.tp1_price??p.tp1;
   const target=p.tp2_price??p.tp2??p.target_price??p.take_profit;
-  const exposure=num(p.quantity)*num(p.entry_price);
-  const currentPnl=num(p.unrealized_pnl);
+  const entry=num(p.entry_price);
+  const quantity=num(p.quantity);
+  const liveCurrent=quote?.price??num(p.current_price);
+  const exposure=quantity*entry;
+  const direction=side(p);
+  const backendPnl=num(p.unrealized_pnl);
+  const derivedPnl=quote&&quantity>0&&entry>0&&liveCurrent>0
+    ? (direction==='SHORT'?(entry-liveCurrent):(liveCurrent-entry))*quantity
+    : backendPnl;
+  const currentPnl=Number.isFinite(derivedPnl)?derivedPnl:backendPnl;
   const pnlTone=currentPnl>0?'positive':currentPnl<0?'negative':'neutral';
   const margin=num(p.leverage)>0?exposure/num(p.leverage):0;
-  const roe=margin>0&&p.unrealized_pnl!=null&&Number.isFinite(Number(p.unrealized_pnl))?currentPnl/margin*100:null;
+  const roe=margin>0?currentPnl/margin*100:null;
   const roeText=roe==null?'—':`${roe>0?'+':''}${roe.toFixed(2)}%`;
-  return <div className="open-position"><div className="position-top"><div><span className="asset-badge">◈</span><strong>{symbol(p)}</strong><b className={side(p)==='LONG'?'long':'short'}>{side(p)}</b></div><span>{p.settlement_pending?'Confirmando cierre':`${p.leverage||10}x`}</span></div><div className="position-grid"><span>Entrada<strong>{marketPrice(p.entry_price)}</strong></span><span>Precio actual<strong>{marketPrice(p.current_price)}</strong></span><span>PnL actual<strong className={pnlTone==='neutral'?'neutral-pnl':pnlTone==='positive'?'green':'red'}>{money(p.unrealized_pnl)}</strong></span><span>ROE en vivo<strong className={pnlTone==='neutral'?'neutral-pnl':pnlTone==='positive'?'green':'red'} title="Calculado con el margen inicial estimado; puede diferir del ROE de CoinW">{roeText}</strong></span><span>Exposición<strong>{money(exposure)}</strong></span><span>Margen estimado<strong>{margin>0?money(margin):'—'}</strong></span></div><div className="position-progress"><i className={pnlTone}/></div><div className="position-bottom"><span>SL<strong>{marketPrice(p.stop_price??p.stop_loss)}</strong></span>{tp1!=null&&<span>TP1<strong>{marketPrice(tp1)}</strong></span>}<span>{tp1!=null?'TP2':'TP'}<strong>{marketPrice(target)}</strong></span></div></div>;
+  const liveSource=quote?.source==='websocket'?'WS':quote?.source==='rest'?'REST':'';
+  return <div className="open-position"><div className="position-top"><div><span className="asset-badge">◈</span><strong>{symbol(p)}</strong><b className={direction==='LONG'?'long':'short'}>{direction}</b></div><span>{p.settlement_pending?'Confirmando cierre':`${p.leverage||10}x`}</span></div><div className="position-grid"><span>Entrada<strong>{marketPrice(p.entry_price)}</strong></span><span>Precio actual<strong>{marketPrice(liveCurrent)}</strong>{liveSource&&<em className={`position-live-source ${quote?.source||''}`}>{liveSource} EN VIVO</em>}</span><span>PnL actual<strong className={pnlTone==='neutral'?'neutral-pnl':pnlTone==='positive'?'green':'red'}>{money(currentPnl)}</strong></span><span>ROE en vivo<strong className={pnlTone==='neutral'?'neutral-pnl':pnlTone==='positive'?'green':'red'} title="Calculado en vivo con el mismo precio que muestra el gráfico CoinW">{roeText}</strong></span><span>Exposición<strong>{money(exposure)}</strong></span><span>Margen estimado<strong>{margin>0?money(margin):'—'}</strong></span></div><div className="position-progress"><i className={pnlTone}/></div><div className="position-bottom"><span>SL<strong>{marketPrice(p.stop_price??p.stop_loss)}</strong></span>{tp1!=null&&<span>TP1<strong>{marketPrice(tp1)}</strong></span>}<span>{tp1!=null?'TP2':'TP'}<strong>{marketPrice(target)}</strong></span></div></div>;
 }

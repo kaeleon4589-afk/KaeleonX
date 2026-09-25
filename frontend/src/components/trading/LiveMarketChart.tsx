@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { dispose, init, registerOverlay } from 'klinecharts';
 import { api, humanizeError } from '../../lib/api';
-import type { MarketCandle, MarketInstrument, Position } from '../../types';
+import type { MarketCandle, MarketInstrument, MarketOrderBook, MarketTicker, MarketTrade, Position } from '../../types';
+import MarketMicrostructure from './MarketMicrostructure';
 
 const COINW_FUTURES_WS = 'wss://ws.futurescw.com/perpum';
 const TRADE_LEVEL_GROUP = 'kaeleon-trade-levels';
 const TRADE_LEVEL_OVERLAY = 'kaeleonTradeLevel';
+const RISK_ZONE_GROUP = 'kaeleon-risk-zones';
+const RISK_ZONE_OVERLAY = 'kaeleonRiskZone';
+const HISTORY_GROUP = 'kaeleon-trade-history';
+const HISTORY_OVERLAY = 'kaeleonTradeMarker';
+const DRAWING_GROUP = 'kaeleon-user-drawings';
+const ALERT_STORAGE_PREFIX = 'kaeleon_price_alerts_';
 const WS_STALE_AFTER_MS = 25_000;
 const WS_RECONNECT_MAX_MS = 12_000;
 const FALLBACK_POLL_MS = 5_000;
@@ -31,12 +38,20 @@ type StreamState = 'connecting' | 'live' | 'reconnecting' | 'polling' | 'offline
 type MainIndicator = 'NONE' | 'MA' | 'EMA' | 'BOLL';
 type SubIndicator = 'VOL' | 'MACD' | 'RSI';
 type ChartMode = 'candle' | 'area';
+type DrawingTool = 'straightLine' | 'segment' | 'horizontalStraightLine' | 'priceLine' | 'priceChannelLine' | 'parallelStraightLine' | 'fibonacciLine' | 'simpleAnnotation' | 'brush';
+type PriceAlert = { id: string; price: number; direction: 'above' | 'below'; triggered: boolean };
+
+const EMPTY_ORDER_BOOK: MarketOrderBook = { asks: [], bids: [], timestamp: null };
+const INDICATOR_DEFAULTS: Record<string, number[]> = {
+  MA: [5, 10, 30, 60], EMA: [6, 12, 20], BOLL: [20, 2],
+  VOL: [5, 10, 20], MACD: [12, 26, 9], RSI: [6, 12, 24],
+};
 
 type TradeLevel = {
   key: string;
   label: string;
   value: number;
-  tone: 'entry' | 'tp' | 'sl';
+  tone: 'entry' | 'tp' | 'sl' | 'be';
   color: string;
 };
 
@@ -93,6 +108,87 @@ if (!overlayRegistry.__kaeleonTradeLevelOverlay) {
     },
   });
   overlayRegistry.__kaeleonTradeLevelOverlay = true;
+}
+
+
+const advancedOverlayRegistry = globalThis as typeof globalThis & {
+  __kaeleonRiskZoneOverlay?: boolean;
+  __kaeleonTradeMarkerOverlay?: boolean;
+};
+
+if (!advancedOverlayRegistry.__kaeleonRiskZoneOverlay) {
+  registerOverlay({
+    name: RISK_ZONE_OVERLAY,
+    totalStep: 3,
+    lock: true,
+    fixedZLevel: false,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ coordinates, bounding, overlay }: any) => {
+      if (!coordinates || coordinates.length < 2) return [];
+      const y1 = Number(coordinates[0]?.y);
+      const y2 = Number(coordinates[1]?.y);
+      if (!Number.isFinite(y1) || !Number.isFinite(y2)) return [];
+      const top = Math.min(y1, y2);
+      const height = Math.max(1, Math.abs(y1 - y2));
+      const data = (overlay?.extendData || {}) as { color?: string; label?: string };
+      const color = data.color || 'rgba(0,230,151,.08)';
+      return [
+        {
+          key: 'risk-zone',
+          type: 'rect',
+          attrs: { x: 0, y: top, width: bounding.width, height },
+          styles: { style: 'fill', color },
+          ignoreEvent: true,
+        },
+      ];
+    },
+  });
+  advancedOverlayRegistry.__kaeleonRiskZoneOverlay = true;
+}
+
+if (!advancedOverlayRegistry.__kaeleonTradeMarkerOverlay) {
+  registerOverlay({
+    name: HISTORY_OVERLAY,
+    totalStep: 2,
+    lock: true,
+    fixedZLevel: true,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ coordinates, overlay }: any) => {
+      if (!coordinates?.length) return [];
+      const x = Number(coordinates[0]?.x);
+      const y = Number(coordinates[0]?.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
+      const data = (overlay?.extendData || {}) as { label?: string; detail?: string; color?: string; placement?: 'top' | 'bottom' };
+      const color = data.color || '#32c7ff';
+      const isTop = data.placement !== 'bottom';
+      const labelY = isTop ? y - 10 : y + 10;
+      return [
+        {
+          key: 'history-dot',
+          type: 'circle',
+          attrs: { x, y, r: 4 },
+          styles: { style: 'fill', color, borderColor: '#031019', borderSize: 1 },
+          ignoreEvent: true,
+        },
+        {
+          key: 'history-label',
+          type: 'text',
+          attrs: { x, y: labelY, text: data.label || '', align: 'center', baseline: isTop ? 'bottom' : 'top' },
+          styles: {
+            style: 'fill', color, size: 9, weight: 800,
+            paddingLeft: 4, paddingRight: 4, paddingTop: 2, paddingBottom: 2,
+            backgroundColor: 'rgba(3,16,25,.9)', borderColor: color, borderSize: 1, borderRadius: 3,
+          },
+          ignoreEvent: true,
+        },
+      ];
+    },
+  });
+  advancedOverlayRegistry.__kaeleonTradeMarkerOverlay = true;
 }
 
 function canonicalSymbol(input: unknown): string {
@@ -162,6 +258,12 @@ function formatPrice(value: number | null, precision = 6): string {
   }).format(value);
 }
 
+
+function indicatorParams(text: string, fallback: number[]): number[] {
+  const parsed = text.split(',').map((part) => Number(part.trim())).filter((value) => Number.isFinite(value) && value > 0).slice(0, 8);
+  return parsed.length ? parsed : fallback;
+}
+
 function unwrapSocketPayload(raw: unknown): Record<string, unknown> | null {
   if (typeof raw !== 'string') return null;
   try {
@@ -192,11 +294,125 @@ function socketCandle(data: unknown): KLineData | null {
   return { timestamp, open, high, low, close, volume: Math.max(0, volume) };
 }
 
+
+function socketDepth(data: unknown): MarketOrderBook | null {
+  const value = unwrapData(data);
+  if (!value || typeof value !== 'object') return null;
+  const source = value as Record<string, unknown>;
+  const parseSide = (rows: unknown, reverse: boolean) => {
+    if (!Array.isArray(rows)) return [];
+    const parsed = rows.flatMap((item) => {
+      try {
+        const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : null;
+        const price = Number(record ? record.p ?? record.price : (item as unknown[])[0]);
+        const quantity = Number(record ? record.m ?? record.quantity : (item as unknown[])[1]);
+        if (!Number.isFinite(price) || !Number.isFinite(quantity) || price <= 0 || quantity < 0) return [];
+        return [{ price, quantity }];
+      } catch { return []; }
+    });
+    parsed.sort((a, b) => reverse ? b.price - a.price : a.price - b.price);
+    return parsed.slice(0, 100);
+  };
+  return {
+    asks: parseSide(source.ask ?? source.asks, false),
+    bids: parseSide(source.bids ?? source.bid, true),
+    timestamp: Number(source.ts ?? source.timestamp ?? Date.now()),
+  };
+}
+
+function socketTrades(data: unknown): MarketTrade[] {
+  const value = unwrapData(data);
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const row = item as Record<string, unknown>;
+    const timestamp = Number(row.createdDate ?? row.timestamp ?? row.ts ?? Date.now());
+    const price = Number(row.price);
+    const quantity = Number(row.quantity ?? 0);
+    const directionRaw = String(row.direction || '').toLowerCase();
+    const direction: MarketTrade['direction'] = directionRaw === 'long' ? 'long' : directionRaw === 'short' ? 'short' : 'unknown';
+    if (![timestamp, price, quantity].every(Number.isFinite) || price <= 0 || quantity < 0) return [];
+    return [{
+      id: String(row.id ?? `${timestamp}:${price}:${quantity}`),
+      timestamp,
+      price,
+      quantity,
+      piece: Number(row.piece ?? 0) || 0,
+      direction,
+    }];
+  });
+}
+
+function socketTicker(data: unknown): MarketTicker | null {
+  const value = unwrapData(data);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const optional = (...keys: string[]) => {
+    for (const key of keys) {
+      const parsed = Number(row[key]);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+  return {
+    last: optional('last', 'last_price'), high: optional('high'), low: optional('low'), open: optional('open'),
+    change_rate: optional('changeRate', 'rise_fall_rate'), volume: optional('vol', 'total_volume'),
+    volume_quote: optional('volUsdt', 'volValue'), max_leverage: optional('maxLeverage', 'max_leverage'),
+    contract_size: optional('contractSize', 'contract_size'), index_price: optional('fair_price', 'indexPrice'),
+  };
+}
+
+function toMarketCandle(bar: KLineData): MarketCandle {
+  return { timestamp: bar.timestamp, open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: Number(bar.volume || 0) };
+}
+
+function mergeCandle(list: MarketCandle[], next: MarketCandle): MarketCandle[] {
+  const existing = list.findIndex((item) => item.timestamp === next.timestamp);
+  if (existing >= 0) {
+    const copy = list.slice();
+    copy[existing] = next;
+    return copy.slice(-600);
+  }
+  return [...list, next].sort((a, b) => a.timestamp - b.timestamp).slice(-600);
+}
+
+function positionTimestamp(value: unknown): number | null {
+  const raw = typeof value === 'number' ? value : value ? new Date(String(value)).getTime() : NaN;
+  if (!Number.isFinite(raw)) return null;
+  return raw < 100_000_000_000 ? raw * 1000 : raw;
+}
+
+function positionPnl(position: Position): number | null {
+  return toNumber(position.net_pnl ?? position.realized_pnl ?? position.unrealized_pnl);
+}
+
 function openedTimestamp(position: Position | undefined): number {
   const value = position?.opened_at ?? position?.created_at;
   const raw = typeof value === 'number' ? value : value ? new Date(value).getTime() : Date.now();
   if (!Number.isFinite(raw)) return Date.now();
   return raw < 100_000_000_000 ? raw * 1000 : raw;
+}
+
+function estimatedBreakEven(position: Position | undefined): { value: number; estimated: boolean } | null {
+  if (!position) return null;
+  const explicit = toNumber(position.break_even_price ?? position.breakeven_price ?? position.breakEvenPrice);
+  if (explicit && explicit > 0) return { value: explicit, estimated: false };
+
+  const entry = toNumber(position.entry_price);
+  const quantity = toNumber(position.quantity);
+  const entryFee = toNumber(position.entry_fee);
+  if (!entry || entry <= 0 || !quantity || quantity === 0 || entryFee == null || entryFee === 0) return null;
+  const notional = Math.abs(quantity * entry);
+  if (!notional) return null;
+  // Estimate the exit fee using the effective entry fee rate. It is marked as
+  // estimated because maker/taker fees can differ at exit.
+  const rate = Math.abs(entryFee) / notional;
+  if (!Number.isFinite(rate) || rate <= 0 || rate >= 0.02) return null;
+  const side = String(position.side ?? position.direction ?? 'LONG').toUpperCase();
+  const value = side === 'SHORT'
+    ? entry * (1 - rate) / (1 + rate)
+    : entry * (1 + rate) / (1 - rate);
+  return Number.isFinite(value) && value > 0 ? { value, estimated: true } : null;
 }
 
 function getTradeLevels(position: Position | undefined): TradeLevel[] {
@@ -207,6 +423,10 @@ function getTradeLevels(position: Position | undefined): TradeLevel[] {
   const tp2 = toNumber(position.tp2_price ?? position.tp2 ?? position.target_price ?? position.take_profit);
   const levels: TradeLevel[] = [];
   if (entry && entry > 0) levels.push({ key: 'entry', label: 'ENTRY', value: entry, tone: 'entry', color: '#3cc9ff' });
+  const breakEven = estimatedBreakEven(position);
+  if (breakEven && (!entry || Math.abs(breakEven.value - entry) > Number.EPSILON)) {
+    levels.push({ key: 'be', label: breakEven.estimated ? 'BE EST.' : 'BE', value: breakEven.value, tone: 'be', color: '#f4c95d' });
+  }
   if (stop && stop > 0) levels.push({ key: 'sl', label: 'SL', value: stop, tone: 'sl', color: '#ff486e' });
   if (tp1 && tp1 > 0) levels.push({ key: 'tp1', label: 'TP1', value: tp1, tone: 'tp', color: '#00e697' });
   if (tp2 && tp2 > 0 && (!tp1 || Math.abs(tp2 - tp1) > Number.EPSILON)) {
@@ -285,7 +505,7 @@ const BASE_STYLES = {
   },
 };
 
-export default function LiveMarketChart({ positions }: { positions: Position[] }) {
+export default function LiveMarketChart({ positions, closedPositions = [] }: { positions: Position[]; closedPositions?: Position[] }) {
   const firstPositionSymbol = positions.length ? positionSymbol(positions[0]) : 'BTCUSDT';
   const [selected, setSelected] = useState<MarketInstrument>({
     symbol: firstPositionSymbol,
@@ -308,10 +528,24 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
     return toNumber(matching?.current_price);
   });
   const [markPrice, setMarkPrice] = useState<number | null>(null);
+  const [indexPrice, setIndexPrice] = useState<number | null>(null);
+  const [fundingRate, setFundingRate] = useState<number | null>(null);
+  const [fundingTimestamp, setFundingTimestamp] = useState<number | null>(null);
+  const [fundingTimestampKind, setFundingTimestampKind] = useState<'next' | 'last' | null>(null);
+  const [orderBook, setOrderBook] = useState<MarketOrderBook>(EMPTY_ORDER_BOOK);
+  const [trades, setTrades] = useState<MarketTrade[]>([]);
+  const [ticker, setTicker] = useState<MarketTicker>({});
+  const [candleHistory, setCandleHistory] = useState<MarketCandle[]>([]);
   const [chartMode, setChartMode] = useState<ChartMode>('candle');
   const [mainIndicator, setMainIndicator] = useState<MainIndicator>('NONE');
   const [subIndicator, setSubIndicator] = useState<SubIndicator>('VOL');
   const [fullscreen, setFullscreen] = useState(false);
+  const [indicatorSettingsOpen, setIndicatorSettingsOpen] = useState(false);
+  const [mainParamsText, setMainParamsText] = useState('');
+  const [subParamsText, setSubParamsText] = useState(INDICATOR_DEFAULTS.VOL.join(', '));
+  const [alertInput, setAlertInput] = useState('');
+  const [alerts, setAlerts] = useState<PriceAlert[]>([]);
+  const [alertNotice, setAlertNotice] = useState('');
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<HTMLDivElement | null>(null);
@@ -321,6 +555,7 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
   const subIndicatorIdRef = useRef<string | null>(null);
   const manualSelectionRef = useRef(false);
   const lastPrimaryPositionRef = useRef('');
+  const lastDepthPaintRef = useRef(0);
 
   const activePosition = useMemo(
     () => positions.find((position) => positionSymbol(position) === canonicalSymbol(selected.symbol)),
@@ -335,6 +570,14 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
     setSearchOpen(false);
     setLastPrice(null);
     setMarkPrice(null);
+    setIndexPrice(null);
+    setFundingRate(null);
+    setFundingTimestamp(null);
+    setFundingTimestampKind(null);
+    setOrderBook(EMPTY_ORDER_BOOK);
+    setTrades([]);
+    setTicker({});
+    setCandleHistory([]);
     setChartError('');
   }, []);
 
@@ -357,6 +600,79 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [query]);
 
+
+  useEffect(() => {
+    let cancelled = false;
+    api.marketSnapshot(selected.symbol).then((snapshot) => {
+      if (cancelled) return;
+      setOrderBook(snapshot.order_book || EMPTY_ORDER_BOOK);
+      setTrades(snapshot.trades || []);
+      setTicker(snapshot.ticker || {});
+      if (snapshot.ticker?.last != null) setLastPrice(Number(snapshot.ticker.last));
+      if (snapshot.ticker?.index_price != null) setIndexPrice(Number(snapshot.ticker.index_price));
+      if (snapshot.funding?.rate != null) setFundingRate(Number(snapshot.funding.rate));
+      if (snapshot.funding?.timestamp != null) {
+        setFundingTimestamp(Number(snapshot.funding.timestamp));
+        setFundingTimestampKind(snapshot.funding.kind === 'last_settlement' ? 'last' : null);
+      }
+    }).catch(() => {
+      // The websocket can still populate all live fields. Snapshot failures are
+      // deliberately non-fatal so the candle chart does not disappear.
+    });
+    return () => { cancelled = true; };
+  }, [selected.symbol]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(`${ALERT_STORAGE_PREFIX}${canonicalSymbol(selected.symbol)}`);
+      const parsed = raw ? JSON.parse(raw) : [];
+      setAlerts(Array.isArray(parsed) ? parsed.filter((item): item is PriceAlert => item && Number.isFinite(Number(item.price))) : []);
+    } catch { setAlerts([]); }
+    setAlertInput('');
+    setAlertNotice('');
+  }, [selected.symbol]);
+
+  useEffect(() => {
+    if (lastPrice == null || !Number.isFinite(lastPrice)) return;
+    let changed = false;
+    const next = alerts.map((alert) => {
+      if (alert.triggered) return alert;
+      const hit = alert.direction === 'above' ? lastPrice >= alert.price : lastPrice <= alert.price;
+      if (!hit) return alert;
+      changed = true;
+      const message = `${displaySymbol(selected.symbol)} alcanzó ${formatPrice(alert.price, selected.price_precision)}`;
+      setAlertNotice(`Alerta: ${message}`);
+      try {
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('KAELEON · Alerta de precio', { body: message });
+        }
+      } catch { /* browser notifications are optional */ }
+      return { ...alert, triggered: true };
+    });
+    if (changed) setAlerts(next);
+  }, [alerts, lastPrice, selected.price_precision, selected.symbol]);
+
+  useEffect(() => {
+    try { localStorage.setItem(`${ALERT_STORAGE_PREFIX}${canonicalSymbol(selected.symbol)}`, JSON.stringify(alerts)); } catch { /* storage unavailable */ }
+  }, [alerts, selected.symbol]);
+
+  const addPriceAlert = useCallback(() => {
+    const price = Number(alertInput);
+    if (!Number.isFinite(price) || price <= 0) {
+      setAlertNotice('Introduce un precio válido para crear la alerta.');
+      return;
+    }
+    const reference = lastPrice ?? toNumber(activePosition?.current_price) ?? price;
+    const direction: PriceAlert['direction'] = price >= reference ? 'above' : 'below';
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setAlerts((current) => [...current.filter((item) => Math.abs(item.price - price) > Number.EPSILON), { id, price, direction, triggered: false }].slice(-8));
+    try {
+      if ('Notification' in window && Notification.permission === 'default') void Notification.requestPermission();
+    } catch { /* keep the in-app alert even if notifications are unsupported */ }
+    setAlertInput('');
+    setAlertNotice(`Alerta creada para ${direction === 'above' ? 'subida' : 'bajada'} a ${formatPrice(price, selected.price_precision)}.`);
+  }, [activePosition?.current_price, alertInput, lastPrice, selected.price_precision]);
+
   const followActiveOperation = useCallback(async () => {
     if (!positions.length) return;
     manualSelectionRef.current = false;
@@ -374,6 +690,14 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
     setSelected(fallback);
     setLastPrice(toNumber(position.current_price));
     setMarkPrice(null);
+    setIndexPrice(null);
+    setFundingRate(null);
+    setFundingTimestamp(null);
+    setFundingTimestampKind(null);
+    setOrderBook(EMPTY_ORDER_BOOK);
+    setTrades([]);
+    setTicker({});
+    setCandleHistory([]);
     setChartError('');
     try {
       const response = await api.marketInstruments(expected, 25);
@@ -464,7 +788,9 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
         setChartError('');
         try {
           const response = await api.marketCandles(symbol.ticker, timeframeFromPeriod(period), 500);
-          const bars = (response.items || []).map(toKLineData).sort((a, b) => a.timestamp - b.timestamp);
+          const sourceCandles = (response.items || []).slice().sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+          setCandleHistory(sourceCandles);
+          const bars = sourceCandles.map(toKLineData);
           const latest = bars.at(-1);
           if (latest) setLastPrice(latest.close);
           callback(bars, false);
@@ -499,6 +825,7 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
               const bar = toKLineData(latest);
               callback(bar);
               setLastPrice(bar.close);
+              setCandleHistory((current) => mergeCandle(current, toMarketCandle(bar)));
               setChartError('');
             }
           } catch (error) {
@@ -550,14 +877,18 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
             stopPolling();
             setStreamState('live');
             setChartError('');
-            socket.send(JSON.stringify({
-              event: 'sub',
-              params: { biz: 'futures', interval, pairCode: currentPairCode, type: 'candles_swap_utc' },
-            }));
-            socket.send(JSON.stringify({
-              event: 'sub',
-              params: { biz: 'futures', pairCode: currentPairCode, type: 'mark_price' },
-            }));
+            const channels = [
+              { type: 'candles_swap_utc', interval },
+              { type: 'mark_price' },
+              { type: 'index_price' },
+              { type: 'funding_rate' },
+              { type: 'depth' },
+              { type: 'fills' },
+              { type: 'ticker_swap' },
+            ];
+            for (const channel of channels) {
+              socket.send(JSON.stringify({ event: 'sub', params: { biz: 'futures', pairCode: currentPairCode, ...channel } }));
+            }
           };
 
           socket.onmessage = (event) => {
@@ -570,13 +901,58 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
               if (bar) {
                 callback(bar);
                 setLastPrice(bar.close);
+                setCandleHistory((current) => mergeCandle(current, toMarketCandle(bar)));
                 setStreamState('live');
               }
-            } else if (payload.type === 'mark_price') {
+            } else if (payload.type === 'mark_price' || payload.type === 'index_price') {
               const data = unwrapData(payload.data);
               if (data && typeof data === 'object') {
                 const value = Number((data as Record<string, unknown>).p);
-                if (Number.isFinite(value) && value > 0) setMarkPrice(value);
+                if (Number.isFinite(value) && value > 0) {
+                  if (payload.type === 'mark_price') setMarkPrice(value);
+                  else setIndexPrice(value);
+                }
+              }
+            } else if (payload.type === 'funding_rate') {
+              const data = unwrapData(payload.data);
+              if (data && typeof data === 'object') {
+                const row = data as Record<string, unknown>;
+                const rate = Number(row.r);
+                const nextFunding = Number(row.nt);
+                const streamTimestamp = Number(row.ts);
+                if (Number.isFinite(rate)) setFundingRate(rate);
+                if (Number.isFinite(nextFunding) && nextFunding > 0) {
+                  setFundingTimestamp(nextFunding);
+                  setFundingTimestampKind('next');
+                } else if (Number.isFinite(streamTimestamp) && streamTimestamp > 0) {
+                  setFundingTimestamp(streamTimestamp);
+                  setFundingTimestampKind('last');
+                }
+              }
+            } else if (payload.type === 'depth') {
+              const now = Date.now();
+              if (now - lastDepthPaintRef.current >= 180) {
+                const book = socketDepth(payload.data);
+                if (book) {
+                  lastDepthPaintRef.current = now;
+                  setOrderBook(book);
+                }
+              }
+            } else if (payload.type === 'fills') {
+              const incoming = socketTrades(payload.data);
+              if (incoming.length) {
+                setTrades((current) => {
+                  const unique = new Map<string, MarketTrade>();
+                  [...incoming, ...current].forEach((trade) => unique.set(String(trade.id), trade));
+                  return [...unique.values()].sort((a, b) => b.timestamp - a.timestamp).slice(0, 60);
+                });
+              }
+            } else if (payload.type === 'ticker_swap') {
+              const nextTicker = socketTicker(payload.data);
+              if (nextTicker) {
+                setTicker((current) => ({ ...current, ...nextTicker }));
+                if (nextTicker.last != null && Number.isFinite(nextTicker.last)) setLastPrice(nextTicker.last);
+                if (nextTicker.index_price != null && Number.isFinite(nextTicker.index_price)) setIndexPrice(nextTicker.index_price);
               }
             }
           };
@@ -651,16 +1027,23 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
     const chart = chartApiRef.current;
     if (!chart) return;
     if (mainIndicatorIdRef.current) chart.removeIndicator({ id: mainIndicatorIdRef.current });
-    mainIndicatorIdRef.current = mainIndicator === 'NONE'
-      ? null
-      : chart.createIndicator({ name: mainIndicator, paneId: 'candle_pane' });
+    if (mainIndicator === 'NONE') {
+      mainIndicatorIdRef.current = null;
+      setMainParamsText('');
+      return;
+    }
+    const params = INDICATOR_DEFAULTS[mainIndicator] || [];
+    setMainParamsText(params.join(', '));
+    mainIndicatorIdRef.current = chart.createIndicator({ name: mainIndicator, paneId: 'candle_pane', calcParams: params });
   }, [mainIndicator]);
 
   useEffect(() => {
     const chart = chartApiRef.current;
     if (!chart) return;
     if (subIndicatorIdRef.current) chart.removeIndicator({ id: subIndicatorIdRef.current });
-    subIndicatorIdRef.current = chart.createIndicator({ name: subIndicator, paneId: 'kaeleon_sub_pane' });
+    const params = INDICATOR_DEFAULTS[subIndicator] || [];
+    setSubParamsText(params.join(', '));
+    subIndicatorIdRef.current = chart.createIndicator({ name: subIndicator, paneId: 'kaeleon_sub_pane', calcParams: params });
   }, [subIndicator]);
 
   useEffect(() => {
@@ -685,6 +1068,85 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
     }
   }, [activePosition, selected.price_precision, tradeLevels]);
 
+  useEffect(() => {
+    const chart = chartApiRef.current;
+    if (!chart) return;
+    chart.removeOverlay({ groupId: RISK_ZONE_GROUP });
+    if (!activePosition) return;
+    const entry = toNumber(activePosition.entry_price);
+    const stop = toNumber(activePosition.stop_price ?? activePosition.stop_loss);
+    const target = toNumber(activePosition.tp2_price ?? activePosition.tp2 ?? activePosition.target_price ?? activePosition.take_profit ?? activePosition.tp1_price ?? activePosition.tp1);
+    const anchor = openedTimestamp(activePosition);
+    if (entry && target && entry > 0 && target > 0) {
+      chart.createOverlay({
+        name: RISK_ZONE_OVERLAY, groupId: RISK_ZONE_GROUP, lock: true, zLevel: -10,
+        points: [{ timestamp: anchor, value: entry }, { timestamp: anchor, value: target }],
+        extendData: { label: 'PROFIT', color: 'rgba(0,230,151,.055)' },
+      });
+    }
+    if (entry && stop && entry > 0 && stop > 0) {
+      chart.createOverlay({
+        name: RISK_ZONE_OVERLAY, groupId: RISK_ZONE_GROUP, lock: true, zLevel: -10,
+        points: [{ timestamp: anchor, value: entry }, { timestamp: anchor, value: stop }],
+        extendData: { label: 'RISK', color: 'rgba(255,72,110,.050)' },
+      });
+    }
+  }, [activePosition]);
+
+  useEffect(() => {
+    const chart = chartApiRef.current;
+    if (!chart) return;
+    chart.removeOverlay({ groupId: HISTORY_GROUP });
+    const selectedSymbol = canonicalSymbol(selected.symbol);
+    const matching = closedPositions.filter((position) => positionSymbol(position) === selectedSymbol).slice(0, 24);
+    for (const position of matching) {
+      const entry = toNumber(position.entry_price);
+      const exit = toNumber(position.exit_price ?? position.current_price);
+      const opened = positionTimestamp(position.opened_at ?? position.created_at);
+      const closed = positionTimestamp(position.closed_at);
+      const side = String(position.side ?? position.direction ?? 'LONG').toUpperCase();
+      if (entry && opened) {
+        chart.createOverlay({
+          name: HISTORY_OVERLAY, groupId: HISTORY_GROUP, lock: true,
+          points: [{ timestamp: opened, value: entry }],
+          extendData: { label: side === 'SHORT' ? '▼ SHORT' : '▲ LONG', color: side === 'SHORT' ? '#ff647f' : '#30d8ff', placement: side === 'SHORT' ? 'top' : 'bottom' },
+        });
+      }
+      if (exit && closed) {
+        const pnl = positionPnl(position);
+        chart.createOverlay({
+          name: HISTORY_OVERLAY, groupId: HISTORY_GROUP, lock: true,
+          points: [{ timestamp: closed, value: exit }],
+          extendData: { label: `${(pnl ?? 0) >= 0 ? '✓' : '×'} ${pnl == null ? 'CLOSE' : `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`}`, color: (pnl ?? 0) >= 0 ? '#00e697' : '#ff486e', placement: (pnl ?? 0) >= 0 ? 'top' : 'bottom' },
+        });
+      }
+    }
+  }, [closedPositions, selected.symbol]);
+
+  const applyMainParams = useCallback(() => {
+    const chart = chartApiRef.current;
+    if (!chart || mainIndicator === 'NONE' || !mainIndicatorIdRef.current) return;
+    const params = indicatorParams(mainParamsText, INDICATOR_DEFAULTS[mainIndicator] || []);
+    setMainParamsText(params.join(', '));
+    chart.overrideIndicator({ id: mainIndicatorIdRef.current, calcParams: params });
+  }, [mainIndicator, mainParamsText]);
+
+  const applySubParams = useCallback(() => {
+    const chart = chartApiRef.current;
+    if (!chart || !subIndicatorIdRef.current) return;
+    const params = indicatorParams(subParamsText, INDICATOR_DEFAULTS[subIndicator] || []);
+    setSubParamsText(params.join(', '));
+    chart.overrideIndicator({ id: subIndicatorIdRef.current, calcParams: params });
+  }, [subIndicator, subParamsText]);
+
+  const startDrawing = useCallback((tool: DrawingTool) => {
+    chartApiRef.current?.createOverlay({ name: tool, groupId: DRAWING_GROUP });
+  }, []);
+
+  const clearDrawings = useCallback(() => {
+    chartApiRef.current?.removeOverlay({ groupId: DRAWING_GROUP });
+  }, []);
+
   const livePrice = lastPrice ?? toNumber(activePosition?.current_price);
   const statusLabel = streamState === 'live'
     ? 'LIVE'
@@ -695,6 +1157,11 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
         : streamState === 'reconnecting'
           ? 'RECONECTANDO'
           : 'CONECTANDO';
+  const rawChange = ticker.change_rate == null ? null : Number(ticker.change_rate);
+  const changePct = rawChange == null || !Number.isFinite(rawChange) ? null : (Math.abs(rawChange) <= 1 ? rawChange * 100 : rawChange);
+  const bestAsk = orderBook.asks[0]?.price ?? null;
+  const bestBid = orderBook.bids[0]?.price ?? null;
+  const spread = bestAsk != null && bestBid != null ? Math.max(0, bestAsk - bestBid) : null;
 
   return (
     <section className={`live-market-chart ${fullscreen ? 'is-fullscreen' : ''}`} ref={rootRef} aria-label="Gráfico de mercado CoinW">
@@ -710,8 +1177,17 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
         <div className="market-chart-prices">
           <span><small>Last</small><strong>{formatPrice(livePrice, selected.price_precision)}</strong></span>
           <span><small>Mark</small><strong>{formatPrice(markPrice, selected.price_precision)}</strong></span>
+          <span><small>Index</small><strong>{formatPrice(indexPrice, selected.price_precision)}</strong></span>
           <span className={`market-stream-state ${streamState}`}><i />{statusLabel}</span>
         </div>
+      </div>
+
+      <div className="market-quick-stats">
+        <span><small>Funding</small><strong className={(fundingRate ?? 0) >= 0 ? 'positive' : 'negative'}>{fundingRate == null ? '—' : `${fundingRate >= 0 ? '+' : ''}${(fundingRate * 100).toFixed(4)}%`}</strong></span>
+        <span><small>24h</small><strong className={(changePct ?? 0) >= 0 ? 'positive' : 'negative'}>{changePct == null ? '—' : `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%`}</strong></span>
+        <span><small>High</small><strong>{formatPrice(ticker.high ?? null, selected.price_precision)}</strong></span>
+        <span><small>Low</small><strong>{formatPrice(ticker.low ?? null, selected.price_precision)}</strong></span>
+        <span><small>Spread</small><strong>{formatPrice(spread, selected.price_precision)}</strong></span>
       </div>
 
       {positions.length > 0 && !activePosition && (
@@ -761,10 +1237,27 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
           <select value={subIndicator} onChange={(event) => setSubIndicator(event.target.value as SubIndicator)} aria-label="Indicador inferior">
             <option value="VOL">VOL</option><option value="MACD">MACD</option><option value="RSI">RSI</option>
           </select>
+          <select value="" onChange={(event) => { const value = event.target.value as DrawingTool; if (value) startDrawing(value); }} aria-label="Herramientas de dibujo">
+            <option value="">Dibujar</option><option value="straightLine">Tendencia</option><option value="segment">Segmento</option><option value="horizontalStraightLine">Horizontal</option><option value="priceLine">Línea de precio</option><option value="priceChannelLine">Canal de precio</option><option value="parallelStraightLine">Paralelas</option><option value="fibonacciLine">Fibonacci</option><option value="simpleAnnotation">Anotación</option><option value="brush">Pincel</option>
+          </select>
+          <button type="button" onClick={clearDrawings} title="Borrar dibujos">⌫</button>
+          <button type="button" className={indicatorSettingsOpen ? 'active' : ''} onClick={() => setIndicatorSettingsOpen((value) => !value)} title="Configurar indicadores">⚙</button>
           <button type="button" className={chartMode === 'candle' ? 'active' : ''} onClick={() => setChartMode(chartMode === 'candle' ? 'area' : 'candle')} title="Cambiar entre velas y área">{chartMode === 'candle' ? '▥ Velas' : '⌁ Área'}</button>
           <button type="button" onClick={() => chartApiRef.current?.scrollToRealTime(250)} title="Volver al precio actual">LIVE</button>
           <button type="button" onClick={() => void toggleFullscreen()} title="Pantalla completa">{fullscreen ? '✕' : '⛶'}</button>
         </div>
+      </div>
+
+      {indicatorSettingsOpen && <div className="indicator-settings">
+        <div><span>{mainIndicator === 'NONE' ? 'Indicador principal' : mainIndicator}</span><input value={mainParamsText} disabled={mainIndicator === 'NONE'} onChange={(event) => setMainParamsText(event.target.value)} placeholder="ej. 9, 21, 50"/><button type="button" disabled={mainIndicator === 'NONE'} onClick={applyMainParams}>Aplicar</button></div>
+        <div><span>{subIndicator}</span><input value={subParamsText} onChange={(event) => setSubParamsText(event.target.value)} placeholder="parámetros"/><button type="button" onClick={applySubParams}>Aplicar</button></div>
+        <small>Parámetros separados por comas. Los cambios solo modifican la visualización del gráfico.</small>
+      </div>}
+
+      <div className="market-alert-row">
+        <div className="market-alert-create"><span>🔔</span><input inputMode="decimal" value={alertInput} onChange={(event) => setAlertInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') addPriceAlert(); }} placeholder="Alerta de precio"/><button type="button" onClick={addPriceAlert}>Crear</button></div>
+        <div className="market-alert-chips">{alerts.map((alert) => <button type="button" key={alert.id} className={alert.triggered ? 'triggered' : ''} onClick={() => setAlerts((current) => current.filter((item) => item.id !== alert.id))} title="Eliminar alerta">{alert.direction === 'above' ? '↑' : '↓'} {formatPrice(alert.price, selected.price_precision)} {alert.triggered ? '✓' : '×'}</button>)}</div>
+        {alertNotice && <small>{alertNotice}</small>}
       </div>
 
       {tradeLevels.length > 0 && (
@@ -778,8 +1271,23 @@ export default function LiveMarketChart({ positions }: { positions: Position[] }
         {chartError && <div className="market-chart-error"><strong>Datos de mercado</strong><span>{chartError}</span></div>}
       </div>
 
+      <MarketMicrostructure
+        orderBook={orderBook}
+        trades={trades}
+        ticker={ticker}
+        lastPrice={livePrice}
+        markPrice={markPrice}
+        indexPrice={indexPrice}
+        fundingRate={fundingRate}
+        fundingTimestamp={fundingTimestamp}
+        fundingTimestampKind={fundingTimestampKind}
+        precision={selected.price_precision}
+        candles={candleHistory}
+        activePosition={activePosition}
+      />
+
       <div className="market-chart-footer">
-        <span>Velas y Mark Price: CoinW</span>
+        <span>Velas, Last, Mark, Index, Funding, Order Book y Trades: CoinW</span>
         <span>{activePosition ? 'Niveles ENTRY / TP / SL sincronizados con la operación activa' : 'Selecciona el par de una operación activa para ver ENTRY / TP / SL'}</span>
       </div>
     </section>

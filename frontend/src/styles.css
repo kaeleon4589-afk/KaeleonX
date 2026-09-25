@@ -48,3 +48,16 @@ svg{width:22px;height:22px}.green{color:var(--green)!important}.red{color:var(--
 .statistics-confirm input{width:18px;height:18px;flex-shrink:0}
 .statistics-reset button{justify-self:start;padding:12px 18px}
 .statistics-panel details{overflow-wrap:anywhere}
+
+/* User-provided KAELEON artwork, kept whole so its wordmark remains readable. */
+.auth-side{gap:18px}
+.auth-hero{display:grid;place-items:center;min-height:0;flex:1}
+.auth-hero img{display:block;width:min(100%,650px);max-height:52vh;object-fit:contain}
+.auth-copy{margin:0;max-width:590px}
+.auth-copy h1{font-size:clamp(30px,3.6vw,52px)}
+.auth-copy p{font-size:15px;line-height:1.55}
+.auth-mobile-brand img{display:block;width:min(100%,320px);height:auto;margin:0 auto;object-fit:contain}
+.sidebar{overflow-y:auto}
+.side-promo-art{display:block;width:100%;height:auto;aspect-ratio:1;object-fit:contain;border-radius:8px;margin-bottom:10px}
+@media(max-width:860px){.auth-mobile-brand{display:block;margin-bottom:16px;text-align:center}}
+@media(max-width:520px){.auth-mobile-brand img{width:min(100%,270px)}}

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { dispose, init, registerOverlay } from 'klinecharts';
 import { api, humanizeError } from '../../lib/api';
+import { publishLiveMarketQuote } from '../../lib/liveMarketPriceStore';
 import type { MarketCandle, MarketInstrument, MarketOrderBook, MarketTicker, MarketTrade, Position } from '../../types';
 import MarketMicrostructure from './MarketMicrostructure';
 
@@ -561,7 +562,23 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     () => positions.find((position) => positionSymbol(position) === canonicalSymbol(selected.symbol)),
     [positions, selected.symbol],
   );
+  const activePositionSymbols = useMemo(
+    () => [...new Set(positions.map((position) => positionSymbol(position)).filter(Boolean))],
+    [positions],
+  );
+  const activePositionSymbolsKey = activePositionSymbols.join('|');
   const tradeLevels = useMemo(() => getTradeLevels(activePosition), [activePosition]);
+  const marketPressure = useMemo(() => {
+    const bids = orderBook.bids.slice(0, 20);
+    const asks = orderBook.asks.slice(0, 20);
+    const bidNotional = bids.reduce((sum, row) => sum + Math.max(0, row.price * row.quantity), 0);
+    const askNotional = asks.reduce((sum, row) => sum + Math.max(0, row.price * row.quantity), 0);
+    const total = bidNotional + askNotional;
+    if (!(total > 0)) return null;
+    const buy = Math.max(0, Math.min(100, bidNotional / total * 100));
+    return { buy, sell: 100 - buy, bidNotional, askNotional };
+  }, [orderBook]);
+
 
   const selectInstrument = useCallback((instrument: MarketInstrument) => {
     manualSelectionRef.current = true;
@@ -621,6 +638,74 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     });
     return () => { cancelled = true; };
   }, [selected.symbol]);
+
+  // Share the exact price rendered by the chart with the active-position card.
+  // This removes the old 15 s dashboard polling lag. When the CoinW socket is
+  // live the card and the chart consume the same WebSocket price.
+  useEffect(() => {
+    if (lastPrice == null || !Number.isFinite(lastPrice) || lastPrice <= 0) return;
+    const source = streamState === 'live' ? 'websocket' : streamState === 'polling' ? 'rest' : 'initial';
+    publishLiveMarketQuote(selected.symbol, lastPrice, source);
+  }, [lastPrice, selected.symbol, streamState]);
+
+
+  // Keep every active-position card live even while the user explores another
+  // chart symbol. One lightweight CoinW ticker socket feeds the shared quote
+  // store; the chart socket remains responsible for candles/order book/trades.
+  useEffect(() => {
+    const selectedSymbol = canonicalSymbol(selected.symbol);
+    const positionSymbols = activePositionSymbolsKey.split('|').filter((symbol) => Boolean(symbol) && symbol !== selectedSymbol);
+    if (!positionSymbols.length) return;
+    let stopped = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    const subscriptionTimers: number[] = [];
+
+    const connectPositionTicker = () => {
+      if (stopped) return;
+      try {
+        socket = new WebSocket(COINW_FUTURES_WS);
+      } catch {
+        reconnectTimer = window.setTimeout(connectPositionTicker, 2500);
+        return;
+      }
+      socket.onopen = () => {
+        if (stopped || !socket) return;
+        positionSymbols.forEach((symbol, index) => {
+          const timer = window.setTimeout(() => {
+            if (stopped || !socket || socket.readyState !== WebSocket.OPEN) return;
+            socket.send(JSON.stringify({ event: 'sub', params: { biz: 'futures', pairCode: pairCode(symbol), type: 'ticker_swap' } }));
+          }, index * 380);
+          subscriptionTimers.push(timer);
+        });
+      };
+      socket.onmessage = (event) => {
+        if (stopped) return;
+        const payload = unwrapSocketPayload(event.data);
+        if (!payload || payload.type !== 'ticker_swap') return;
+        const nextTicker = socketTicker(payload.data);
+        const price = nextTicker?.last;
+        if (price == null || !Number.isFinite(price) || price <= 0) return;
+        const incomingSymbol = canonicalSymbol(payload.pairCode || '');
+        publishLiveMarketQuote(incomingSymbol, price, 'websocket');
+      };
+      socket.onclose = () => {
+        socket = null;
+        if (!stopped) reconnectTimer = window.setTimeout(connectPositionTicker, 2500);
+      };
+      socket.onerror = () => {
+        if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+      };
+    };
+
+    connectPositionTicker();
+    return () => {
+      stopped = true;
+      subscriptionTimers.forEach((timer) => window.clearTimeout(timer));
+      if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
+      if (socket && socket.readyState <= WebSocket.OPEN) socket.close();
+    };
+  }, [activePositionSymbolsKey, selected.symbol]);
 
   useEffect(() => {
     try {
@@ -1265,6 +1350,22 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
           {tradeLevels.map((level) => <span key={level.key} className={level.tone}><i />{level.label}<strong>{formatPrice(level.value, selected.price_precision)}</strong></span>)}
         </div>
       )}
+
+      <div className={`market-pressure-strip ${marketPressure ? 'ready' : 'waiting'}`} aria-label="Fuerza compradora y vendedora">
+        <div className="market-pressure-label buy">
+          <span>Fuerza compradora</span>
+          <strong>{marketPressure ? `${marketPressure.buy.toFixed(1)}%` : '—'}</strong>
+        </div>
+        <div className="market-pressure-track" aria-hidden="true">
+          <i style={{ width: `${marketPressure?.buy ?? 50}%` }} />
+          <b style={{ width: `${marketPressure?.sell ?? 50}%` }} />
+        </div>
+        <div className="market-pressure-label sell">
+          <span>Fuerza vendedora</span>
+          <strong>{marketPressure ? `${marketPressure.sell.toFixed(1)}%` : '—'}</strong>
+        </div>
+        <small>{marketPressure ? 'Liquidez visible · 20 niveles del Order Book de CoinW' : 'Esperando Order Book en tiempo real…'}</small>
+      </div>
 
       <div className="market-chart-canvas-wrap">
         <div className="market-chart-canvas" ref={chartRef} />

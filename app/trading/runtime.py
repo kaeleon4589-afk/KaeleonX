@@ -160,6 +160,9 @@ class UserTradingRuntimeManager:
                     net_pnl=row.get('net_pnl'),
                     leverage=int(row.get('leverage', self.settings.fixed_leverage)),
                     protected=bool(row.get('protected', True)),
+                    exit_trigger_price=row.get('exit_trigger_price'),
+                    stop_gap_bps=row.get('stop_gap_bps'),
+                    exit_quote_delay_ms=row.get('exit_quote_delay_ms'),
                 )
                 for attr in ("strategy", "quality", "execution_rr", "structural_rr"):
                     if row.get(attr) is not None:
@@ -175,6 +178,8 @@ class UserTradingRuntimeManager:
                 self.settings.risk_per_trade,
                 self.settings.fixed_leverage,
                 max_margin_fraction=self.settings.max_margin_fraction,
+                fee_rate=self.settings.paper_taker_fee,
+                exit_slippage_bps=self.settings.paper_slippage_bps,
             ),
             execution,
             self.db,
@@ -276,7 +281,16 @@ class UserTradingRuntimeManager:
 
     async def _run_snapshot(self, snapshot) -> None:
         await self.refresh()
-        for runtime in list(self._runtimes.values()):
+        runtimes = list(self._runtimes.values())
+        if getattr(snapshot, 'monitor_only', False):
+            # A risk quote only needs the owners of an open position or an
+            # unresolved order in this symbol. Visiting every other user would
+            # delay stops as the account count grows.
+            runtimes = [runtime for runtime in runtimes
+                        if any(p.status == 'OPEN' and p.symbol == snapshot.symbol
+                               for p in runtime.position_manager.positions.values())
+                        or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol]
+        for runtime in runtimes:
             try:
                 self.audit.event('USER_MARKET_ANALYSIS_START', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, trading_enabled=runtime.trading_enabled, configured_capital=runtime.configured_capital)
                 live_allowed = runtime.live_allowed

@@ -175,3 +175,14 @@ export type ActivityEvent = {
   [key: string]: unknown;
 };
 export type ActivityResponse = { mode: string; items: ActivityEvent[]; count: number };
+
+export interface AdminStatistics {
+  mode: 'demo' | 'live';
+  period: StatisticsPeriod | null;
+  history: StatisticsPeriod[];
+  metrics: { trades: number; wins: number; losses: number; breakeven: number; pnl: number; win_rate: number; profit_factor: number | null; open_positions: number; excluded_positions: number };
+}
+export interface StatisticsPeriod {
+  reset_id: string; started_at: number; label: string; actor: string;
+  previous_metrics: AdminStatistics['metrics'];
+}

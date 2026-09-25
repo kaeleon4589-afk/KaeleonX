@@ -12,6 +12,8 @@ from app.security.credential_vault import CredentialVault
 from app.storage.database import Database
 from app.trading.profile import UserTradingProfileService
 from app.trading.metrics import calculate_performance
+from app.trading.statistics import TradingStatistics
+from app.trading.metrics import position_net_pnl
 from app.referrals import new_referral_code
 
 router = APIRouter(prefix="/user", tags=["user"])
@@ -211,6 +213,17 @@ def dashboard(authorization: str | None = Header(default=None)):
     }
     state["configured_capital"] = profile.operating_capital
     state["trading_enabled"] = profile.trading_enabled
+    # The worker may still be between market snapshots after an admin cutover.
+    stats = TradingStatistics(db)
+    period = stats.current_period(mode)
+    if period and period.get('global_reset'):
+        positions = stats.active_positions(mode, db.find_many('positions', {'user_id': uid, 'mode': mode}, limit=0))
+        positions = [p for p in positions if not p.get('settlement_pending')]
+        capital = profiles.demo_account.opening_balance(uid) if mode == 'demo' else max(
+            0.0, profile.coinw_available_equity - sum(position_net_pnl(p) for p in positions if p.get('status') == 'CLOSED'))
+        state.update(calculate_performance(positions, capital))
+        state['current_capital'] = profile.demo_available_equity if mode == 'demo' else profile.coinw_available_equity
+        state['available_equity'] = state['current_capital']
     return {"user": {"user_id": uid, "role": user.get("role")}, "engine": state}
 
 
@@ -220,12 +233,14 @@ def execution(authorization: str | None = Header(default=None)):
     profile = profiles.public(user["user_id"])
     mode = profile.execution_mode
     state = db.find_one("user_engine_state", {"user_id": user["user_id"], "mode": mode.upper()}) or {}
+    period = TradingStatistics(db).current_period(mode)
+    fresh_equity = (profile.demo_available_equity if mode == 'demo' else profile.coinw_available_equity)
     return {
         "mode": state.get("mode", mode.upper()),
         "status": state.get("status", "PAUSADO" if not profile.trading_enabled else "ANALIZANDO"),
         "capital": state.get("capital", profile.operating_capital),
         "configured_capital": profile.operating_capital,
-        "available_equity": state.get(
+        "available_equity": fresh_equity if period and period.get('global_reset') else state.get(
             "available_equity",
             profile.demo_available_equity if mode == "demo" else profile.coinw_available_equity,
         ),
@@ -250,6 +265,8 @@ def operations(authorization: str | None = Header(default=None)):
     query = {"user_id": uid, "mode": mode}
     opened = db.find_many('positions', {**query, 'status': 'OPEN'}, limit=0, sort_field='opened_at')
     closed = db.find_many('positions', {**query, 'status': 'CLOSED'}, limit=50, sort_field='closed_at')
+    if (TradingStatistics(db).current_period(mode) or {}).get('global_reset'):
+        closed = TradingStatistics(db).active_positions(mode, closed)
     return {"mode": mode, "open": [{k: v for k, v in p.items() if k != '_id'} for p in opened],
             "closed": [{k: v for k, v in p.items() if k != '_id'} for p in closed]}
 
@@ -263,6 +280,13 @@ def performance(authorization: str | None = Header(default=None)):
     state = db.find_one("user_engine_state", {"user_id": uid, "mode": mode.upper()}) or {}
     capital = profiles.demo_account.opening_balance(uid) if mode == "demo" else float(profile.operating_capital)
     positions = db.find_many("positions", {"user_id": uid, "mode": mode}, limit=0)
+    period = TradingStatistics(db).current_period(mode)
+    if period and period.get('global_reset'):
+        positions = TradingStatistics(db).active_positions(mode, positions)
+    positions = [p for p in positions if not p.get('settlement_pending')]
+    if mode == 'live' and period and period.get('global_reset'):
+        capital = max(0.0, profile.coinw_available_equity - sum(
+            position_net_pnl(p) for p in positions if p.get('status') == 'CLOSED'))
     metrics = calculate_performance(positions, capital)
     default_available = profile.demo_available_equity if mode == "demo" else profile.coinw_available_equity
     return {
@@ -270,8 +294,9 @@ def performance(authorization: str | None = Header(default=None)):
         "capital": capital,
         "configured_capital": profile.operating_capital,
         **metrics,
-        "current_capital": profile.demo_available_equity if mode == "demo" else metrics["current_capital"],
-        "available_equity": float(state.get("available_equity", default_available)),
+        "current_capital": profile.demo_available_equity if mode == "demo" else (
+            profile.coinw_available_equity if period and period.get('global_reset') else metrics['current_capital']),
+        "available_equity": float(default_available if period and period.get('global_reset') else state.get("available_equity", default_available)),
     }
 
 

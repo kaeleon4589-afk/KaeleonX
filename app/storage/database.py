@@ -210,10 +210,16 @@ class Database:
             self.memory.append(('positions', {**key, **document}))
 
     def demo_net_pnl(self, user_id):
-        """Aggregate every persisted position, without a history/page limit."""
+        """Net PnL and fees in the current global DEMO period."""
+        from app.trading.statistics import TradingStatistics
+        period = TradingStatistics(self).current_period('demo')
+        since = period['started_at'] if period and period.get('global_reset') else None
         if self.db is not None:
+            match = {'user_id': user_id, 'mode': 'demo'}
+            if since is not None:
+                match['opened_at'] = {'$gte': since}
             pipeline = [
-                {'$match': {'user_id': user_id, 'mode': 'demo'}},
+                {'$match': match},
                 {'$group': {'_id': None, 'net': {'$sum': {'$subtract': [
                     {'$add': [{'$ifNull': ['$realized_pnl', 0]}, {'$ifNull': ['$funding_pnl', 0]}]},
                     {'$add': [{'$ifNull': ['$entry_fee', 0]}, {'$ifNull': ['$exit_fee', 0]}]}
@@ -224,4 +230,6 @@ class Database:
         from math import fsum
         from app.trading.metrics import position_net_pnl
         return fsum(position_net_pnl(p) for p in self.find_many(
-            'positions', {'user_id': user_id, 'mode': 'demo'}, limit=0))
+            'positions', {'user_id': user_id, 'mode': 'demo'}, limit=0)
+            if (since is None or (isinstance(p.get('opened_at'), (int, float))
+                                    and p['opened_at'] >= since)))

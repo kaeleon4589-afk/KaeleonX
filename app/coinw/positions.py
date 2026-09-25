@@ -22,3 +22,7 @@ class CoinWPositionsAPI:
 
     async def close_all_market(self, instrument: str):
         return await self.client.request("DELETE", "/v1/perpum/allpositions", {"instrument": instrument}, private=True)
+
+    async def history(self, instrument: str):
+        return await self.client.request('GET', '/v1/perpum/positions/history',
+                                         {'instrument': instrument}, private=True)

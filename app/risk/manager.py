@@ -14,15 +14,18 @@ class RiskDecision:
 
 class RiskManager:
     def __init__(self, max_risk_per_trade=.01, max_leverage=10, min_quality=60,
-                 max_margin_fraction=.90):
+                 max_margin_fraction=.90, fee_rate=0.0, exit_slippage_bps=0.0):
         self.max_risk_per_trade = max_risk_per_trade
         self.max_leverage = max_leverage
         self.min_quality = min_quality
         self.max_margin_fraction = max_margin_fraction
+        self.fee_rate = fee_rate
+        self.exit_slippage_bps = exit_slippage_bps
 
     def evaluate(self, intent, equity, leverage=1):
         if not all(math.isfinite(float(v)) for v in (equity, intent.entry_price, intent.stop_price,
-                                                       intent.quality, intent.risk_multiplier)):
+                                                       intent.quality, intent.risk_multiplier,
+                                                       self.fee_rate, self.exit_slippage_bps)):
             return RiskDecision(False, 0, 'invalid_numeric_input')
         if intent.quality < self.min_quality:
             return RiskDecision(False, 0, "quality_below_threshold")
@@ -35,9 +38,17 @@ class RiskManager:
         if stop_distance <= 0 or intent.entry_price <= 0:
             return RiskDecision(False, 0, "invalid_stop")
 
+        if self.fee_rate < 0 or self.exit_slippage_bps < 0:
+            return RiskDecision(False, 0, "invalid_cost_assumptions")
         multiplier = max(0.0, min(1.0, intent.risk_multiplier))
         risk_cap = equity * self.max_risk_per_trade * multiplier
-        base_quantity = risk_cap / stop_distance
+        # At the stop, net loss also includes both taker fees and the expected
+        # DEMO exit slip (or a conservative LIVE reserve). Gaps can still exceed
+        # the risk budget; this is sizing, not a guaranteed loss cap.
+        expected_stop = intent.stop_price
+        cost_per_base = (self.fee_rate * (intent.entry_price + expected_stop)
+                         + self.exit_slippage_bps / 10000 * expected_stop)
+        base_quantity = risk_cap / (stop_distance + cost_per_base)
         if base_quantity <= 0:
             return RiskDecision(False, 0, "invalid_quantity")
 

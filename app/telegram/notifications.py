@@ -173,7 +173,10 @@ class TelegramTradeNotifier:
             f"Resultado: {result}\n"
             f"Entrada: {_fmt_number(getattr(position, 'entry_price', None), price=True)}\n"
             f"Salida: {_fmt_number(getattr(position, 'exit_price', None), price=True)}\n"
-            f"PnL neto: {'+' if net > 0 else ''}{_fmt_number(net)} USDT\n"
+            + (f"Stop Loss: {_fmt_number(getattr(position, 'stop_price', None), price=True)}\n"
+               f"Diferencia frente al SL: {float(getattr(position, 'stop_gap_bps', 0) or 0)/100:.4f}%\n"
+               if getattr(position, 'exit_reason', None) == 'SL' and getattr(position, 'stop_gap_bps', None) is not None else "")
+            + f"PnL neto: {'+' if net > 0 else ''}{_fmt_number(net)} USDT\n"
             f"Motivo: {getattr(position, 'exit_reason', None) or 'EXCHANGE'}"
         )
         self._schedule(user_id, text)

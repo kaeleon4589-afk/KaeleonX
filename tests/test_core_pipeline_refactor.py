@@ -78,7 +78,7 @@ def build_orchestrator(execution, *, db=None, audit=None, opened=None, mode="dem
         owner_user_id="u1", owner_mode=mode,
     )
     orchestrator = TradingOrchestrator(
-        FixedRegime(), DynamicRouter(), RiskManager(.01, 5), execution,
+        FixedRegime(), DynamicRouter(), RiskManager(.01, 10), execution,
         db, audit, manager, None,
         execution_mode=mode,
         on_position_opened=opened.append,
@@ -327,7 +327,7 @@ def test_engine_state_persistence_is_cadence_bounded_across_symbol_rotation():
     asyncio.run(manager._persist_state(runtime, 100.0, 10.0, 'ACTIVO', first))
     asyncio.run(manager._persist_state(runtime, 100.0, 10.0, 'ACTIVO', second))
     assert manager.db.upserts == 1
-    assert manager.profiles.equity_updates == 1
+    assert manager.profiles.equity_updates == 0  # DEMO must not overwrite the CoinW LIVE balance.
 
 
 def test_source_router_defaults_range_no_trade_and_trend_probe_opt_in(monkeypatch):

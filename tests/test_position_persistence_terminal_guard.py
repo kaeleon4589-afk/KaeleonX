@@ -59,7 +59,7 @@ def test_real_fill_persists_bson_safe_position_order_and_emits_opened():
     execution = PaperExecutionEngine(audit=audit, max_spread_bps=30, initial_equity=100)
     opened = []
     orchestrator = TradingOrchestrator(
-        FixedRegime(), FixedRouter(), RiskManager(.01, 5), execution,
+        FixedRegime(), FixedRouter(), RiskManager(.01, 10), execution,
         db, audit, manager, None, execution_mode="demo",
         on_position_opened=opened.append,
         persistence=TradePersistence(db, audit, timeout_seconds=1, retries=1),

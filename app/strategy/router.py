@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace, is_dataclass
+from types import SimpleNamespace
 
 from app.strategy.breakout_retest import BreakoutRetestStrategy
 from app.strategy.liquidity_sweep import LiquiditySweepStrategy
@@ -113,7 +115,7 @@ class StrategyRouter:
                 traces['sweep'] = {'accepted': False, 'reason': 'primary_breakout_selected'}
             elif self._should_probe_liquidity(regime_metadata):
                 probe = self.sweep.evaluate(
-                    regime, candles, decision_id, symbol, timeframe,
+                    (replace(regime, sweep_allowed=True) if is_dataclass(regime) else SimpleNamespace(**{**vars(regime), "sweep_allowed": True})), candles, decision_id, symbol, timeframe,
                     current_price, snapshot=snapshot,
                 )
                 traces['sweep'] = self._compact(self.sweep)

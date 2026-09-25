@@ -3,7 +3,7 @@ import { dispose, init, registerOverlay } from 'klinecharts';
 import { api, humanizeError } from '../../lib/api';
 import { publishLiveMarketQuote } from '../../lib/liveMarketPriceStore';
 import type { MarketCandle, MarketInstrument, MarketOrderBook, MarketTicker, MarketTrade, Position } from '../../types';
-import MarketMicrostructure from './MarketMicrostructure';
+import MarketMicrostructure, { type MarketPressure } from './MarketMicrostructure';
 
 const COINW_FUTURES_WS = 'wss://ws.futurescw.com/perpum';
 const TRADE_LEVEL_GROUP = 'kaeleon-trade-levels';
@@ -528,6 +528,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     const matching = positions.find((p) => positionSymbol(p) === firstPositionSymbol);
     return toNumber(matching?.current_price);
   });
+  const [lastPriceSource, setLastPriceSource] = useState<'websocket' | 'rest' | 'initial'>('initial');
   const [markPrice, setMarkPrice] = useState<number | null>(null);
   const [indexPrice, setIndexPrice] = useState<number | null>(null);
   const [fundingRate, setFundingRate] = useState<number | null>(null);
@@ -568,7 +569,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
   );
   const activePositionSymbolsKey = activePositionSymbols.join('|');
   const tradeLevels = useMemo(() => getTradeLevels(activePosition), [activePosition]);
-  const marketPressure = useMemo(() => {
+  const marketPressure = useMemo<MarketPressure | null>(() => {
     const bids = orderBook.bids.slice(0, 20);
     const asks = orderBook.asks.slice(0, 20);
     const bidNotional = bids.reduce((sum, row) => sum + Math.max(0, row.price * row.quantity), 0);
@@ -586,6 +587,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     setQuery('');
     setSearchOpen(false);
     setLastPrice(null);
+    setLastPriceSource('initial');
     setMarkPrice(null);
     setIndexPrice(null);
     setFundingRate(null);
@@ -625,7 +627,16 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
       setOrderBook(snapshot.order_book || EMPTY_ORDER_BOOK);
       setTrades(snapshot.trades || []);
       setTicker(snapshot.ticker || {});
-      if (snapshot.ticker?.last != null) setLastPrice(Number(snapshot.ticker.last));
+      if (snapshot.ticker?.last != null) {
+        const snapshotLast = Number(snapshot.ticker.last);
+        if (Number.isFinite(snapshotLast) && snapshotLast > 0) {
+          setLastPrice((current) => {
+            if (current != null) return current;
+            setLastPriceSource('rest');
+            return snapshotLast;
+          });
+        }
+      }
       if (snapshot.ticker?.index_price != null) setIndexPrice(Number(snapshot.ticker.index_price));
       if (snapshot.funding?.rate != null) setFundingRate(Number(snapshot.funding.rate));
       if (snapshot.funding?.timestamp != null) {
@@ -644,9 +655,8 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
   // live the card and the chart consume the same WebSocket price.
   useEffect(() => {
     if (lastPrice == null || !Number.isFinite(lastPrice) || lastPrice <= 0) return;
-    const source = streamState === 'live' ? 'websocket' : streamState === 'polling' ? 'rest' : 'initial';
-    publishLiveMarketQuote(selected.symbol, lastPrice, source);
-  }, [lastPrice, selected.symbol, streamState]);
+    publishLiveMarketQuote(selected.symbol, lastPrice, lastPriceSource, selected.price_precision);
+  }, [lastPrice, lastPriceSource, selected.price_precision, selected.symbol]);
 
 
   // Keep every active-position card live even while the user explores another
@@ -774,6 +784,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     };
     setSelected(fallback);
     setLastPrice(toNumber(position.current_price));
+    setLastPriceSource('initial');
     setMarkPrice(null);
     setIndexPrice(null);
     setFundingRate(null);
@@ -877,7 +888,10 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
           setCandleHistory(sourceCandles);
           const bars = sourceCandles.map(toKLineData);
           const latest = bars.at(-1);
-          if (latest) setLastPrice(latest.close);
+          if (latest) {
+            setLastPrice(latest.close);
+            setLastPriceSource('rest');
+          }
           callback(bars, false);
           if (!bars.length) setChartError('CoinW no devolvió velas para este mercado y temporalidad.');
         } catch (error) {
@@ -910,6 +924,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
               const bar = toKLineData(latest);
               callback(bar);
               setLastPrice(bar.close);
+              setLastPriceSource('rest');
               setCandleHistory((current) => mergeCandle(current, toMarketCandle(bar)));
               setChartError('');
             }
@@ -986,6 +1001,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
               if (bar) {
                 callback(bar);
                 setLastPrice(bar.close);
+                setLastPriceSource('websocket');
                 setCandleHistory((current) => mergeCandle(current, toMarketCandle(bar)));
                 setStreamState('live');
               }
@@ -1036,7 +1052,10 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
               const nextTicker = socketTicker(payload.data);
               if (nextTicker) {
                 setTicker((current) => ({ ...current, ...nextTicker }));
-                if (nextTicker.last != null && Number.isFinite(nextTicker.last)) setLastPrice(nextTicker.last);
+                // Keep the chart candle close as the canonical live price.
+                // ticker_swap still feeds 24h market statistics, but it must not
+                // overwrite the value shared with the position card or the
+                // visible K-line price can diverge by a tick.
                 if (nextTicker.index_price != null && Number.isFinite(nextTicker.index_price)) setIndexPrice(nextTicker.index_price);
               }
             }
@@ -1385,6 +1404,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
         precision={selected.price_precision}
         candles={candleHistory}
         activePosition={activePosition}
+        marketPressure={marketPressure}
       />
 
       <div className="market-chart-footer">

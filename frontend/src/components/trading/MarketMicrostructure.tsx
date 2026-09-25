@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { MarketCandle, MarketOrderBook, MarketTicker, MarketTrade, Position } from '../../types';
 
+export type MarketPressure = {
+  buy: number;
+  sell: number;
+  bidNotional: number;
+  askNotional: number;
+};
+
 type Props = {
   orderBook: MarketOrderBook;
   trades: MarketTrade[];
@@ -14,6 +21,7 @@ type Props = {
   precision: number;
   candles: MarketCandle[];
   activePosition?: Position;
+  marketPressure: MarketPressure | null;
 };
 
 type Tab = 'book' | 'trades' | 'market' | 'depth';
@@ -62,17 +70,15 @@ function countdown(timestamp: number | null | undefined, now: number): string {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
-function OrderBook({ book, precision, lastPrice }: { book: MarketOrderBook; precision: number; lastPrice: number | null }) {
+function OrderBook({ book, precision, lastPrice, marketPressure }: { book: MarketOrderBook; precision: number; lastPrice: number | null; marketPressure: MarketPressure | null }) {
   const asks = book.asks.slice(0, 12).reverse();
   const bids = book.bids.slice(0, 12);
-  const bidVolume = bids.reduce((sum, row) => sum + row.quantity, 0);
-  const askVolume = asks.reduce((sum, row) => sum + row.quantity, 0);
   const maxQty = Math.max(1e-12, ...asks.map((r) => r.quantity), ...bids.map((r) => r.quantity));
   const bestAsk = book.asks[0]?.price ?? null;
   const bestBid = book.bids[0]?.price ?? null;
   const spread = bestAsk != null && bestBid != null ? Math.max(0, bestAsk - bestBid) : null;
-  const total = bidVolume + askVolume;
-  const buyPressure = total > 0 ? bidVolume / total * 100 : 50;
+  const buyPressure = marketPressure?.buy ?? null;
+  const sellPressure = marketPressure?.sell ?? null;
 
   return <div className="market-book">
     <div className="book-head"><span>Precio</span><span>Cantidad</span><span>Total</span></div>
@@ -93,11 +99,11 @@ function OrderBook({ book, precision, lastPrice }: { book: MarketOrderBook; prec
       </div>)}
     </div>
     <div className="book-pressure">
-      <div><strong>{buyPressure.toFixed(1)}%</strong><span>Fuerza compradora</span></div>
-      <div className="pressure-bar"><i style={{ width: `${buyPressure}%` }} /><b style={{ width: `${100 - buyPressure}%` }} /></div>
-      <div><strong>{(100 - buyPressure).toFixed(1)}%</strong><span>Fuerza vendedora</span></div>
+      <div><strong>{buyPressure == null ? '—' : `${buyPressure.toFixed(1)}%`}</strong><span>Fuerza compradora</span></div>
+      <div className="pressure-bar"><i style={{ width: `${buyPressure ?? 50}%` }} /><b style={{ width: `${sellPressure ?? 50}%` }} /></div>
+      <div><strong>{sellPressure == null ? '—' : `${sellPressure.toFixed(1)}%`}</strong><span>Fuerza vendedora</span></div>
     </div>
-    <small className="market-derived-note">Presión derivada de los niveles visibles del libro; no representa cantidad de personas.</small>
+    <small className="market-derived-note">Presión derivada y sincronizada con la barra superior · 20 niveles por lado · no representa cantidad de personas.</small>
   </div>;
 }
 
@@ -191,7 +197,7 @@ function PositionData({ position, lastPrice }: { position?: Position; lastPrice:
 
 export default function MarketMicrostructure(props: Props) {
   const [tab, setTab] = useState<Tab>('book');
-  const { orderBook, trades, ticker, precision, lastPrice, markPrice, indexPrice, fundingRate, fundingTimestamp, fundingTimestampKind, candles, activePosition } = props;
+  const { orderBook, trades, ticker, precision, lastPrice, markPrice, indexPrice, fundingRate, fundingTimestamp, fundingTimestampKind, candles, activePosition, marketPressure } = props;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (fundingTimestampKind !== 'next' || fundingTimestamp == null) return;
@@ -212,7 +218,7 @@ export default function MarketMicrostructure(props: Props) {
       <button type="button" className={tab === 'depth' ? 'active' : ''} onClick={() => setTab('depth')}>Depth</button>
     </div>
 
-    {tab === 'book' && <OrderBook book={orderBook} precision={precision} lastPrice={lastPrice} />}
+    {tab === 'book' && <OrderBook book={orderBook} precision={precision} lastPrice={lastPrice} marketPressure={marketPressure} />}
     {tab === 'trades' && <RecentTrades trades={trades} precision={precision} />}
     {tab === 'depth' && <DepthChart book={orderBook} precision={precision} />}
     {tab === 'market' && <div className="market-data-layout">

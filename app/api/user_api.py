@@ -37,6 +37,7 @@ def deps():
             _db,
             vault,
             minimum_operating_capital=s.min_operating_capital,
+        initial_demo_equity=s.paper_initial_equity,
         )
     if _billing is None:
         _billing = BillingService(_db, trial_days=s.live_trial_days)
@@ -92,7 +93,7 @@ class TradingConfigRequest(BaseModel):
 
 
 def _config_payload(profile, entitlement, settings):
-    active_available = settings.paper_initial_equity if profile.execution_mode == "demo" else profile.coinw_available_equity
+    active_available = profile.demo_available_equity if profile.execution_mode == "demo" else profile.coinw_available_equity
     return {
         "execution_mode": profile.execution_mode,
         "trading_enabled": profile.trading_enabled,
@@ -100,7 +101,9 @@ def _config_payload(profile, entitlement, settings):
         "demo_operating_capital": profile.demo_operating_capital,
         "live_operating_capital": profile.live_operating_capital,
         "minimum_operating_capital": settings.min_operating_capital,
-        "demo_available_equity": float(settings.paper_initial_equity),
+        "demo_available_equity": profile.demo_available_equity,
+        "demo_auto_compound": profile.demo_auto_compound,
+        "leverage": settings.fixed_leverage,
         "live_available_equity": profile.coinw_available_equity,
         "available_equity": float(active_available),
         "coinw_configured": profile.coinw_configured,
@@ -138,7 +141,7 @@ async def save_trading_config(req: TradingConfigRequest, authorization: str | No
             if not before.coinw_verified:
                 raise ValueError("coinw_verification_required_for_capital")
             if req.execution_mode == "demo":
-                if requested > settings.paper_initial_equity:
+                if requested > before.demo_available_equity + 1e-8:
                     raise ValueError("demo_capital_exceeds_virtual_balance")
             else:
                 available = await _coinw_equity(profiles, uid)
@@ -188,7 +191,7 @@ async def test_coinw_credentials(authorization: str | None = Header(default=None
             "connected": True,
             "verified": True,
             "available_equity": available,
-            "demo_equity": float(get_settings().paper_initial_equity),
+            "demo_equity": profiles.demo_account.balance(user["user_id"]),
             "api_key": profiles.public(user["user_id"]).coinw_api_key_masked,
         }
     except Exception as exc:
@@ -224,12 +227,15 @@ def execution(authorization: str | None = Header(default=None)):
         "configured_capital": profile.operating_capital,
         "available_equity": state.get(
             "available_equity",
-            get_settings().paper_initial_equity if mode == "demo" else profile.coinw_available_equity,
+            profile.demo_available_equity if mode == "demo" else profile.coinw_available_equity,
         ),
         "markets_scanned": state.get("markets_scanned", 0),
         "candidates": state.get("candidates", 0),
         "coinw_connected": profile.coinw_verified,
-        "leverage": "INTERNAL",
+        "leverage": get_settings().fixed_leverage,
+        "last_price": state.get("last_price"),
+        "last_market_at": state.get("last_market_at"),
+        "last_rejection": state.get("last_rejection"),
         "market_selection": "KAELEON_AUTO",
         "timeframe_selection": "KAELEON_INTERNAL",
         "trading_enabled": profile.trading_enabled,
@@ -241,12 +247,11 @@ def operations(authorization: str | None = Header(default=None)):
     db, user, profiles, _ = current(authorization)
     uid = user["user_id"]
     mode = profiles.public(uid).execution_mode
-    all_positions = collection(db, "positions", {"user_id": uid, "mode": mode})
-    return {
-        "mode": mode,
-        "open": [p for p in all_positions if str(p.get("status", "OPEN")).upper() == "OPEN"],
-        "closed": [p for p in all_positions if str(p.get("status", "OPEN")).upper() != "OPEN"],
-    }
+    query = {"user_id": uid, "mode": mode}
+    opened = db.find_many('positions', {**query, 'status': 'OPEN'}, limit=0, sort_field='opened_at')
+    closed = db.find_many('positions', {**query, 'status': 'CLOSED'}, limit=50, sort_field='closed_at')
+    return {"mode": mode, "open": [{k: v for k, v in p.items() if k != '_id'} for p in opened],
+            "closed": [{k: v for k, v in p.items() if k != '_id'} for p in closed]}
 
 
 @router.get("/performance")
@@ -256,15 +261,16 @@ def performance(authorization: str | None = Header(default=None)):
     profile = profiles.public(uid)
     mode = profile.execution_mode
     state = db.find_one("user_engine_state", {"user_id": uid, "mode": mode.upper()}) or {}
-    capital = float(profile.operating_capital)
-    positions = db.find_many("positions", {"user_id": uid, "mode": mode}, limit=10000)
+    capital = profiles.demo_account.opening_balance(uid) if mode == "demo" else float(profile.operating_capital)
+    positions = db.find_many("positions", {"user_id": uid, "mode": mode}, limit=0)
     metrics = calculate_performance(positions, capital)
-    default_available = get_settings().paper_initial_equity if mode == "demo" else profile.coinw_available_equity
+    default_available = profile.demo_available_equity if mode == "demo" else profile.coinw_available_equity
     return {
         "mode": mode,
         "capital": capital,
-        "configured_capital": capital,
+        "configured_capital": profile.operating_capital,
         **metrics,
+        "current_capital": profile.demo_available_equity if mode == "demo" else metrics["current_capital"],
         "available_equity": float(state.get("available_equity", default_available)),
     }
 
@@ -371,7 +377,7 @@ def activity(
             "confidence": state.get("regime_confidence"),
             "updated_at": state.get("updated_at"),
         })
-    if state.get("strategy"):
+    if state.get("strategy") or state.get("last_strategy_trace"):
         items.append({
             "event": "STRATEGY_STATE",
             "mode": active_mode,

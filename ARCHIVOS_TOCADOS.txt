@@ -1,0 +1,33 @@
+ARCHIVOS TOCADOS — Revisión de lógica de operaciones
+Base: KaeleonX-precios-precisos-RR-demo-live.zip
+
+MODIFICADOS (10)
+ARCHIVOS_TOCADOS.txt
+app/models/trading.py
+app/orchestrator.py
+app/position/manager.py
+app/risk/manager.py
+app/strategy/breakout_retest.py
+app/strategy/liquidity_sweep.py
+app/telegram/notifications.py
+app/trading/runtime.py
+frontend/src/lib/api.ts
+
+NUEVOS (2)
+REVISION_LOGICA_OPERACIONES.md
+tests/test_entry_geometry_risk.py
+
+ELIMINADOS: ninguno
+
+AMPLIACIÓN — Reinicio global DEMO/LIVE sobre este ZIP
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+app/api/user_api.py
+app/storage/database.py
+app/trading/runtime.py
+app/trading/statistics.py
+frontend/src/components/AdminStatisticsPanel.tsx
+frontend/src/lib/api.ts
+tests/test_statistics_reset.py
+ELIMINADOS: ninguno

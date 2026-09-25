@@ -14,7 +14,9 @@ class RiskDecision:
 
 class RiskManager:
     def __init__(self, max_risk_per_trade=.01, max_leverage=10, min_quality=60,
-                 max_margin_fraction=.90, fee_rate=0.0, exit_slippage_bps=0.0):
+                 max_margin_fraction=.90, fee_rate=.0006, exit_slippage_bps=0.0):
+        # Retained for callers loading older configurations; position size is
+        # now allocated from the user's configured margin, not a stop-risk cap.
         self.max_risk_per_trade = max_risk_per_trade
         self.max_leverage = max_leverage
         self.min_quality = min_quality
@@ -22,7 +24,7 @@ class RiskManager:
         self.fee_rate = fee_rate
         self.exit_slippage_bps = exit_slippage_bps
 
-    def evaluate(self, intent, equity, leverage=1):
+    def evaluate(self, intent, equity, leverage=1, available_equity=None):
         if not all(math.isfinite(float(v)) for v in (equity, intent.entry_price, intent.stop_price,
                                                        intent.quality, intent.risk_multiplier,
                                                        self.fee_rate, self.exit_slippage_bps)):
@@ -40,32 +42,19 @@ class RiskManager:
 
         if self.fee_rate < 0 or self.exit_slippage_bps < 0:
             return RiskDecision(False, 0, "invalid_cost_assumptions")
-        multiplier = max(0.0, min(1.0, intent.risk_multiplier))
-        risk_cap = equity * self.max_risk_per_trade * multiplier
-        # At the stop, net loss also includes both taker fees and the expected
-        # DEMO exit slip (or a conservative LIVE reserve). Gaps can still exceed
-        # the risk budget; this is sizing, not a guaranteed loss cap.
-        expected_stop = intent.stop_price
-        cost_per_base = (self.fee_rate * (intent.entry_price + expected_stop)
-                         + self.exit_slippage_bps / 10000 * expected_stop)
-        base_quantity = risk_cap / (stop_distance + cost_per_base)
-        if base_quantity <= 0:
-            return RiskDecision(False, 0, "invalid_quantity")
-
-        # CoinW quantityUnit=0 is denominated in quote currency (USDT).
-        quote_notional = base_quantity * intent.entry_price
-
-        # Leverage controls required margin. Never let the trade consume more
-        # than the configured fraction of available equity.
-        max_notional = equity * leverage * self.max_margin_fraction
-        if quote_notional > max_notional:
-            quote_notional = max_notional
-            base_quantity = quote_notional / intent.entry_price
-            if base_quantity <= 0:
-                return RiskDecision(False, 0, "margin_cap_zero")
-
+        available = equity if available_equity is None else float(available_equity)
+        if not math.isfinite(available) or available <= 0:
+            return RiskDecision(False, 0, 'equity_unavailable')
+        # Use the entire configured capital as margin. If it is also the entire
+        # wallet, reserve the entry taker fee so CoinW can accept the order.
+        # Extra unallocated wallet balance may cover that fee instead.
+        quote_notional = min(equity * leverage,
+                             available / (1.0 / leverage + self.fee_rate) * 0.999999)
+        base_quantity = quote_notional / intent.entry_price
+        if not math.isfinite(quote_notional) or quote_notional <= 0:
+            return RiskDecision(False, 0, 'margin_cap_zero')
         margin_required = quote_notional / leverage
-        if margin_required > equity * self.max_margin_fraction:
+        if margin_required > equity + 1e-8 or margin_required + quote_notional * self.fee_rate > available + 1e-8:
             return RiskDecision(False, 0, "margin_limit")
 
         return RiskDecision(

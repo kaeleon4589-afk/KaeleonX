@@ -17,12 +17,12 @@ def position(db, pid, mode='demo', opened=1000, pnl=5, status='CLOSED'):
                           'status': status, 'realized_pnl': pnl, 'entry_fee': 1})
 
 
-def test_reset_isolates_modes_and_preserves_money_and_pending(monkeypatch):
+def test_reset_isolates_modes_resets_demo_balance_and_preserves_history(monkeypatch):
     db = Database()
     position(db, 'old')
     position(db, 'live', 'live')
-    position(db, 'open', status='OPEN', pnl=0)
-    db.write('execution_pending', {'user_id': 'u', 'order_id': 'pending'})
+    position(db, 'other_user', opened=1001, pnl=-3)
+    db.update_many('positions', {'position_id': 'other_user'}, {'user_id': 'another'})
     account = DemoAccount(db)
     balance = account.balance('u')
     before = list(db.memory)
@@ -33,15 +33,30 @@ def test_reset_isolates_modes_and_preserves_money_and_pending(monkeypatch):
     assert service.report('demo')['metrics']['trades'] == 0
     assert service.report('live')['metrics']['trades'] == 1
     assert all(row in db.memory for row in before)
-    assert account.balance('u') == balance
-    # A previous setup's open trade must remain excluded even after closing.
-    db.update_many('positions', {'position_id': 'open'}, {'status': 'CLOSED', 'closed_at': 3000})
+    assert account.balance('u') == 100
+    assert account.balance('another') == 100
+    assert balance == 104
     position(db, 'new', opened=2001, pnl=-2)
     report = TradingStatistics(db).report('demo')  # fresh service / restart
     assert report['metrics']['trades'] == 1
     assert report['metrics']['pnl'] == -3
     assert report['metrics']['losses'] == 1
     assert report['metrics']['excluded_positions'] == 2
+    assert account.balance('u') == 97
+    assert service.report('live')['metrics']['trades'] == 1
+
+
+def test_reset_refuses_open_positions_and_pending_orders(monkeypatch):
+    db = Database()
+    service = TradingStatistics(db)
+    position(db, 'open', status='OPEN', pnl=0)
+    with pytest.raises(ValueError, match='reset_requires_no_open_positions'):
+        service.reset('demo', 'v2', 'admin', str(uuid4()))
+    db.update_many('positions', {'position_id': 'open'}, {'status': 'CLOSED'})
+    db.write('execution_pending', {'user_id': 'u', 'active': True})
+    with pytest.raises(ValueError, match='reset_requires_no_pending_orders'):
+        service.reset('demo', 'v2', 'admin', str(uuid4()))
+    assert db.count('statistics_periods') == 0
 
 
 def test_reset_receipt_idempotency_and_history(monkeypatch):
@@ -106,3 +121,36 @@ def test_only_final_settlements_count_and_missing_open_time_is_excluded(monkeypa
     assert service.report('live')['metrics']['trades'] == 0
     db.update_many('positions', {'position_id': 'pending'}, {'settlement_pending': False, 'net_pnl': 7})
     assert service.report('live')['metrics']['pnl'] == 7
+
+
+def test_user_performance_and_operations_start_new_period(monkeypatch):
+    from app.api import user_api
+    db = Database()
+    position(db, 'demo-old', opened=1000, pnl=-4)
+    position(db, 'live-old', 'live', opened=1000, pnl=9)
+    account = DemoAccount(db)
+    account.opening_balance('u')
+    monkeypatch.setattr('app.trading.statistics.time_ns', lambda: 2000_000_000)
+    TradingStatistics(db).reset('demo', 'Demo nuevo', 'admin', str(uuid4()))
+    TradingStatistics(db).reset('live', 'Live nuevo', 'admin', str(uuid4()))
+    class Profiles:
+        demo_account = account
+        def __init__(self, mode): self.mode = mode
+        def public(self, user_id):
+            return SimpleNamespace(execution_mode=self.mode, operating_capital=50,
+                                   demo_available_equity=account.balance(user_id),
+                                   coinw_available_equity=82, trading_enabled=False)
+    mode = ['demo']
+    monkeypatch.setattr(user_api, 'current', lambda _: (db, {'user_id': 'u'}, Profiles(mode[0]), None))
+    assert user_api.performance()['trades'] == 0
+    assert user_api.performance()['current_capital'] == 100
+    assert user_api.operations()['closed'] == []
+    position(db, 'demo-new', opened=2100, pnl=6)
+    assert user_api.performance()['pnl'] == 5
+    assert user_api.performance()['current_capital'] == 105
+    mode[0] = 'live'
+    assert user_api.performance()['pnl'] == 0
+    assert user_api.performance()['current_capital'] == 82
+    position(db, 'live-new', 'live', opened=2100, pnl=-2)
+    assert user_api.performance()['pnl'] == -3
+    assert user_api.performance()['current_capital'] == 82

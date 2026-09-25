@@ -75,3 +75,23 @@ frontend/src/components/AdminStatisticsPanel.tsx
 frontend/src/lib/api.ts
 tests/test_statistics_reset.py
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — Gráfico nativo CoinW en tiempo real
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+app/api/app.py
+app/coinw/market.py
+frontend/package.json
+frontend/package-lock.json
+frontend/src/lib/api.ts
+frontend/src/pages/DashboardPage.tsx
+frontend/src/styles.css
+frontend/src/types.ts
+NUEVOS:
+app/api/market_api.py
+app/market/chart_service.py
+docs/LIVE_MARKET_CHART.md
+frontend/src/components/trading/LiveMarketChart.tsx
+tests/test_live_market_chart.py
+ELIMINADOS: ninguno

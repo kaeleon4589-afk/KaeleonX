@@ -73,3 +73,15 @@ La línea bajo el PnL actual en «Operaciones Activas» pasa a verde si el PnL e
 ## ROE en vivo — 2026-09-25
 
 En «Operaciones Activas» se muestra ROE en vivo = PnL no realizado / margen inicial estimado × 100. El margen inicial estimado se calcula como cantidad base × precio de entrada / apalancamiento. El ROE usa el mismo color del PnL y muestra «—» si faltan los datos necesarios. En LIVE puede diferir del ROE que publique CoinW si el exchange aplica margen ajustado, comisiones u otra base de cálculo. No altera órdenes ni la contabilidad. Compilación TypeScript/Vite y 132 pruebas backend aprobadas; pendiente verificación visual tras despliegue.
+
+## Gráfico nativo CoinW — 2026-09-25
+
+Se añadió un gráfico financiero propio de KAELEON debajo de «Operaciones Activas». Usa KLineChart 10.0.3, histórico de velas desde el backend y datos públicos en vivo de CoinW Futures. Incluye 1m/3m/5m/15m/30m/1H/4H/1D, velas o área, crosshair, zoom/pan, pantalla completa, Last Price, Mark Price, VOL/MACD/RSI, MA/EMA/BOLL y fallback REST si el WebSocket se interrumpe.
+
+El buscador consulta dinámicamente el catálogo de instrumentos `online` de CoinW Futures; no existe una whitelist local, por lo que un contrato nuevo queda disponible sin cambiar código cuando CoinW lo publica en ese endpoint. El backend valida que el símbolo exista antes de servir velas. Los contratos USDT y USDC se normalizan respetando el formato requerido por CoinW.
+
+Cuando hay una operación activa, ENTRY, SL y TP/TP1/TP2 aparecen como líneas y etiquetas bloqueadas dentro del gráfico. Al abrir una nueva operación, el gráfico vuelve automáticamente al par operado. El usuario puede buscar otro mercado y después regresar con «Ver operación». El gráfico no modifica los niveles ni la ejecución: solo visualiza los valores persistidos por el motor.
+
+Seguridad: el histórico y el catálogo pasan por endpoints autenticados `/market/instruments` y `/market/candles`. El socket del navegador se conecta únicamente a canales públicos `candles_swap_utc` y `mark_price`; no expone API Key ni API Secret. Para una escala alta de usuarios concurrentes queda recomendado migrar ese socket público a un hub backend compartido.
+
+Validación local de esta ampliación: `python -m compileall -q app` y `pytest -q`: **137 pruebas aprobadas**. La compilación frontend final requiere descargar la nueva dependencia `klinecharts@10.0.3`; el entorno de esta revisión no tuvo acceso operativo al registro npm, por lo que el `npm install/npm run build` de esta ampliación queda pendiente de ejecutar en un entorno con red (por ejemplo Railway o local). Ejecutar `cd frontend && npm install && npm run build` antes de promover a producción.

@@ -160,3 +160,17 @@ NUEVO:
 tests/test_directional_symmetry.py
 
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — Tarjetas para compartir operaciones DEMO/LIVE
+BASE COMPARADA: KaeleonX-neutralidad-long-short.zip
+
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+frontend/src/pages/DashboardPage.tsx
+frontend/src/styles.css
+
+NUEVOS:
+frontend/src/components/trading/TradeShareModal.tsx
+frontend/src/lib/tradeShare.ts
+
+ELIMINADOS: ninguno

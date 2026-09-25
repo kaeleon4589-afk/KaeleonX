@@ -19,6 +19,24 @@ tests/test_entry_geometry_risk.py
 
 ELIMINADOS: ninguno
 
+AMPLIACIÓN — Capital configurado completo y niveles estructurales
+MODIFICADOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+app/api/admin_api.py
+app/config/settings.py
+app/orchestrator.py
+app/risk/manager.py
+app/strategy/breakout_retest.py
+app/strategy/liquidity_sweep.py
+app/trading/runtime.py
+frontend/src/pages/DashboardPage.tsx
+tests/test_core_pipeline_refactor.py
+tests/test_entry_geometry_risk.py
+tests/test_live_core_v0107.py
+ELIMINADOS: ninguno
+
 AMPLIACIÓN — Reinicio global DEMO/LIVE sobre este ZIP
 MODIFICADOS:
 ARCHIVOS_TOCADOS.txt

@@ -48,7 +48,7 @@ class PositionManager:
             self.add(p, persist=False)
         self.state_changed = False
 
-    def mark(self, symbol, price, timestamp, bid=None, ask=None):
+    def mark(self, symbol, price, timestamp, bid=None, ask=None, quote_received_ms=None):
         for p in list(self.positions.values()):
             if p.symbol != symbol or p.status != "OPEN":
                 continue
@@ -64,7 +64,10 @@ class PositionManager:
             if self.evaluate_local_exits:
                 action = self.exit_engine.evaluate(p, price)
                 if action:
-                    self.close_or_reduce(p, action, price, timestamp)
+                    observed = (quote_received_ms if isinstance(quote_received_ms, (int, float))
+                                and 0 < quote_received_ms <= timestamp else timestamp)
+                    p.exit_quote_delay_ms = max(0, int(timestamp - observed))
+                    self.close_or_reduce(p, action, price, int(observed))
                     continue
             # A mark can arrive every couple of seconds. Persist at a bounded
             # cadence instead of turning Mongo into a per-tick event stream.
@@ -222,6 +225,7 @@ class PositionManager:
         return changes
 
     def close_or_reduce(self, p, action, price, timestamp):
+        trigger_price = price
         if self.evaluate_local_exits:
             slip = self.exit_slippage_bps / 10000
             price *= (1 - slip) if p.direction == Direction.LONG else (1 + slip)
@@ -244,6 +248,11 @@ class PositionManager:
             gross = self._pnl(p, price, qty)
             p.realized_pnl += gross
             p.exit_price = price
+            p.exit_trigger_price = trigger_price if self.evaluate_local_exits else None
+            if action == 'SL' and p.stop_price > 0 and self.evaluate_local_exits:
+                adverse = ((p.stop_price - price) if p.direction == Direction.LONG
+                           else (price - p.stop_price))
+                p.stop_gap_bps = round(max(0.0, adverse / p.stop_price * 10000), 2)
             p.exit_reason = action
             p.closed_at = timestamp
             p.status = "CLOSED"
@@ -260,6 +269,9 @@ class PositionManager:
                     position_id=p.position_id, symbol=p.symbol,
                     direction=getattr(p.direction, "value", str(p.direction)),
                     reason=action, exit_price=price, quantity=qty,
+                    exit_trigger_price=p.exit_trigger_price,
+                    stop_gap_bps=p.stop_gap_bps,
+                    quote_delay_ms=p.exit_quote_delay_ms,
                     realized_pnl=p.realized_pnl, gross_pnl=gross,
                     strategy=getattr(p, "strategy", None),
                     execution_rr=getattr(p, "execution_rr", None),

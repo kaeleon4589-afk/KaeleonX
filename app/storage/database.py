@@ -74,6 +74,8 @@ class Database:
         self.db.positions.create_index([('position_id', ASCENDING)], unique=True)
         self.db.positions.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('status', ASCENDING)])
         self.db.pnl.create_index([('position_id', ASCENDING)])
+        self.db.statistics_periods.create_index('reset_id', unique=True)
+        self.db.statistics_periods.create_index([('mode', ASCENDING), ('started_at', DESCENDING)])
         self.db.demo_accounts.create_index('user_id', unique=True)
         self.db.execution_pending.create_index('user_id', unique=True)
         self.db.notification_outbox.create_index('event_id', unique=True)

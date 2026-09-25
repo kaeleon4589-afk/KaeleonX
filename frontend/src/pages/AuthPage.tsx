@@ -23,9 +23,9 @@ export default function AuthPage({onAuthenticated}:{onAuthenticated:(user:User)=
 
   return <main className="auth-shell">
     <div className="auth-glow auth-glow-one"/><div className="auth-glow auth-glow-two"/>
-    <section className="auth-side"><Brand/><div className="auth-copy"><span className="eyebrow">PLATAFORMA KAELEON</span><h1>Disciplina, estrategia y ejecución en un solo lugar.</h1><p>Conecta tu cuenta, define tu capital y deja que el motor gestione la ejecución respetando la lógica real del backend.</p></div><div className="auth-status"><i/> API segura · CoinW · Telegram</div></section>
+    <section className="auth-side"><Brand/><div className="auth-hero"><img src="/images/kaeleon-trading-art.jpg" alt="Camaleón verde KAELEON sobre un gráfico de trading" fetchPriority="high"/></div><div className="auth-copy"><span className="eyebrow">PLATAFORMA KAELEON</span><h1>Disciplina, estrategia y ejecución.</h1><p>Conecta tu cuenta y define tu capital para operar con KAELEON.</p></div><div className="auth-status"><i/> API segura · CoinW · Telegram</div></section>
     <section className="auth-panel"><div className="auth-card">
-      <div className="auth-mobile-brand"><Brand/></div>
+      <div className="auth-mobile-brand"><img src="/images/kaeleon-trading-art.jpg" alt="Camaleón verde y logotipo KAELEON" fetchPriority="high"/></div>
       {mode!=='verify' ? <>
         <div className="auth-tabs"><button className={mode==='login'?'active':''} onClick={()=>{setMode('login');setError('')}}>Iniciar sesión</button><button className={mode==='register'?'active':''} onClick={()=>{setMode('register');setError('')}}>Crear cuenta</button></div>
         <div className="auth-title"><h2>{mode==='login'?'Bienvenido de nuevo':'Crea tu cuenta'}</h2><p>{mode==='login'?'Accede a tu panel de ejecución.':'El teléfono debe coincidir con el que compartirás con Telegram.'}</p></div>

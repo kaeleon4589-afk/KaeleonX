@@ -1213,7 +1213,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     if (!chart || mainIndicator === 'NONE' || !mainIndicatorIdRef.current) return;
     const params = indicatorParams(mainParamsText, INDICATOR_DEFAULTS[mainIndicator] || []);
     setMainParamsText(params.join(', '));
-    chart.overrideIndicator({ id: mainIndicatorIdRef.current, calcParams: params });
+    chart.overrideIndicator({ id: mainIndicatorIdRef.current, name: mainIndicator, calcParams: params });
   }, [mainIndicator, mainParamsText]);
 
   const applySubParams = useCallback(() => {
@@ -1221,7 +1221,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     if (!chart || !subIndicatorIdRef.current) return;
     const params = indicatorParams(subParamsText, INDICATOR_DEFAULTS[subIndicator] || []);
     setSubParamsText(params.join(', '));
-    chart.overrideIndicator({ id: subIndicatorIdRef.current, calcParams: params });
+    chart.overrideIndicator({ id: subIndicatorIdRef.current, name: subIndicator, calcParams: params });
   }, [subIndicator, subParamsText]);
 
   const startDrawing = useCallback((tool: DrawingTool) => {

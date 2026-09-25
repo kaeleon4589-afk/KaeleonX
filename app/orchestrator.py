@@ -13,6 +13,11 @@ from app.models.trading import Position
 from app.trading.persistence import TradePersistence
 
 
+# Both strategies require at least this RR before generating a signal. Enforce
+# the same limit after executable bid/ask and DEMO slippage alter the entry.
+MIN_EXECUTION_RR = 0.95
+
+
 class TradingOrchestrator:
     """Deterministic signal -> risk -> execution -> position pipeline.
 
@@ -402,6 +407,19 @@ class TradingOrchestrator:
                     strategy=getattr(intent.strategy, "value", str(intent.strategy)),
                     reason="invalid_trade_geometry", entry_price=entry,
                     stop_price=stop, target_price=target, execution_rr=execution_rr,
+                )
+                return None
+
+            if execution_rr < MIN_EXECUTION_RR:
+                self.last_decision[key] = now
+                self.last_rejection = 'execution_rr_too_low'
+                self.audit.event(
+                    "SIGNAL_REJECTED", decision_id, user_id=user_id,
+                    mode=self.execution_mode, symbol=snapshot.symbol,
+                    strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    reason='execution_rr_too_low', entry_price=entry,
+                    stop_price=stop, target_price=target,
+                    execution_rr=round(execution_rr, 4), minimum_rr=MIN_EXECUTION_RR,
                 )
                 return None
 

@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from app.models.trading import Position
 from app.models.enums import Direction
+from app.coinw.normalization import base_quantity
 
 
 class CoinWExecutor:
@@ -100,16 +101,7 @@ class CoinWExecutor:
             or intent.entry_price
         )
 
-        quantity_unit = int(row.get("quantityUnit", 0) or 0)
-        if quantity_unit == 2:
-            base_quantity = float(row.get("quantity") or row.get("baseSize") or 0)
-        else:
-            base_size = float(row.get("baseSize") or 0)
-            quote_quantity = float(row.get("quantity") or 0)
-            base_quantity = base_size or (
-                quote_quantity / max(entry, 1e-12)
-                if quantity_unit == 0 else 0
-            )
+        quantity = base_quantity(row, entry)
 
         position_id = str(
             row.get("id")
@@ -121,7 +113,7 @@ class CoinWExecutor:
             decision_id=intent.decision_id,
             symbol=intent.symbol,
             direction=intent.direction,
-            quantity=base_quantity,
+            quantity=quantity,
             entry_price=entry,
             stop_price=float(intent.stop_price),
             target_price=float(intent.target_price),
@@ -130,12 +122,12 @@ class CoinWExecutor:
                 if intent.metadata.get("tp1_price") is not None else None
             ),
             tp2_price=float(intent.metadata.get("tp2_price", intent.target_price)),
-            remaining_quantity=base_quantity,
+            remaining_quantity=quantity,
             opened_at=int(row.get("updatedDate") or row.get("createdDate") or 0),
             entry_fee=float(row.get("fee") or 0),
         )
 
-    async def submit_intent(self, intent, quantity, leverage=1, position_model=0):
+    async def submit_intent(self, intent, quantity, leverage=10, position_model=0):
         if not self.enabled:
             return {
                 "accepted": False,
@@ -230,6 +222,7 @@ class CoinWExecutor:
             }
 
         position = self._position_from_exchange(intent, position_row)
+        position.leverage = int(leverage)
 
         # Reassert exchange-native protection against an entry/fill race.
         try:
@@ -320,3 +313,37 @@ class CoinWExecutor:
                 or 0.0
             )
         return 0.0
+
+    async def settlements(self, instrument, position_ids):
+        """Only use explicit, complete closing events. Unknown means keep reconciling."""
+        import math
+        rows = self._rows(await self.positions.history(self._instrument(instrument)))
+        result = {}
+        for pid in position_ids:
+            unique = {}
+            for row in rows:
+                if (str(row.get('openId')) == str(pid)
+                        and str(row.get('status', '')).lower() == 'close'
+                        and str(row.get('orderStatus', '')).lower() == 'finish'
+                        and row.get('netProfit') is not None):
+                    unique[str(row.get('orderId') or '')] = row
+            closes = list(unique.values())
+            if not closes:
+                continue
+            try:
+                weights = [float(r['tradePiece']) for r in closes]
+                total = max(float(r['totalPiece']) for r in closes)
+                prices = [float(r.get('avgClosePrice') or r.get('closePrice')) for r in closes]
+                pnls = [float(r['netProfit']) for r in closes]
+                if (not all(math.isfinite(v) for v in [*weights, total, *prices, *pnls])
+                        or min(weights) <= 0 or min(prices) <= 0 or total <= 0
+                        or sum(weights) < total):
+                    continue
+                result[str(pid)] = {
+                    'net_pnl': sum(pnls),
+                    'exit_price': sum(p * w for p, w in zip(prices, weights)) / sum(weights),
+                    'closed_at': max(int(r['tradeStartDate']) for r in closes),
+                }
+            except (KeyError, ValueError, TypeError):
+                continue
+        return result

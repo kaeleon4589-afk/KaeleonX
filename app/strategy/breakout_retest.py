@@ -246,7 +246,11 @@ class BreakoutRetestStrategy:
 
         sl_from_atr = atr_pct * MTF_SL_ATR_MULT
         sl_from_structure = structural_pct + (atr_pct * MTF_SL_BUFFER_ATR)
-        sl_pct = clamp(max(sl_from_atr, sl_from_structure), MTF_SL_MIN_PCT, MTF_SL_MAX_PCT)
+        required_sl_pct = max(sl_from_atr, sl_from_structure)
+        if required_sl_pct > MTF_SL_MAX_PCT:
+            return self._reject("stop_exceeds_model_limit", required_sl_pct=required_sl_pct,
+                                max=MTF_SL_MAX_PCT)
+        sl_pct = max(required_sl_pct, MTF_SL_MIN_PCT)
         extension_atr = float(trigger_diag.get("extension_atr", 0.0) or 0.0)
         h1_strength = clamp((float(diag1h.get("adx", 0.0)) - H1_ADX_MIN) / 15.0, 0.0, 1.0)
         m15_strength = clamp((float(diag15.get("adx", 0.0)) - M15_ADX_MIN) / 14.0, 0.0, 1.0)

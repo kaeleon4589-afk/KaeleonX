@@ -257,7 +257,10 @@ class LiquiditySweepStrategy:
             if direction == Direction.LONG
             else (structural_stop - close5) / max(close5, 1e-12)
         )
-        sl_pct = clamp(structural_sl_pct, SL_MIN_PCT, SL_MAX_PCT)
+        if structural_sl_pct > SL_MAX_PCT:
+            return self._reject("stop_exceeds_model_limit", required_sl_pct=structural_sl_pct,
+                                max=SL_MAX_PCT)
+        sl_pct = max(structural_sl_pct, SL_MIN_PCT)
         target_level = float(candidate["target_level"])
         structural_tp_pct = abs(target_level - close5) / max(close5, 1e-12) if target_level > 0 else 0.0
         tp_pct, execution_rr = _fixed_tp_pct(

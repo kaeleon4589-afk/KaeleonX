@@ -177,9 +177,7 @@ class UserTradingRuntimeManager:
             RegimeEngine(),
             StrategyRouter(),
             RiskManager(
-                self.settings.risk_per_trade,
-                self.settings.fixed_leverage,
-                max_margin_fraction=self.settings.max_margin_fraction,
+                max_leverage=self.settings.fixed_leverage,
                 fee_rate=self.settings.paper_taker_fee,
                 exit_slippage_bps=self.settings.paper_slippage_bps,
             ),
@@ -339,6 +337,7 @@ class UserTradingRuntimeManager:
                     effective_capital,
                     user_id=runtime.user_id,
                     allow_entries=allow_entries,
+                    available_equity=available_equity,
                 )
                 if runtime.mode == TradingEnvironment.LIVE.value and not live_allowed:
                     status = "LIVE_NO_ENTITLED"

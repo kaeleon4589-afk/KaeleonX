@@ -53,6 +53,14 @@ class CoinWMarketClient:
     async def depth(self, instrument):
         return await self._get('/v1/perpumPublic/depth', {'base': _base(instrument)})
 
+    async def trades(self, instrument):
+        return await self._get('/v1/perpumPublic/trades', {'base': _base(instrument)})
+
+    async def funding_rate(self, instrument):
+        # CoinW documents this REST endpoint as the *last settled* funding rate.
+        # Real-time funding is consumed from the public websocket by the UI.
+        return await self._get('/v1/perpum/fundingRate', {'instrument': _base(instrument).lower()})
+
     async def klines(self, instrument, period='5m', size=320):
         if period not in _GRANULARITY:
             raise ValueError('unsupported_timeframe')

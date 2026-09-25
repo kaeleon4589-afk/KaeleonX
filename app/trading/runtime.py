@@ -23,6 +23,7 @@ from app.orchestrator import TradingOrchestrator
 from app.trading.profile import UserTradingProfileService
 from app.trading.persistence import TradePersistence
 from app.trading.metrics import calculate_performance, position_net_pnl
+from app.trading.statistics import TradingStatistics
 from app.models.trading import Position
 from app.models.enums import Direction
 
@@ -41,6 +42,7 @@ class UserRuntime:
     live_allowed: bool = True
     last_state_persist: float = 0.0
     last_state_signature: str = ""
+    last_reset_id: str | None = None
 
 
 class UserTradingRuntimeManager:
@@ -214,6 +216,7 @@ class UserTradingRuntimeManager:
             orchestrator=orchestrator,
             coinw_verified=bool(row.get("coinw_verified", False)),
             live_allowed=True,
+            last_reset_id=(TradingStatistics(self.db).current_period(mode) or {}).get('reset_id'),
         )
 
     async def refresh(self) -> None:
@@ -281,6 +284,11 @@ class UserTradingRuntimeManager:
 
     async def _run_snapshot(self, snapshot) -> None:
         await self.refresh()
+        periods = None
+        if not getattr(snapshot, 'monitor_only', False):
+            periods = await asyncio.to_thread(lambda: {
+                mode: TradingStatistics(self.db).current_period(mode) for mode in ('demo', 'live')
+            })
         runtimes = list(self._runtimes.values())
         if getattr(snapshot, 'monitor_only', False):
             # A risk quote only needs the owners of an open position or an
@@ -292,6 +300,14 @@ class UserTradingRuntimeManager:
                         or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol]
         for runtime in runtimes:
             try:
+                period = periods[runtime.mode] if periods is not None else None
+                reset_id = period.get('reset_id') if period else None
+                if periods is not None and runtime.last_reset_id != reset_id:
+                    if runtime.mode == 'demo':
+                        runtime.execution.equity = await asyncio.to_thread(
+                            self.profiles.demo_account.balance, runtime.user_id)
+                    runtime.last_reset_id = reset_id
+                    runtime.last_state_persist = 0.0
                 self.audit.event('USER_MARKET_ANALYSIS_START', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, trading_enabled=runtime.trading_enabled, configured_capital=runtime.configured_capital)
                 live_allowed = runtime.live_allowed
 
@@ -386,13 +402,19 @@ class UserTradingRuntimeManager:
                 {"user_id": runtime.user_id, "mode": runtime.mode},
                 limit=0,
             )
+            period = await asyncio.to_thread(TradingStatistics(self.db).current_period, runtime.mode)
+            if period and period.get('global_reset'):
+                positions = TradingStatistics(self.db).active_positions(runtime.mode, positions)
+            positions = [p for p in positions if not p.get('settlement_pending')]
             baseline = runtime.configured_capital
             account = getattr(self.profiles, 'demo_account', None)
             if runtime.mode == 'demo' and account is not None:
                 baseline = await asyncio.to_thread(account.opening_balance, runtime.user_id)
+            elif period and period.get('global_reset'):
+                baseline = max(0.0, float(available_equity) - sum(
+                    position_net_pnl(p) for p in positions if p.get('status') == 'CLOSED'))
             metrics = calculate_performance(positions, baseline)
-            if runtime.mode == 'demo':
-                metrics['current_capital'] = float(available_equity)
+            metrics['current_capital'] = float(available_equity)
             state_key = {"user_id": runtime.user_id, "mode": runtime.mode.upper()}
             state_doc = {
                 "user_id": runtime.user_id,

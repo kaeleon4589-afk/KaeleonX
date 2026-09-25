@@ -6,6 +6,7 @@ from app.coinw.normalization import base_quantity
 
 from app.models.enums import Direction
 from app.models.trading import Position
+from app.position.protection import calculate_break_even_price
 
 
 class PositionManager:
@@ -17,7 +18,8 @@ class PositionManager:
 
     def __init__(self, exit_engine, audit=None, on_realized=None, db=None,
                  evaluate_local_exits=True, owner_user_id=None, owner_mode=None,
-                 on_closed=None, on_opened=None, persist_interval_seconds=15.0):
+                 on_closed=None, on_opened=None, persist_interval_seconds=15.0,
+                 estimated_exit_fee_rate=0.0006, break_even_buffer_bps=3.0):
         self.exit_engine = exit_engine
         self.positions: dict[str, Position] = {}
         self.audit = audit
@@ -32,11 +34,14 @@ class PositionManager:
         self._last_persist: dict[str, float] = {}
         self.persistence = None
         self.exit_slippage_bps = 0.0
+        self.estimated_exit_fee_rate = max(0.0, float(estimated_exit_fee_rate))
+        self.break_even_buffer_bps = max(0.0, float(break_even_buffer_bps))
         self.state_changed = False
 
     def add(self, position, *, persist=True):
         if position.remaining_quantity is None:
             position.remaining_quantity = position.quantity
+        self._ensure_management_state(position)
         self.positions[position.position_id] = position
         self.state_changed = True
         if persist:
@@ -48,7 +53,125 @@ class PositionManager:
             self.add(p, persist=False)
         self.state_changed = False
 
+    def _ensure_management_state(self, p):
+        if getattr(p, "initial_stop_price", None) is None:
+            p.initial_stop_price = float(p.stop_price)
+        if getattr(p, "structural_target_price", None) is None:
+            p.structural_target_price = float(p.target_price)
+        if getattr(p, "best_price", None) is None:
+            p.best_price = float(p.entry_price)
+        if not getattr(p, "management_stage", None):
+            p.management_stage = "INITIAL"
+
+        for name, default, low, high in (
+            ("break_even_activation_ratio", 0.55, 0.20, 0.90),
+            ("profit_lock_activation_ratio", 0.80, 0.40, 0.98),
+            ("profit_lock_capture_ratio", 0.35, 0.05, 0.80),
+        ):
+            try:
+                value = float(getattr(p, name, default))
+            except (TypeError, ValueError):
+                value = default
+            setattr(p, name, min(high, max(low, value)))
+        if p.profit_lock_activation_ratio <= p.break_even_activation_ratio:
+            p.profit_lock_activation_ratio = min(0.98, p.break_even_activation_ratio + 0.15)
+        p.profit_lock_capture_ratio = min(
+            p.profit_lock_capture_ratio,
+            max(0.05, p.profit_lock_activation_ratio - 0.10),
+        )
+
+        try:
+            configured_fee = float(getattr(p, "estimated_exit_fee_rate", self.estimated_exit_fee_rate))
+        except (TypeError, ValueError):
+            configured_fee = self.estimated_exit_fee_rate
+        p.estimated_exit_fee_rate = configured_fee if configured_fee >= 0 else self.estimated_exit_fee_rate
+        try:
+            configured_buffer = float(getattr(p, "break_even_buffer_bps", self.break_even_buffer_bps))
+        except (TypeError, ValueError):
+            configured_buffer = self.break_even_buffer_bps
+        p.break_even_buffer_bps = configured_buffer if configured_buffer >= 0 else self.break_even_buffer_bps
+        if getattr(p, "break_even_price", None) is None:
+            p.break_even_price = calculate_break_even_price(
+                p,
+                fallback_exit_fee_rate=self.estimated_exit_fee_rate,
+                buffer_bps=self.break_even_buffer_bps,
+            )
+
+    @staticmethod
+    def _management_progress(p) -> float:
+        target_distance = abs(float(p.target_price) - float(p.entry_price))
+        if target_distance <= 1e-12:
+            return 0.0
+        best = float(p.best_price if p.best_price is not None else p.entry_price)
+        favorable = (best - p.entry_price) if p.direction == Direction.LONG else (p.entry_price - best)
+        return max(0.0, favorable / target_distance)
+
+    def _apply_dynamic_protection(self, p, price) -> bool:
+        self._ensure_management_state(p)
+        if p.direction == Direction.LONG:
+            p.best_price = max(float(p.best_price), float(price))
+        else:
+            p.best_price = min(float(p.best_price), float(price))
+
+        progress = self._management_progress(p)
+        target_distance = abs(float(p.target_price) - float(p.entry_price))
+        if target_distance <= 1e-12:
+            return False
+
+        candidate = None
+        stage = None
+        if progress >= float(p.profit_lock_activation_ratio):
+            lock_distance = target_distance * float(p.profit_lock_capture_ratio)
+            candidate = (p.entry_price + lock_distance if p.direction == Direction.LONG
+                         else p.entry_price - lock_distance)
+            if p.break_even_price is not None:
+                candidate = (max(candidate, p.break_even_price) if p.direction == Direction.LONG
+                             else min(candidate, p.break_even_price))
+            stage = "PROFIT_LOCK"
+        elif progress >= float(p.break_even_activation_ratio) and p.break_even_price is not None:
+            candidate = float(p.break_even_price)
+            stage = "BREAK_EVEN"
+
+        if candidate is None or not math.isfinite(float(candidate)) or float(candidate) <= 0:
+            return False
+
+        # Never move a protective stop backwards. The stop may only become more
+        # protective as favorable excursion increases.
+        epsilon = max(abs(float(p.entry_price)) * 1e-10, 1e-12)
+        if p.direction == Direction.LONG:
+            candidate = min(float(candidate), float(p.target_price) - epsilon)
+            tightened = float(candidate) > float(p.stop_price) + epsilon
+        else:
+            candidate = max(float(candidate), float(p.target_price) + epsilon)
+            tightened = float(candidate) < float(p.stop_price) - epsilon
+        if not tightened:
+            return False
+
+        previous_stop = float(p.stop_price)
+        p.stop_price = float(candidate)
+        p.management_stage = stage
+        p.stop_moved_to_breakeven = True
+        if stage == "PROFIT_LOCK":
+            p.profit_lock_price = float(candidate)
+        p.protection_update_pending = not self.evaluate_local_exits
+        p.revision += 1
+        self.state_changed = True
+        self._persist(p, force=True)
+        if self.audit:
+            self.audit.event(
+                "PROFIT_LOCK_ACTIVATED" if stage == "PROFIT_LOCK" else "STOP_MOVED_TO_BREAK_EVEN",
+                p.decision_id,
+                user_id=self.owner_user_id, mode=self.owner_mode,
+                position_id=p.position_id, symbol=p.symbol,
+                direction=getattr(p.direction, "value", str(p.direction)),
+                previous_stop=previous_stop, stop_price=p.stop_price,
+                break_even_price=p.break_even_price, best_price=p.best_price,
+                progress_ratio=round(progress, 6), target_price=p.target_price,
+            )
+        return True
+
     def mark(self, symbol, price, timestamp, bid=None, ask=None, quote_received_ms=None):
+        protection_changes = []
         for p in list(self.positions.values()):
             if p.symbol != symbol or p.status != "OPEN":
                 continue
@@ -61,6 +184,8 @@ class PositionManager:
             p.revision += 1
             qty = p.remaining_quantity or p.quantity
             p.unrealized_pnl = self._pnl(p, price, qty)
+            if self._apply_dynamic_protection(p, price):
+                protection_changes.append(p)
             if self.evaluate_local_exits:
                 action = self.exit_engine.evaluate(p, price)
                 if action:
@@ -72,6 +197,7 @@ class PositionManager:
             # A mark can arrive every couple of seconds. Persist at a bounded
             # cadence instead of turning Mongo into a per-tick event stream.
             self._persist(p, force=False)
+        return protection_changes
 
     @staticmethod
     def _same_symbol(value: str | None, expected: str | None) -> bool:
@@ -159,7 +285,23 @@ class PositionManager:
             )
             entry = self._float(row.get("openPrice") or row.get("avgPrice"), p.entry_price)
             p.entry_price = entry
-            p.stop_price = self._float(row.get("stopLossPrice"), p.stop_price)
+            remote_stop = self._float(row.get("stopLossPrice"), p.stop_price)
+            local_stop = float(p.stop_price)
+            stage = str(getattr(p, "management_stage", "INITIAL") or "INITIAL")
+            if stage != "INITIAL":
+                # Exchange reconciliation must never loosen a stop already moved
+                # to break-even/profit-lock. If the exchange is lagging, keep the
+                # tighter local stop and reassert it after reconciliation.
+                if p.direction == Direction.LONG:
+                    p.stop_price = max(local_stop, remote_stop)
+                    remote_is_looser = remote_stop + max(abs(local_stop) * 1e-10, 1e-12) < local_stop
+                else:
+                    p.stop_price = min(local_stop, remote_stop)
+                    remote_is_looser = remote_stop - max(abs(local_stop) * 1e-10, 1e-12) > local_stop
+                if remote_is_looser:
+                    p.protection_update_pending = True
+            else:
+                p.stop_price = remote_stop
             p.target_price = self._float(row.get("stopProfitPrice"), p.target_price)
             qty = base_quantity(row, entry)
             p.settlement_pending = False

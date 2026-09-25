@@ -174,3 +174,21 @@ frontend/src/components/trading/TradeShareModal.tsx
 frontend/src/lib/tradeShare.ts
 
 ELIMINADOS: ninguno
+
+CORRECCIÓN — Build frontend Railway / Node 22
+BASE COMPARADA: KaeleonX-share-card-demo-live.zip
+
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+frontend/package.json
+frontend/railway.toml
+
+NUEVOS:
+frontend/railpack.json
+frontend/.nvmrc
+
+ELIMINADOS: ninguno
+
+MOTIVO:
+Vite 7.3.6 exige Node ^20.19.0 o >=22.12.0. Railway estaba construyendo con Node 18.20.5 y fallaba durante el build CSS con "crypto.hash is not a function".
+La corrección fija Node 22.14.0 en Railpack, declara Node >=22.12 <23 en package.json y usa npm ci para builds reproducibles.

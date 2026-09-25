@@ -78,7 +78,7 @@ def test_breakout_target_comes_from_swing_or_measured_range():
     assert _structure_target(Direction.LONG, 103, highs, lows, [102] * 26, lows) == 105.5
 
 
-def test_sweep_keeps_liquidity_swing_target_and_sweep_extreme_stop(monkeypatch):
+def test_sweep_front_runs_liquidity_target_and_keeps_sweep_extreme_stop(monkeypatch):
     import app.strategy.liquidity_sweep as sweep
     monkeypatch.setattr(sweep, 'candle_quality', lambda *a: (True, {}))
     monkeypatch.setattr(sweep, 'extract', lambda _: ([100]*260, [101]*260,
@@ -95,9 +95,12 @@ def test_sweep_keeps_liquidity_swing_target_and_sweep_extreme_stop(monkeypatch):
     intent = sweep.LiquiditySweepStrategy().evaluate(
         regime, [object()]*260, 'd', 'BTC', '5m')
     assert intent.stop_price == 98.8
-    assert intent.target_price == 105
+    assert intent.metadata['structural_target_price'] == 105
+    assert intent.metadata['target_front_run_ratio'] == pytest.approx(.92)
+    assert intent.target_price == pytest.approx(104.6)
     assert intent.metadata['sl_pct'] == pytest.approx(.012)
-    assert intent.metadata['tp_pct'] == pytest.approx(.05)
+    assert intent.metadata['structural_tp_pct'] == pytest.approx(.05)
+    assert intent.metadata['tp_pct'] == pytest.approx(.046)
 
 
 @pytest.mark.parametrize('side,stop,observed', [

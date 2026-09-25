@@ -23,14 +23,7 @@ RESET_TOUCH_TOL_ATR = 0.38
 RESET_BREAK_TOL_ATR = 0.48
 TRIGGER_MAX_EMA20_EXTENSION_ATR = 0.95
 CONTINUATION_CONFIRM_TOL_ATR = 0.10
-MTF_SL_MIN_PCT = 0.0045
-MTF_SL_MAX_PCT = 0.0068
-MTF_SL_ATR_MULT = 0.88
 MTF_SL_BUFFER_ATR = 0.10
-MTF_TP_MIN_PCT = 0.0060
-MTF_TP_MAX_PCT = 0.0085
-MTF_RR_MIN = 1.05
-MTF_RR_MAX = 1.30
 MIN_RR_TO_SIGNAL = 0.95
 MIN_SCORE_TO_SIGNAL = 69.0
 MAX_SCORE = 100.0
@@ -164,14 +157,16 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
     return True, "OK", diag
 
 
-def _fixed_tp_pct(*, score: float, atr_pct: float, sl_pct: float) -> tuple[float, float]:
-    rr_target = 1.14
-    rr_target += clamp((float(score) - 82.0) * 0.0048, -0.08, 0.10)
-    rr_target += clamp((float(atr_pct) - 0.0060) * 6.0, -0.04, 0.04)
-    rr_target = clamp(rr_target, MTF_RR_MIN, MTF_RR_MAX)
-    tp_pct = clamp(float(sl_pct) * rr_target, MTF_TP_MIN_PCT, MTF_TP_MAX_PCT)
-    rr_real = tp_pct / max(float(sl_pct), 1e-12)
-    return round(tp_pct, 6), round(rr_real, 4)
+def _structure_target(direction, close, highs5, lows5, highs15, lows15):
+    """Nearest opposing swing, or a projection of the latest consolidation range."""
+    recent_high = max(highs5[-(RESET_LOOKBACK_BARS + 1):-1])
+    recent_low = min(lows5[-(RESET_LOOKBACK_BARS + 1):-1])
+    range_size = recent_high - recent_low
+    if direction == Direction.LONG:
+        levels = [x for x in (max(highs5[-35:-1]), max(highs15[-25:-1])) if x > close]
+        return min(levels) if levels else close + range_size
+    levels = [x for x in (min(lows5[-35:-1]), min(lows15[-25:-1])) if x < close]
+    return max(levels) if levels else close - range_size
 
 
 def _break_even(score: float, strength: float, sl_pct: float, tp_pct: float) -> tuple[float, float, str]:
@@ -244,13 +239,11 @@ class BreakoutRetestStrategy:
             structural_pct = max(0.0, (reset_extreme - close5) / max(close5, 1e-12))
             direction = Direction.SHORT
 
-        sl_from_atr = atr_pct * MTF_SL_ATR_MULT
-        sl_from_structure = structural_pct + (atr_pct * MTF_SL_BUFFER_ATR)
-        required_sl_pct = max(sl_from_atr, sl_from_structure)
-        if required_sl_pct > MTF_SL_MAX_PCT:
-            return self._reject("stop_exceeds_model_limit", required_sl_pct=required_sl_pct,
-                                max=MTF_SL_MAX_PCT)
-        sl_pct = max(required_sl_pct, MTF_SL_MIN_PCT)
+        stop = (reset_extreme - atr5 * MTF_SL_BUFFER_ATR if direction == Direction.LONG
+                else reset_extreme + atr5 * MTF_SL_BUFFER_ATR)
+        sl_pct = abs(close5 - stop) / close5
+        if stop <= 0 or sl_pct <= 0:
+            return self._reject('invalid_structural_stop')
         extension_atr = float(trigger_diag.get("extension_atr", 0.0) or 0.0)
         h1_strength = clamp((float(diag1h.get("adx", 0.0)) - H1_ADX_MIN) / 15.0, 0.0, 1.0)
         m15_strength = clamp((float(diag15.get("adx", 0.0)) - M15_ADX_MIN) / 14.0, 0.0, 1.0)
@@ -275,11 +268,13 @@ class BreakoutRetestStrategy:
         if score < MIN_SCORE_TO_SIGNAL:
             return self._reject("score_too_low", score=score, min=MIN_SCORE_TO_SIGNAL)
 
-        tp_pct, execution_rr = _fixed_tp_pct(score=score, atr_pct=atr_pct, sl_pct=sl_pct)
+        target = _structure_target(direction, close5, tf5['h'], tf5['l'], tf15['h'], tf15['l'])
+        tp_pct = abs(target - close5) / close5
+        execution_rr = tp_pct / sl_pct
         if execution_rr < MIN_RR_TO_SIGNAL:
             return self._reject("rr_too_low", execution_rr=execution_rr, min=MIN_RR_TO_SIGNAL)
-        stop = close5 * (1.0 - sl_pct) if direction == Direction.LONG else close5 * (1.0 + sl_pct)
-        target = close5 * (1.0 + tp_pct) if direction == Direction.LONG else close5 * (1.0 - tp_pct)
+        if target <= 0:
+            return self._reject('invalid_structural_target')
         strength = clamp(score / 100.0, STRENGTH_MIN, STRENGTH_MAX)
         be_activation, be_offset, bucket = _break_even(score, strength, sl_pct, tp_pct)
 

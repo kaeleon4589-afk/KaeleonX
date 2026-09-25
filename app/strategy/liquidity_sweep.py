@@ -23,8 +23,6 @@ TRIGGER_EMA20_RECOVER_TOL_ATR = 0.55
 TRIGGER_EMA50_RECOVER_TOL_ATR = 1.05
 RETEST_INVALIDATION_ATR = 0.58
 SL_BUFFER_ATR = 0.18
-SL_MIN_PCT = 0.0050
-SL_MAX_PCT = 0.0070
 TARGET_LOOKBACK = 48
 MIN_RR = 0.95
 ATR_PCT_MIN = 0.0013
@@ -74,21 +72,6 @@ def _score_candidate(*, sweep_depth_atr: float, sweep_wick_ratio: float, sweep_r
         1.0,
     )
     return round(min(100.0, 66.0 + 34.0 * quality), 2)
-
-
-def _fixed_tp_pct(*, score: float, atr_pct: float, sl_pct: float, rr_estimate: float,
-                  structural_tp_pct: float, bars_since_sweep: int, trigger_rvol: float) -> tuple[float, float]:
-    sl_pct = max(float(sl_pct or 0.0), SL_MIN_PCT)
-    tp_pct = 0.0059
-    tp_pct += clamp((float(score) - 84.0) * 0.00005, -0.00022, 0.00022)
-    tp_pct += clamp((min(float(rr_estimate), 2.0) - 1.0) * 0.00025, -0.00010, 0.00018)
-    tp_pct += clamp((float(trigger_rvol) - 1.0) * 0.00004, -0.00010, 0.00016)
-    tp_pct += clamp((float(atr_pct) - 0.0065) * 0.10, -0.00012, 0.00012)
-    tp_pct -= clamp((max(1, int(bars_since_sweep)) - 1) * 0.00010, 0.0, 0.00035)
-    if structural_tp_pct > 0.0:
-        tp_pct = min(tp_pct, max(0.0050, structural_tp_pct * 0.78))
-    tp_pct = clamp(tp_pct, 0.0050, 0.0070)
-    return round(tp_pct, 6), round(tp_pct / max(sl_pct, 1e-12), 4)
 
 
 def _detect(direction: str, *, o, h, l, c, v, ema20, ema50, atr_value):
@@ -252,28 +235,17 @@ class LiquiditySweepStrategy:
 
         direction = Direction.LONG if candidate["direction"] == "long" else Direction.SHORT
         structural_stop = float(candidate["stop_price"])
-        structural_sl_pct = (
-            (close5 - structural_stop) / max(close5, 1e-12)
-            if direction == Direction.LONG
-            else (structural_stop - close5) / max(close5, 1e-12)
-        )
-        if structural_sl_pct > SL_MAX_PCT:
-            return self._reject("stop_exceeds_model_limit", required_sl_pct=structural_sl_pct,
-                                max=SL_MAX_PCT)
-        sl_pct = max(structural_sl_pct, SL_MIN_PCT)
+        sl_pct = abs(close5 - structural_stop) / max(close5, 1e-12)
+        if structural_stop <= 0 or sl_pct <= 0:
+            return self._reject('invalid_structural_stop')
         target_level = float(candidate["target_level"])
         structural_tp_pct = abs(target_level - close5) / max(close5, 1e-12) if target_level > 0 else 0.0
-        tp_pct, execution_rr = _fixed_tp_pct(
-            score=score,
-            atr_pct=atr_pct,
-            sl_pct=sl_pct,
-            rr_estimate=float(candidate["rr_estimate"]),
-            structural_tp_pct=structural_tp_pct,
-            bars_since_sweep=int(candidate["bars_since_sweep"]),
-            trigger_rvol=float(candidate["trigger_rvol"]),
-        )
-        stop = close5 * (1.0 - sl_pct) if direction == Direction.LONG else close5 * (1.0 + sl_pct)
-        target = close5 * (1.0 + tp_pct) if direction == Direction.LONG else close5 * (1.0 - tp_pct)
+        stop = structural_stop
+        target = target_level
+        tp_pct = structural_tp_pct
+        execution_rr = tp_pct / sl_pct
+        if target <= 0 or execution_rr < MIN_RR:
+            return self._reject('invalid_structural_target', execution_rr=execution_rr)
         be_activation = clamp(max(sl_pct * 0.46, tp_pct * 0.40), 0.0028, min(tp_pct * 0.56, 0.0039))
         be_offset = clamp(max(atr_pct * 0.06, 0.00050), 0.00050, 0.00095)
 

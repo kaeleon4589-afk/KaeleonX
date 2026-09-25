@@ -59,3 +59,28 @@ Las variables son ajustables, pero no conviene cambiarlas con una muestra peque�
 
 ### Validación
 `python -m compileall -q app` y `pytest -q`: **143 pruebas aprobadas**. Se añadieron pruebas LONG/SHORT de break-even y profit lock, sincronización de protección LIVE y protección contra una conciliación de CoinW que intente devolver el stop a un nivel menos protector. No se enviaron órdenes reales durante esta validación.
+
+## Neutralidad direccional LONG/SHORT — 2026-09-25
+
+Se corrigieron dos sesgos previos que podían reducir artificialmente la aparición de operaciones SHORT aunque las estrategias sí soportaran ambos sentidos.
+
+### Scanner de mercados
+El ranking previo daba una contribución mayor a `change_24h` positivo que a un movimiento negativo de igual magnitud. El ranking ahora usa `abs(change_24h)` exclusivamente como magnitud de momentum. Con volumen y Open Interest equivalentes, `+4%` y `-4%` reciben exactamente la misma puntuación. La dirección del mercado ya no interviene en la selección previa; queda reservada al detector de régimen y a las estrategias.
+
+El evento `MARKET_SCAN_DONE` incorpora `eligible_breadth` y `shortlist_breadth` (`up`, `down`, `flat`) y `ranking_mode=direction_neutral_momentum`. Esto permite distinguir entre un mercado realmente dominado por subidas y un problema de filtrado sin imponer cuotas artificiales de LONG/SHORT.
+
+### Régimen EMA
+`ema_stack_alignment` se calcula ahora con dos puntuaciones espejo: `ema_bullish_alignment` y `ema_bearish_alignment`. Las cinco condiciones tienen exactamente el mismo peso en ambos sentidos: precio respecto a EMA20, EMA20/EMA50, EMA50/EMA200, pendiente EMA20 y pendiente EMA50. El alignment efectivo es el máximo de ambos lados y `ema_alignment_edge` conserva la diferencia firmada.
+
+El `trend_bias` puede identificar un sesgo LONG o SHORT durante una estructura parcial suficientemente clara, sin exigir que las cinco condiciones ya formen un stack perfecto. Esto elimina la asimetría anterior, en la que los puntos parciales solo se concedían al lado alcista.
+
+### Estrategias y observabilidad
+No se fuerza una distribución 50/50 de operaciones. Si el mercado es realmente alcista, pueden seguir predominando los LONG; si es bajista, los SHORT deben tener la misma oportunidad técnica. `BreakoutRetestStrategy` y `LiquiditySweepStrategy` mantienen sus condiciones simétricas existentes.
+
+Los eventos `REGIME_EVALUATED` y `STRATEGY_EVALUATED` incluyen ahora dirección de régimen y dirección seleccionada, además de los alignments bullish/bearish. Esto permite localizar en producción si un SHORT fue descartado en scanner, régimen, setup, riesgo o ejecución.
+
+### Validación
+- `python -m compileall -q app`: sin errores.
+- `pytest -q`: **149 pruebas aprobadas**.
+- Se añadieron pruebas que comprueban igualdad de score para movimientos `+X%/-X%`, simetría del alignment EMA, clasificación de tendencia bajista con `short` bias y generación real de intents `LONG` y `SHORT` sobre setups MTF espejo.
+- No se añadieron cuotas de dirección ni se obligó al motor a abrir SHORT cuando no existe un setup válido.

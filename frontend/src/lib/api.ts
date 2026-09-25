@@ -1,4 +1,4 @@
-import type { AdminStatistics, ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, MarketCandlesResponse, MarketInstrument, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
+import type { AdminStatistics, ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, MarketCandlesResponse, MarketInstrument, MarketSnapshotResponse, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
@@ -75,6 +75,7 @@ export const api = {
 
   marketInstruments: (q = '', limit = 100) => request<{items: MarketInstrument[]; count: number; source: string}>(`/market/instruments?q=${encodeURIComponent(q)}&limit=${Math.max(1, Math.min(limit, 500))}`),
   marketCandles: (symbol: string, timeframe = '5m', limit = 400) => request<MarketCandlesResponse>(`/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${Math.max(50, Math.min(limit, 1000))}`),
+  marketSnapshot: (symbol: string) => request<MarketSnapshotResponse>(`/market/snapshot?symbol=${encodeURIComponent(symbol)}`),
 
   referrals: () => request<ReferralSummary>('/user/referrals'),
   adminMe: () => request<User>('/admin/me'),
@@ -151,5 +152,6 @@ export function humanizeError(error: unknown): string {
   if (detail.startsWith('coinw_connection_failed:')) return `CoinW rechazó la conexión: ${detail.slice('coinw_connection_failed:'.length)}`;
   if (detail.startsWith('coinw_market_instruments_failed:')) return 'No se pudo cargar el catálogo de mercados de CoinW en este momento.';
   if (detail.startsWith('coinw_market_candles_failed:')) return 'No se pudieron cargar las velas de CoinW en este momento.';
+  if (detail.startsWith('coinw_market_snapshot_failed:')) return 'No se pudieron cargar los datos de profundidad de CoinW en este momento.';
   return map[detail] || detail.replaceAll('_', ' ');
 }

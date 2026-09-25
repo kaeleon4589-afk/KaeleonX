@@ -15,4 +15,10 @@ class Position:
     tp1_price:float|None=None; tp2_price:float|None=None; remaining_quantity:float|None=None
     tp1_hit:bool=False; stop_moved_to_breakeven:bool=False
     entry_fee:float=0.0; exit_fee:float=0.0; funding_pnl:float=0.0
+    revision:int=0
+    current_price:float|None=None
+    settlement_pending:bool=False
+    net_pnl:float|None=None
+    leverage:int=10
+    protected:bool=True
     opened_at:int|None=None; closed_at:int|None=None; exit_price:float|None=None; exit_reason:str|None=None

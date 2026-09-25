@@ -21,4 +21,7 @@ class Position:
     net_pnl:float|None=None
     leverage:int=10
     protected:bool=True
+    exit_trigger_price:float|None=None
+    stop_gap_bps:float|None=None
+    exit_quote_delay_ms:int|None=None
     opened_at:int|None=None; closed_at:int|None=None; exit_price:float|None=None; exit_reason:str|None=None

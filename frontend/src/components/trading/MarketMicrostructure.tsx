@@ -93,9 +93,9 @@ function OrderBook({ book, precision, lastPrice }: { book: MarketOrderBook; prec
       </div>)}
     </div>
     <div className="book-pressure">
-      <div><strong>{buyPressure.toFixed(1)}%</strong><span>Bid liquidity</span></div>
+      <div><strong>{buyPressure.toFixed(1)}%</strong><span>Fuerza compradora</span></div>
       <div className="pressure-bar"><i style={{ width: `${buyPressure}%` }} /><b style={{ width: `${100 - buyPressure}%` }} /></div>
-      <div><strong>{(100 - buyPressure).toFixed(1)}%</strong><span>Ask liquidity</span></div>
+      <div><strong>{(100 - buyPressure).toFixed(1)}%</strong><span>Fuerza vendedora</span></div>
     </div>
     <small className="market-derived-note">Presión derivada de los niveles visibles del libro; no representa cantidad de personas.</small>
   </div>;

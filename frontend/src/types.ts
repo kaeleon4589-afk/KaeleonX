@@ -16,6 +16,8 @@ export type TradingConfig = {
   live_operating_capital: number;
   minimum_operating_capital: number;
   demo_available_equity: number;
+  demo_auto_compound?: boolean;
+  leverage?: number;
   live_available_equity: number;
   available_equity: number;
   coinw_configured: boolean;
@@ -35,7 +37,10 @@ export type Execution = {
   markets_scanned: number;
   candidates: number;
   coinw_connected: boolean;
-  leverage: string;
+  leverage: number;
+  last_price?: number;
+  last_market_at?: number;
+  last_rejection?: string | null;
   market_selection: string;
   timeframe_selection: string;
   trading_enabled: boolean;
@@ -67,6 +72,9 @@ export type Position = Record<string, unknown> & {
   current_price?: number;
   quantity?: number;
   realized_pnl?: number;
+  net_pnl?: number;
+  settlement_pending?: boolean;
+  leverage?: number;
   unrealized_pnl?: number;
   entry_fee?: number;
   exit_fee?: number;

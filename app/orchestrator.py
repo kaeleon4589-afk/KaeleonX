@@ -5,6 +5,8 @@ import inspect
 import math
 import time
 from uuid import uuid4
+from dataclasses import replace
+from datetime import datetime, timezone, timedelta
 
 from app.models.enums import Direction
 from app.models.trading import Position
@@ -40,6 +42,8 @@ class TradingOrchestrator:
         self.on_position_closed = on_position_closed
         self.persistence = persistence or TradePersistence(db, audit)
         self.pending_execution = None
+        self.last_rejection = None
+        self.entry_guard = None
 
     def _has_open_position(self, symbol=None, user_id=None):
         # Source-bot invariant: one open trade at a time per user/runtime.
@@ -146,10 +150,23 @@ class TradingOrchestrator:
         if hasattr(self.execution, "sync_symbol"):
             try:
                 exchange_positions = await self.execution.sync_symbol(snapshot.symbol)
+                settlements = None
+                if hasattr(self.execution, 'settlements'):
+                    remote_ids = {str(r.get('id') or r.get('openId')) for r in exchange_positions}
+                    missing = [p.position_id for p in self.position_manager.positions.values()
+                               if p.status == 'OPEN' and p.symbol == snapshot.symbol and p.position_id not in remote_ids]
+                    settlements = await self.execution.settlements(snapshot.symbol, missing) if missing else {}
                 changes = self.position_manager.reconcile_exchange(
                     exchange_positions, now_ms, symbol=snapshot.symbol,
-                    persist=False, notify=False,
+                    persist=False, notify=False, settlements=settlements,
                 )
+                if hasattr(self.execution, 'ensure_protection'):
+                    for held in self.position_manager.positions.values():
+                        if held.status == 'OPEN' and held.symbol == snapshot.symbol and not held.protected:
+                            await self.execution.ensure_protection(held)
+                            held.protected = True
+                            held.revision += 1
+                            changes['updated'].append(held)
                 for position in changes.get("updated", []):
                     self.persistence.schedule_position_save(
                         position=position, user_id=user_id, mode=self.execution_mode,
@@ -174,13 +191,17 @@ class TradingOrchestrator:
                             position.execution_rr = pending.get("execution_rr")
                             if pending.get("structural_rr") is not None:
                                 position.structural_rr = pending.get("structural_rr")
-                        self.pending_execution = None
+                        ok, _ = await self.persistence.save_position(position=position, user_id=user_id, mode=self.execution_mode)
+                        if ok:
+                            await self._clear_pending(user_id)
                     self.persistence.schedule_position_save(
                         position=position, user_id=user_id, mode=self.execution_mode,
                         symbol=position.symbol,
                     )
                     await self._notify_opened(position, position.decision_id, user_id)
             except Exception as exc:
+                allow_entries = False
+                self.last_rejection = 'position_sync_failed'
                 self.audit.event(
                     "POSITION_SYNC_ERROR", user_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -189,7 +210,7 @@ class TradingOrchestrator:
 
         if snapshot.last:
             price = snapshot.last if isinstance(snapshot.last, (int, float)) else snapshot.last.close
-            self.position_manager.mark(snapshot.symbol, price, now_ms)
+            self.position_manager.mark(snapshot.symbol, price, now_ms, bid=getattr(snapshot, "bid", None), ask=getattr(snapshot, "ask", None))
 
         # An exchange-accepted but not-yet-confirmed order reserves the runtime.
         # Without this lock the scanner could submit a second symbol while CoinW
@@ -207,18 +228,10 @@ class TradingOrchestrator:
                         reason="exchange_order_cancelled_after_accept",
                         order_id=pending.get("order_id"),
                     )
-                    self.pending_execution = None
+                    await self._clear_pending(user_id)
                 elif order_status == "finish" and age >= 15.0:
-                    # A finished order with no current position is terminal at the
-                    # exchange (for example, it may have opened and closed rapidly).
-                    # Do not keep the account permanently locked.
-                    self.audit.event(
-                        "EXECUTION_PENDING_CLEARED", pending.get("decision_id"),
-                        user_id=user_id, mode=self.execution_mode, symbol=pending.get("symbol"),
-                        reason="order_finished_without_open_position",
-                        order_id=pending.get("order_id"),
-                    )
-                    self.pending_execution = None
+                    # No proven position/settlement: keep the reservation, do not open a duplicate.
+                    self.last_rejection = 'execution_requires_reconciliation'
             if self.pending_execution:
                 self.audit.event(
                     "ENTRY_SKIPPED", pending.get("decision_id"), level="DEBUG", persist=False,
@@ -235,7 +248,7 @@ class TradingOrchestrator:
                 reason="open_position_exists",
             )
             return None
-        if not allow_entries:
+        if not allow_entries or getattr(snapshot, 'monitor_only', False):
             self.audit.event(
                 "ENTRY_SKIPPED", user_id, level="DEBUG", persist=False,
                 user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
@@ -349,6 +362,7 @@ class TradingOrchestrator:
                     ):
                         rejection_reason = str(branch.get("reason"))
                         break
+                self.last_rejection = rejection_reason
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -356,6 +370,15 @@ class TradingOrchestrator:
                 )
                 return None
 
+            try:
+                executable = float(snapshot.ask if intent.direction == Direction.LONG else snapshot.bid)
+                if math.isfinite(executable) and executable > 0:
+                    # Size against the expected executable price, including DEMO's explicit slippage.
+                    slip = float(getattr(self.execution, 'slippage_bps', 0)) / 10000
+                    executable *= 1 + slip if intent.direction == Direction.LONG else 1 - slip
+                    intent = replace(intent, entry_price=executable)
+            except (ValueError, TypeError):
+                pass  # The market guard below emits the terminal rejection.
             entry = float(intent.entry_price)
             stop = float(intent.stop_price)
             target = float(intent.target_price)
@@ -372,6 +395,7 @@ class TradingOrchestrator:
             )
             if not geometry_ok:
                 self.last_decision[key] = now
+                self.last_rejection = 'invalid_trade_geometry' 
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -447,7 +471,11 @@ class TradingOrchestrator:
                 market_bid = 0.0
                 market_ask = 0.0
 
-            if market_bid <= 0 or market_ask <= 0:
+            quote_ms = getattr(snapshot, 'quote_received_ms', now_ms)
+            if (not math.isfinite(market_bid) or not math.isfinite(market_ask)
+                    or market_bid <= 0 or market_ask <= 0 or market_bid > market_ask
+                    or int(time.time() * 1000) - quote_ms > 10_000):
+                self.last_rejection = 'market_unavailable'
                 result = {"accepted": False, "filled": False, "reason": "market_unavailable"}
                 terminal_event_emitted = True
                 self.last_decision[key] = now
@@ -468,6 +496,34 @@ class TradingOrchestrator:
                 )
                 return result
 
+            executable_price = market_ask if intent.direction == Direction.LONG else market_bid
+            if not ((intent.direction == Direction.LONG and stop < executable_price < target)
+                    or (intent.direction == Direction.SHORT and target < executable_price < stop)):
+                terminal_event_emitted = True
+                self.last_rejection = 'fill_outside_trade_geometry'
+                self.audit.event('EXECUTION_REJECTED', decision_id, user_id=user_id,
+                                 mode=self.execution_mode, symbol=snapshot.symbol,
+                                 reason='fill_outside_trade_geometry')
+                return {'accepted': False, 'filled': False, 'reason': 'fill_outside_trade_geometry'}
+            if self.entry_guard is not None and not self.entry_guard():
+                raise RuntimeError('trading_worker_lease_expired')
+            if snapshot.candles:
+                bar_ts = snapshot.candles[-1].timestamp
+                claim_id = f'{user_id}:{self.execution_mode}:{snapshot.symbol}:{bar_ts}'
+                claim = await asyncio.to_thread(self.db.set_once, 'signal_claims', {'claim_id': claim_id}, {
+                    'decision_id': decision_id, 'expires_at': datetime.now(timezone.utc) + timedelta(days=7),
+                })
+                if claim['decision_id'] != decision_id:
+                    terminal_event_emitted = True
+                    self.last_rejection = 'setup_already_executed'
+                    self.audit.event('EXECUTION_REJECTED', decision_id, user_id=user_id,
+                                     mode=self.execution_mode, symbol=snapshot.symbol, reason='setup_already_executed')
+                    return {'accepted': False, 'filled': False, 'reason': 'setup_already_executed'}
+            if self.execution_mode == 'live':
+                reservation = {'user_id': user_id, 'active': True, 'symbol': snapshot.symbol,
+                               'decision_id': decision_id, 'order_id': None, 'created_ms': now_ms}
+                await asyncio.to_thread(self.db.upsert, 'execution_pending', {'user_id': user_id}, reservation)
+                self.pending_execution = {**reservation, 'created_monotonic': time.monotonic()}
             try:
                 result = self.execution.submit(
                     intent,
@@ -520,6 +576,8 @@ class TradingOrchestrator:
                     accepted=bool(result.get("accepted", False)),
                     order_id=result.get("order_id"),
                 )
+                if not pending and self.execution_mode == 'live':
+                    await self._clear_pending(user_id)
                 if pending:
                     self.pending_execution = {
                         "decision_id": decision_id,
@@ -531,6 +589,9 @@ class TradingOrchestrator:
                         "structural_rr": structural_rr,
                         "created_monotonic": time.monotonic(),
                     }
+                    if self.execution_mode == 'live':
+                        await asyncio.to_thread(self.db.upsert, 'execution_pending', {'user_id': user_id},
+                                                {'active': True, 'order_id': result.get('order_id')})
                 # Post-submit persistence is allowed here because the execution
                 # outcome is already known and visible.
                 if result.get("order_id"):
@@ -568,6 +629,7 @@ class TradingOrchestrator:
             # ---------------------- FINALIZATION STAGE ----------------------
             position = self._position_from_result(result["position"], intent)
             strategy_name = getattr(intent.strategy, "value", str(intent.strategy))
+            position.protected = bool(result.get("protected", True))
             position.strategy = strategy_name
             position.quality = round(float(intent.quality), 2)
             position.execution_rr = round(execution_rr, 4)
@@ -603,6 +665,9 @@ class TradingOrchestrator:
                     position_id=position.position_id, error=persist_error,
                 )
 
+            if persisted and self.execution_mode == 'live':
+                await self._clear_pending(user_id)
+            self.last_rejection = None
             terminal_event_emitted = True
             self.last_decision[key] = now
             self.audit.event(
@@ -664,3 +729,8 @@ class TradingOrchestrator:
                     error="accepted_signal_without_terminal_event",
                 )
             self.inflight.discard(key)
+
+    async def _clear_pending(self, user_id):
+        if self.execution_mode == 'live':
+            await asyncio.to_thread(self.db.upsert, 'execution_pending', {'user_id': user_id}, {'active': False})
+        self.pending_execution = None

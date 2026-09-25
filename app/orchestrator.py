@@ -215,7 +215,10 @@ class TradingOrchestrator:
 
         if snapshot.last:
             price = snapshot.last if isinstance(snapshot.last, (int, float)) else snapshot.last.close
-            self.position_manager.mark(snapshot.symbol, price, now_ms, bid=getattr(snapshot, "bid", None), ask=getattr(snapshot, "ask", None))
+            self.position_manager.mark(snapshot.symbol, price, now_ms,
+                                       bid=getattr(snapshot, "bid", None),
+                                       ask=getattr(snapshot, "ask", None),
+                                       quote_received_ms=getattr(snapshot, "quote_received_ms", None))
 
         # An exchange-accepted but not-yet-confirmed order reserves the runtime.
         # Without this lock the scanner could submit a second symbol while CoinW
@@ -375,6 +378,7 @@ class TradingOrchestrator:
                 )
                 return None
 
+            signal_entry = float(intent.entry_price)
             try:
                 executable = float(snapshot.ask if intent.direction == Direction.LONG else snapshot.bid)
                 if math.isfinite(executable) and executable > 0:
@@ -409,6 +413,45 @@ class TradingOrchestrator:
                     stop_price=stop, target_price=target, execution_rr=execution_rr,
                 )
                 return None
+
+            # Signal SL/TP are anchored to the closed candle. A delayed quote can
+            # improve apparent RR by bringing entry right next to the old stop.
+            # Keep the original structure and wait for a new setup instead of
+            # widening a protective stop after the signal was generated.
+            planned_stop_pct = (getattr(intent, 'metadata', {}) or {}).get('sl_pct')
+            if planned_stop_pct is not None:
+                try:
+                    minimum_stop_pct = 0.80 * float(planned_stop_pct)
+                except (TypeError, ValueError):
+                    minimum_stop_pct = float('nan')
+                actual_stop_pct = risk_distance / entry
+                if (not math.isfinite(minimum_stop_pct) or minimum_stop_pct <= 0
+                        or actual_stop_pct < minimum_stop_pct):
+                    self.last_decision[key] = now
+                    self.last_rejection = 'entry_too_close_to_stop'
+                    self.audit.event(
+                        'SIGNAL_REJECTED', decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        reason='entry_too_close_to_stop', entry_price=entry,
+                        signal_entry_price=signal_entry, stop_price=stop,
+                        target_price=target, actual_stop_pct=actual_stop_pct,
+                        minimum_stop_pct=minimum_stop_pct,
+                    )
+                    return None
+                if actual_stop_pct > 1.25 * float(planned_stop_pct):
+                    self.last_decision[key] = now
+                    self.last_rejection = 'entry_far_from_signal'
+                    self.audit.event(
+                        'SIGNAL_REJECTED', decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        reason='entry_far_from_signal', entry_price=entry,
+                        signal_entry_price=signal_entry, stop_price=stop,
+                        target_price=target, actual_stop_pct=actual_stop_pct,
+                        planned_stop_pct=float(planned_stop_pct),
+                    )
+                    return None
 
             if execution_rr < MIN_EXECUTION_RR:
                 self.last_decision[key] = now

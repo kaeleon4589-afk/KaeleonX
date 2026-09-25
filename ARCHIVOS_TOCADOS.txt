@@ -19,6 +19,13 @@ tests/test_entry_geometry_risk.py
 
 ELIMINADOS: ninguno
 
+AMPLIACIÓN — ROE en vivo de operación abierta
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+frontend/src/pages/DashboardPage.tsx
+ELIMINADOS: ninguno
+
 AMPLIACIÓN — Color de barra según PnL actual
 MODIFICADOS:
 ARCHIVOS_TOCADOS.txt

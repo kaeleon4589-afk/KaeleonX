@@ -69,3 +69,7 @@ La imagen KAELEON suministrada se sirve desde `frontend/public/images/kaeleon-tr
 ## Indicador de PnL de posición abierta — 2026-09-25
 
 La línea bajo el PnL actual en «Operaciones Activas» pasa a verde si el PnL es positivo, rojo si es negativo y gris neutro si es cero o todavía no hay dato. El texto del PnL usa el mismo criterio. No cambia el tamaño de la posición, la salida ni el cálculo financiero. Comprobado con `npm run build` y 132 pruebas backend; falta la comprobación visual en el despliegue móvil.
+
+## ROE en vivo — 2026-09-25
+
+En «Operaciones Activas» se muestra ROE en vivo = PnL no realizado / margen inicial estimado × 100. El margen inicial estimado se calcula como cantidad base × precio de entrada / apalancamiento. El ROE usa el mismo color del PnL y muestra «—» si faltan los datos necesarios. En LIVE puede diferir del ROE que publique CoinW si el exchange aplica margen ajustado, comisiones u otra base de cálculo. No altera órdenes ni la contabilidad. Compilación TypeScript/Vite y 132 pruebas backend aprobadas; pendiente verificación visual tras despliegue.

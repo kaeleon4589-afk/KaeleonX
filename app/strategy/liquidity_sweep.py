@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from app.models.enums import Direction, Strategy
 from app.models.trading import TradeIntent
+from app.position.protection import (
+    break_even_activation_ratio, front_run_target,
+    profit_lock_activation_ratio, profit_lock_capture_ratio,
+)
 from app.strategy.source_math import atr, candle_quality, clamp, ema, extract, relative_volume
 
 EMA_FAST = 20
@@ -241,13 +245,18 @@ class LiquiditySweepStrategy:
         target_level = float(candidate["target_level"])
         structural_tp_pct = abs(target_level - close5) / max(close5, 1e-12) if target_level > 0 else 0.0
         stop = structural_stop
-        target = target_level
-        tp_pct = structural_tp_pct
+        target, target_ratio = front_run_target(close5, target_level, direction)
+        tp_pct = abs(target - close5) / max(close5, 1e-12)
         execution_rr = tp_pct / sl_pct
         if target <= 0 or execution_rr < MIN_RR:
             return self._reject('invalid_structural_target', execution_rr=execution_rr)
+        # Keep the legacy percentage metadata for diagnostics, while actual
+        # position management now uses distance ratios and executes in PositionManager.
         be_activation = clamp(max(sl_pct * 0.46, tp_pct * 0.40), 0.0028, min(tp_pct * 0.56, 0.0039))
         be_offset = clamp(max(atr_pct * 0.06, 0.00050), 0.00050, 0.00095)
+        be_ratio = break_even_activation_ratio()
+        lock_activation = profit_lock_activation_ratio()
+        lock_capture = profit_lock_capture_ratio()
 
         self.last_trace = {
             "accepted": True,
@@ -267,6 +276,8 @@ class LiquiditySweepStrategy:
             "entry": close5,
             "stop": stop,
             "target": target,
+            "structural_target": target_level,
+            "target_front_run_ratio": target_ratio,
         }
         return TradeIntent(
             decision_id,
@@ -293,6 +304,8 @@ class LiquiditySweepStrategy:
                 "bars_since_sweep": candidate["bars_since_sweep"],
                 "structural_rr_estimate": candidate["rr_estimate"],
                 "structural_tp_pct": structural_tp_pct,
+                "structural_target_price": target_level,
+                "target_front_run_ratio": target_ratio,
                 "execution_rr": execution_rr,
                 "rr_estimate": candidate["rr_estimate"],
                 "sl_pct": sl_pct,
@@ -301,5 +314,8 @@ class LiquiditySweepStrategy:
                 "tp2_price": target,
                 "break_even_activation_pct": be_activation,
                 "break_even_offset_pct": be_offset,
+                "break_even_activation_ratio": be_ratio,
+                "profit_lock_activation_ratio": lock_activation,
+                "profit_lock_capture_ratio": lock_capture,
             },
         )

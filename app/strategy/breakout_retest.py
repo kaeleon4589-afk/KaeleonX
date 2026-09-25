@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from app.models.enums import Direction, Strategy
 from app.models.trading import TradeIntent
+from app.position.protection import (
+    break_even_activation_ratio, front_run_target,
+    profit_lock_activation_ratio, profit_lock_capture_ratio,
+)
 from app.strategy.source_math import adx, atr, candle_quality, clamp, ema, extract, pct_change
 
 EMA_FAST = 20
@@ -268,7 +272,9 @@ class BreakoutRetestStrategy:
         if score < MIN_SCORE_TO_SIGNAL:
             return self._reject("score_too_low", score=score, min=MIN_SCORE_TO_SIGNAL)
 
-        target = _structure_target(direction, close5, tf5['h'], tf5['l'], tf15['h'], tf15['l'])
+        structural_target = _structure_target(direction, close5, tf5['h'], tf5['l'], tf15['h'], tf15['l'])
+        target, target_ratio = front_run_target(close5, structural_target, direction)
+        structural_tp_pct = abs(structural_target - close5) / close5
         tp_pct = abs(target - close5) / close5
         execution_rr = tp_pct / sl_pct
         if execution_rr < MIN_RR_TO_SIGNAL:
@@ -277,6 +283,9 @@ class BreakoutRetestStrategy:
             return self._reject('invalid_structural_target')
         strength = clamp(score / 100.0, STRENGTH_MIN, STRENGTH_MAX)
         be_activation, be_offset, bucket = _break_even(score, strength, sl_pct, tp_pct)
+        be_ratio = break_even_activation_ratio()
+        lock_activation = profit_lock_activation_ratio()
+        lock_capture = profit_lock_capture_ratio()
 
         self.last_trace = {
             "accepted": True,
@@ -292,6 +301,8 @@ class BreakoutRetestStrategy:
             "entry": close5,
             "stop": stop,
             "target": target,
+            "structural_target": structural_target,
+            "target_front_run_ratio": target_ratio,
             "execution_rr": execution_rr,
             "structural_stop_pct": structural_pct,
         }
@@ -317,12 +328,18 @@ class BreakoutRetestStrategy:
                 "adx1h": diag1h["adx"],
                 "sl_pct": sl_pct,
                 "tp_pct": tp_pct,
+                "structural_tp_pct": structural_tp_pct,
+                "structural_target_price": structural_target,
+                "target_front_run_ratio": target_ratio,
                 "execution_rr": execution_rr,
                 "structural_stop_pct": structural_pct,
                 "partial_tp_enabled": False,
                 "tp2_price": target,
                 "break_even_activation_pct": be_activation,
                 "break_even_offset_pct": be_offset,
+                "break_even_activation_ratio": be_ratio,
+                "profit_lock_activation_ratio": lock_activation,
+                "profit_lock_capture_ratio": lock_capture,
                 "management_bucket": bucket,
             },
         )

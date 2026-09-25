@@ -19,6 +19,14 @@ tests/test_entry_geometry_risk.py
 
 ELIMINADOS: ninguno
 
+AMPLIACIÓN — Color de barra según PnL actual
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+frontend/src/pages/DashboardPage.tsx
+frontend/src/styles.css
+ELIMINADOS: ninguno
+
 AMPLIACIÓN — Imagen de marca suministrada por el usuario
 MODIFICADOS:
 ARCHIVOS_TOCADOS.txt

@@ -65,3 +65,7 @@ El panel muestra exposición y margen estimado de la posición abierta. La comis
 ## Imagen de marca — 2026-09-25
 
 La imagen KAELEON suministrada se sirve desde `frontend/public/images/kaeleon-trading-art.jpg` (el archivo de origen era JPEG aunque su nombre terminaba en `.png`). Se muestra completa en la pantalla de acceso de escritorio y móvil, y en la tarjeta lateral del dashboard. El acceso mantiene el formulario separado y legible; no se recorta el logotipo de la imagen. Comprobado con `npm run build` y 132 pruebas backend. Revisar visualmente después de desplegar en teléfono y escritorio.
+
+## Indicador de PnL de posición abierta — 2026-09-25
+
+La línea bajo el PnL actual en «Operaciones Activas» pasa a verde si el PnL es positivo, rojo si es negativo y gris neutro si es cero o todavía no hay dato. El texto del PnL usa el mismo criterio. No cambia el tamaño de la posición, la salida ni el cálculo financiero. Comprobado con `npm run build` y 132 pruebas backend; falta la comprobación visual en el despliegue móvil.

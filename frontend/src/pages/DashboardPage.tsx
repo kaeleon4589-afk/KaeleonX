@@ -45,7 +45,7 @@ export default function DashboardPage({user,isAdmin,onOpenAdmin,onOpenSubscripti
 
   const mode=config?.execution_mode||'demo'; const enabled=Boolean(config?.trading_enabled); const verified=Boolean(config?.coinw_verified);
   const available=mode==='demo'?(config?.demo_available_equity??0):(exec?.available_equity??config?.live_available_equity??0);
-  const equity=useMemo(()=>{let cur=config?.operating_capital||0;const values=[cur];[...ops.closed].reverse().forEach(p=>{cur+=pnl(p);values.push(cur)});return values},[ops.closed,config?.operating_capital]);
+  const equity=useMemo(()=>{let cur=perf?.capital||config?.operating_capital||0;const values=[cur];[...ops.closed].reverse().forEach(p=>{cur+=pnl(p);values.push(cur)});return values},[ops.closed,perf?.capital,config?.operating_capital]);
   const notifications=useMemo(()=>{
     const items:{tone:'ok'|'warn'|'info';title:string;text:string}[]=[];
     if(!config?.coinw_configured)items.push({tone:'warn',title:'CoinW pendiente',text:'Guarda tu API Key y API Secret.'});
@@ -106,5 +106,6 @@ function Empty({text}:{text:string}){return <div className="empty-state"><span>�
 function OpenPosition({p}:{p:Position}){
   const tp1=p.tp1_price??p.tp1;
   const target=p.tp2_price??p.tp2??p.target_price??p.take_profit;
-  return <div className="open-position"><div className="position-top"><div><span className="asset-badge">◈</span><strong>{symbol(p)}</strong><b className={side(p)==='LONG'?'long':'short'}>{side(p)}</b></div><span>{p.settlement_pending?'Confirmando cierre':`${p.leverage||10}x`}</span></div><div className="position-grid"><span>Entrada<strong>{marketPrice(p.entry_price)}</strong></span><span>Precio actual<strong>{marketPrice(p.current_price)}</strong></span><span>PnL actual<strong className={num(p.unrealized_pnl)>=0?'green':'red'}>{money(p.unrealized_pnl)}</strong></span></div><div className="position-progress"><i/></div><div className="position-bottom"><span>SL<strong>{marketPrice(p.stop_price??p.stop_loss)}</strong></span>{tp1!=null&&<span>TP1<strong>{marketPrice(tp1)}</strong></span>}<span>{tp1!=null?'TP2':'TP'}<strong>{marketPrice(target)}</strong></span></div></div>;
+  const exposure=num(p.quantity)*num(p.entry_price);
+  return <div className="open-position"><div className="position-top"><div><span className="asset-badge">◈</span><strong>{symbol(p)}</strong><b className={side(p)==='LONG'?'long':'short'}>{side(p)}</b></div><span>{p.settlement_pending?'Confirmando cierre':`${p.leverage||10}x`}</span></div><div className="position-grid"><span>Entrada<strong>{marketPrice(p.entry_price)}</strong></span><span>Precio actual<strong>{marketPrice(p.current_price)}</strong></span><span>PnL actual<strong className={num(p.unrealized_pnl)>=0?'green':'red'}>{money(p.unrealized_pnl)}</strong></span><span>Exposición<strong>{money(exposure)}</strong></span><span>Margen estimado<strong>{money(exposure/Math.max(num(p.leverage),1))}</strong></span></div><div className="position-progress"><i/></div><div className="position-bottom"><span>SL<strong>{marketPrice(p.stop_price??p.stop_loss)}</strong></span>{tp1!=null&&<span>TP1<strong>{marketPrice(tp1)}</strong></span>}<span>{tp1!=null?'TP2':'TP'}<strong>{marketPrice(target)}</strong></span></div></div>;
 }

@@ -95,3 +95,25 @@ docs/LIVE_MARKET_CHART.md
 frontend/src/components/trading/LiveMarketChart.tsx
 tests/test_live_market_chart.py
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — Microestructura y herramientas avanzadas del gráfico CoinW
+BASE COMPARADA: KaeleonX-grafico-CoinW-tiempo-real.zip
+
+MODIFICADOS (12):
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+app/api/market_api.py
+app/coinw/market.py
+app/market/chart_service.py
+docs/LIVE_MARKET_CHART.md
+frontend/src/components/trading/LiveMarketChart.tsx
+frontend/src/lib/api.ts
+frontend/src/pages/DashboardPage.tsx
+frontend/src/styles.css
+frontend/src/types.ts
+tests/test_live_market_chart.py
+
+NUEVOS (1):
+frontend/src/components/trading/MarketMicrostructure.tsx
+
+ELIMINADOS: ninguno

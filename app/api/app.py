@@ -10,6 +10,7 @@ from app.api.admin_api import router as admin_router
 from app.api.billing_api import router as billing_router
 from app.api.user_api import router as user_router
 from app.api.telegram_api import router as telegram_router
+from app.api.market_api import router as market_router
 from app.auth.service import AuthService
 from app.config.settings import get_settings
 from app.storage.database import Database
@@ -108,6 +109,7 @@ app.include_router(telegram_router)
 app.include_router(admin_router)
 app.include_router(billing_router)
 app.include_router(user_router)
+app.include_router(market_router)
 
 
 @app.get("/health")

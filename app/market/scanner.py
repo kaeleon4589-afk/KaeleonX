@@ -20,9 +20,12 @@ def _env_float(name: str, default: float) -> float:
 class CoinWMarketScanner:
     """CoinW market scanner adapted from Trading-X-Hiper-Pro.
 
-    The reference engine ranks candidates by notional volume (50%), open interest
-    (30%) and *directional* 24h trend (20%).  CoinW field names vary by endpoint,
-    so this adapter accepts the common aliases while preserving the source score.
+    Candidates are ranked by notional volume (50%), open interest (30%) and
+    direction-neutral 24h momentum magnitude (20%).  A +X% and -X% move therefore
+    receive the same momentum contribution, preventing the scanner from preferring
+    LONG candidates before the regime/strategy layers evaluate direction.
+
+    CoinW field names vary by endpoint, so this adapter accepts the common aliases.
 
     A short normal cache avoids unnecessary public-API traffic.  If a refresh
     fails, the last known-good shortlist remains usable for up to five minutes,
@@ -89,8 +92,12 @@ class CoinWMarketScanner:
 
         vol_score = min(volume / 1_000_000.0, 1.0)
         oi_score = min(oi / 10_000_000.0, 1.0) if oi > 0.0 else 0.3
-        trend_score = max(min((change_pct / 5.0) + 0.5, 1.0), 0.0)
-        score = (vol_score * 0.5) + (oi_score * 0.3) + (trend_score * 0.2)
+        # Direction must be decided by the regime/strategy layer, not by the market
+        # shortlist.  Use the magnitude of the 24h move so equally strong positive
+        # and negative moves receive the same score contribution.
+        momentum_score = max(min(abs(change_pct) / 5.0, 1.0), 0.0)
+        score = (vol_score * 0.5) + (oi_score * 0.3) + (momentum_score * 0.2)
+        market_direction = 'up' if change_pct > 0.0 else ('down' if change_pct < 0.0 else 'flat')
 
         return {
             'symbol': base,
@@ -98,6 +105,8 @@ class CoinWMarketScanner:
             'volume': round(volume, 2),
             'oi': round(oi, 2),
             'change_24h': round(change_pct, 2),
+            'market_direction': market_direction,
+            'momentum_score': round(momentum_score, 4),
             'price': last,
         }
 
@@ -149,18 +158,39 @@ class CoinWMarketScanner:
             scored.append(parsed)
 
         if scored:
-            scored.sort(key=lambda item: item['score'], reverse=True)
+            # Stable, sign-neutral ordering.  The sign of change_24h is never used as
+            # a preference; it is included only as diagnostics for market breadth.
+            scored.sort(
+                key=lambda item: (
+                    -float(item['score']),
+                    -abs(float(item.get('change_24h') or 0.0)),
+                    -float(item.get('volume') or 0.0),
+                    -float(item.get('oi') or 0.0),
+                    str(item.get('symbol') or ''),
+                )
+            )
             self._cache = scored[:self.depth]
             self._ts = now
             if self.audit:
+                def _breadth(items):
+                    counts = {'up': 0, 'down': 0, 'flat': 0}
+                    for item in items:
+                        side = str(item.get('market_direction') or 'flat')
+                        counts[side if side in counts else 'flat'] += 1
+                    return counts
+
                 self.audit.event(
                     'MARKET_SCAN_DONE', 'system',
                     universe_rows=len(rows), eligible=len(scored), shortlisted=len(self._cache),
                     rejected=rejected, duration_ms=round((time.monotonic() - started) * 1000, 2),
+                    eligible_breadth=_breadth(scored), shortlist_breadth=_breadth(self._cache),
+                    ranking_mode='direction_neutral_momentum',
                     top=[
                         {
                             'symbol': item['symbol'], 'score': item['score'], 'volume': item['volume'],
                             'oi': item['oi'], 'change_24h': item['change_24h'],
+                            'market_direction': item['market_direction'],
+                            'momentum_score': item['momentum_score'],
                         }
                         for item in self._cache
                     ],

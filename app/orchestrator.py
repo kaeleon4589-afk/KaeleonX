@@ -381,7 +381,8 @@ class TradingOrchestrator:
                 k: rf.get(k) for k in (
                     "adx", "choppiness", "efficiency_ratio", "atr_pct",
                     "wick_instability", "body_quality", "breakout_failure_ratio",
-                    "ema_stack_alignment", "trend_bias", "btc_shock_ratio",
+                    "ema_stack_alignment", "ema_bullish_alignment", "ema_bearish_alignment",
+                    "ema_alignment_edge", "trend_bias", "btc_shock_ratio",
                 ) if k in rf
             }
             state_summary = {
@@ -396,6 +397,7 @@ class TradingOrchestrator:
                 state=regime.global_state.value, score=regime.core_score,
                 candidate=regime_meta.get("candidate"), active=regime_meta.get("active"),
                 confidence=regime_meta.get("confidence"), scores=regime_meta.get("scores"),
+                regime_direction=getattr(getattr(regime, "direction", None), "value", str(getattr(regime, "direction", "UNKNOWN"))),
                 features=feature_summary, state_machine=state_summary,
                 breakout_allowed=regime.breakout_allowed, sweep_allowed=regime.sweep_allowed,
                 hard_block=regime.hard_block, risk_multiplier=regime.risk_multiplier,
@@ -430,7 +432,13 @@ class TradingOrchestrator:
             self.audit.event(
                 "STRATEGY_EVALUATED", decision_id, user_id=user_id,
                 mode=self.execution_mode, symbol=snapshot.symbol,
-                regime=regime_meta.get("active"), trace=compact_trace,
+                regime=regime_meta.get("active"),
+                regime_direction=getattr(getattr(regime, "direction", None), "value", str(getattr(regime, "direction", "UNKNOWN"))),
+                selected_direction=(
+                    getattr(getattr(intent, "direction", None), "value", None)
+                    if intent is not None else None
+                ),
+                trace=compact_trace,
             )
 
             if not intent:

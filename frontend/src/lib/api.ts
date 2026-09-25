@@ -121,6 +121,8 @@ export function humanizeError(error: unknown): string {
     close_positions_before_removing_credentials: 'Cierra las posiciones antes de eliminar las credenciales.',
     resolve_pending_execution_before_changing_account: 'Hay una orden pendiente de confirmar. Espera a su reconciliación antes de cambiar la cuenta.',
     live_capital_exceeds_available_balance: 'El capital LIVE supera el saldo USDT disponible en CoinW.',
+    reset_requires_no_open_positions: 'Cierra todas las posiciones del modo seleccionado antes de reiniciar.',
+    reset_requires_no_pending_orders: 'Espera a que terminen las órdenes pendientes antes de reiniciar.',
     pause_live_before_removing_credentials: 'Pausa LIVE antes de eliminar las credenciales CoinW.',
     close_live_position_before_switching_to_demo: 'Cierra la posición LIVE antes de volver a Demo.',
     switch_to_demo_before_removing_credentials: 'Cambia a Demo antes de eliminar las credenciales.',

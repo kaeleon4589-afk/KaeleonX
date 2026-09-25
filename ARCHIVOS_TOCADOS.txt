@@ -192,3 +192,18 @@ ELIMINADOS: ninguno
 MOTIVO:
 Vite 7.3.6 exige Node ^20.19.0 o >=22.12.0. Railway estaba construyendo con Node 18.20.5 y fallaba durante el build CSS con "crypto.hash is not a function".
 La corrección fija Node 22.14.0 en Railpack, declara Node >=22.12 <23 en package.json y usa npm ci para builds reproducibles.
+
+CORRECCIÓN — Railway Railpack EBUSY durante npm ci
+BASE COMPARADA: KaeleonX-fix-railway-node22.zip
+
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+frontend/railway.toml
+
+NUEVO:
+frontend/.railwayignore
+
+ELIMINADOS: ninguno
+
+NOTA:
+Railpack ya instala dependencias antes del build. Se eliminó el segundo `npm ci` del buildCommand porque intentaba borrar el cache/mount de `/app/node_modules` y podía fallar con `EBUSY` sobre `/app/node_modules/.vite`.

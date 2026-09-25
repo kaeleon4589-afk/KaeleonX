@@ -131,23 +131,56 @@ def _ema_metrics(close: float, closes: list[float]) -> dict[str, Any]:
     slope20 = float(e20 - (e20s[-6] if len(e20s) >= 6 else e20))
     slope50 = float(e50 - (e50s[-6] if len(e50s) >= 6 else e50))
 
+    # Score bullish and bearish structure with exactly mirrored conditions.
+    # The previous implementation only awarded partial points to bullish stacks,
+    # which made a developing downtrend much harder to classify as TREND.
+    bullish_alignment = 0.0
+    bearish_alignment = 0.0
+    if close > e20:
+        bullish_alignment += 0.25
+    if close < e20:
+        bearish_alignment += 0.25
+    if e20 > e50:
+        bullish_alignment += 0.25
+    if e20 < e50:
+        bearish_alignment += 0.25
+    if e50 > e200:
+        bullish_alignment += 0.25
+    if e50 < e200:
+        bearish_alignment += 0.25
+    if slope20 > 0.0:
+        bullish_alignment += 0.125
+    if slope20 < 0.0:
+        bearish_alignment += 0.125
+    if slope50 > 0.0:
+        bullish_alignment += 0.125
+    if slope50 < 0.0:
+        bearish_alignment += 0.125
+
+    bullish_alignment = clamp(bullish_alignment, 0.0, 1.0)
+    bearish_alignment = clamp(bearish_alignment, 0.0, 1.0)
+
     bullish = close > e20 > e50 > e200 and slope20 > 0.0 and slope50 >= 0.0
     bearish = close < e20 < e50 < e200 and slope20 < 0.0 and slope50 <= 0.0
-    if bullish or bearish:
-        alignment = 1.0
+    # Preserve the previous meaning of a fully ordered stack: it is 100% aligned
+    # even when the slower slope is exactly flat at the boundary.
+    if bullish:
+        bullish_alignment = 1.0
+    if bearish:
+        bearish_alignment = 1.0
+    alignment = max(bullish_alignment, bearish_alignment)
+    alignment_edge = bullish_alignment - bearish_alignment
+
+    # Bias is allowed to emerge before a perfect five-condition stack exists,
+    # but only when one side has a meaningful and unambiguous alignment edge.
+    bias_min = 0.50
+    bias_edge_min = 0.125
+    if bullish or (bullish_alignment >= bias_min and alignment_edge >= bias_edge_min):
+        trend_bias = "long"
+    elif bearish or (bearish_alignment >= bias_min and alignment_edge <= -bias_edge_min):
+        trend_bias = "short"
     else:
-        score = 0.0
-        if close > e20:
-            score += 0.25
-        if e20 > e50:
-            score += 0.25
-        if e50 > e200:
-            score += 0.25
-        if slope20 > 0.0:
-            score += 0.125
-        if slope50 > 0.0:
-            score += 0.125
-        alignment = clamp(score, 0.0, 1.0)
+        trend_bias = "neutral"
 
     return {
         "ema20": e20,
@@ -156,7 +189,10 @@ def _ema_metrics(close: float, closes: list[float]) -> dict[str, Any]:
         "ema20_slope": slope20,
         "ema50_slope": slope50,
         "ema_stack_alignment": alignment,
-        "trend_bias": "long" if bullish else "short" if bearish else "neutral",
+        "ema_bullish_alignment": bullish_alignment,
+        "ema_bearish_alignment": bearish_alignment,
+        "ema_alignment_edge": alignment_edge,
+        "trend_bias": trend_bias,
         "distance_to_ema20": close - e20,
         "distance_to_ema50": close - e50,
         "distance_to_ema200": close - e200,

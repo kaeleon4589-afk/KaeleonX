@@ -1,4 +1,4 @@
-import type { ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
+import type { AdminStatistics, ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
@@ -82,6 +82,8 @@ export const api = {
   adminSubscriptions: () => request<{items: Record<string, unknown>[]}>('/admin/subscriptions'),
   adminOperations: () => request<{items: Record<string, unknown>[]}>('/admin/operations'),
   adminEvents: () => request<{items: Record<string, unknown>[]}>('/admin/system/events'),
+  adminStatistics: (mode: 'demo' | 'live') => request<AdminStatistics>(`/admin/trading/statistics?mode=${mode}`),
+  adminResetStatistics: (body: {mode: 'demo' | 'live'; label: string; confirm: true; request_id: string}) => request<{success: boolean}>('/admin/trading/statistics/reset', {method: 'POST', body: JSON.stringify(body)}),
   adminConfig: () => request<Record<string, unknown>>('/admin/system/config'),
   adminGrantLiveDays: (body: {phone?: string; telegram_user_id?: string; days: number}) => request('/admin/users/live-days', {method:'POST', body:JSON.stringify(body)}),
   adminBanUser: (body: {phone?: string; telegram_user_id?: string; days?: number; reason?: string}) => request('/admin/users/ban', {method:'POST', body:JSON.stringify(body)}),

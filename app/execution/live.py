@@ -41,5 +41,10 @@ class LiveExecutionEngine:
         return await self.coinw.settlements(symbol, position_ids)
 
     async def ensure_protection(self, position):
-        await self.coinw.orders.set_tpsl(position.position_id, self.coinw._instrument(position.symbol),
-                                         stop_loss=position.stop_price, take_profit=position.target_price)
+        if hasattr(self.coinw, "ensure_protection"):
+            return await self.coinw.ensure_protection(position)
+        await self.coinw.orders.set_tpsl(
+            position.position_id, self.coinw._instrument(position.symbol),
+            stop_loss=position.stop_price, take_profit=position.target_price,
+        )
+        return position

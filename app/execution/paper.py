@@ -2,6 +2,7 @@ from uuid import uuid4
 import math
 from app.models.trading import Position
 from app.models.enums import Direction
+from app.position.protection import apply_intent_management
 
 class PaperExecutionEngine:
     mode='paper'
@@ -41,6 +42,7 @@ class PaperExecutionEngine:
         p.remaining_quantity=base_quantity
         p.leverage=self.leverage
         p.current_price=fill
+        apply_intent_management(p, intent)
         self.positions[pid]=p
         self.equity -= fee
         self.orders[pid]={'order_id':pid,'status':'FILLED','fill_price':fill,'fee':fee,'decision_id':intent.decision_id}

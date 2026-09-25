@@ -4,7 +4,7 @@ import time
 class LiveExecutionEngine:
     mode = "live"
 
-    def __init__(self, coinw_executor, leverage=1):
+    def __init__(self, coinw_executor, leverage=10):
         self.coinw = coinw_executor
         self.leverage = leverage
         self._equity_cache = 0.0
@@ -36,3 +36,10 @@ class LiveExecutionEngine:
 
     async def sync(self, instruments):
         return await self.coinw.sync_positions(instruments)
+
+    async def settlements(self, symbol, position_ids):
+        return await self.coinw.settlements(symbol, position_ids)
+
+    async def ensure_protection(self, position):
+        await self.coinw.orders.set_tpsl(position.position_id, self.coinw._instrument(position.symbol),
+                                         stop_loss=position.stop_price, take_profit=position.target_price)

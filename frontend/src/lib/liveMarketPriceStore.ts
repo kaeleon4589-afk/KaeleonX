@@ -6,6 +6,7 @@ export type LiveMarketQuote = {
   price: number;
   source: LiveMarketQuoteSource;
   updatedAt: number;
+  precision?: number;
 };
 
 const quotes = new Map<string, LiveMarketQuote>();
@@ -23,15 +24,16 @@ export function canonicalLiveSymbol(input: unknown): string {
   return `${value}USDT`;
 }
 
-export function publishLiveMarketQuote(symbol: unknown, price: unknown, source: LiveMarketQuoteSource): void {
+export function publishLiveMarketQuote(symbol: unknown, price: unknown, source: LiveMarketQuoteSource, precision?: number): void {
   const key = canonicalLiveSymbol(symbol);
   const numericPrice = Number(price);
   if (!key || !Number.isFinite(numericPrice) || numericPrice <= 0) return;
 
+  const safePrecision = Number.isInteger(precision) ? Math.max(0, Math.min(12, Number(precision))) : undefined;
   const previous = quotes.get(key);
-  if (previous && previous.price === numericPrice && previous.source === source) return;
+  if (previous && previous.price === numericPrice && previous.source === source && previous.precision === safePrecision) return;
 
-  quotes.set(key, { price: numericPrice, source, updatedAt: Date.now() });
+  quotes.set(key, { price: numericPrice, source, updatedAt: Date.now(), precision: safePrecision });
   listeners.get(key)?.forEach((listener) => listener());
 }
 

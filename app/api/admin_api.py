@@ -195,7 +195,7 @@ def system_config(authorization: str | None = Header(default=None)):
         "scanner_parallel": s.market_scanner_parallel,
         "default_timeframe": s.default_timeframe,
         "fixed_leverage": s.fixed_leverage,
-        "risk_per_trade": s.risk_per_trade,
+        "capital_allocation": "FULL_CONFIGURED_MARGIN",
         "coinw_rest_base_url": s.coinw_rest_base_url,
         "coinw_ws_url": s.coinw_ws_url,
         "admin_phone_configured": bool(s.admin_phone),

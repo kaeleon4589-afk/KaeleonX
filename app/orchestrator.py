@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 
 from app.models.enums import Direction
 from app.models.trading import Position
+from app.position.protection import apply_intent_management
 from app.trading.persistence import TradePersistence
 
 
@@ -60,11 +61,11 @@ class TradingOrchestrator:
     @staticmethod
     def _position_from_result(raw, intent) -> Position:
         if isinstance(raw, Position):
-            return raw
+            return apply_intent_management(raw, intent)
         direction = raw.get("direction", intent.direction)
         if not isinstance(direction, Direction):
             direction = Direction(str(direction))
-        return Position(
+        position = Position(
             position_id=str(raw["position_id"]),
             decision_id=str(raw.get("decision_id") or intent.decision_id),
             symbol=str(raw.get("symbol") or intent.symbol),
@@ -84,11 +85,25 @@ class TradingOrchestrator:
             entry_fee=float(raw.get("entry_fee", 0) or 0),
             exit_fee=float(raw.get("exit_fee", 0) or 0),
             funding_pnl=float(raw.get("funding_pnl", 0) or 0),
+            initial_stop_price=raw.get("initial_stop_price"),
+            structural_target_price=raw.get("structural_target_price"),
+            target_front_run_ratio=raw.get("target_front_run_ratio"),
+            break_even_price=raw.get("break_even_price"),
+            break_even_activation_ratio=float(raw.get("break_even_activation_ratio", 0.55) or 0.55),
+            profit_lock_activation_ratio=float(raw.get("profit_lock_activation_ratio", 0.80) or 0.80),
+            profit_lock_capture_ratio=float(raw.get("profit_lock_capture_ratio", 0.35) or 0.35),
+            profit_lock_price=raw.get("profit_lock_price"),
+            management_stage=str(raw.get("management_stage", "INITIAL") or "INITIAL"),
+            best_price=raw.get("best_price"),
+            estimated_exit_fee_rate=float(raw.get("estimated_exit_fee_rate", 0.0006) or 0.0006),
+            break_even_buffer_bps=float(raw.get("break_even_buffer_bps", 3.0) or 3.0),
+            protection_update_pending=bool(raw.get("protection_update_pending", False)),
             opened_at=raw.get("opened_at"),
             closed_at=raw.get("closed_at"),
             exit_price=raw.get("exit_price"),
             exit_reason=raw.get("exit_reason"),
         )
+        return apply_intent_management(position, intent)
 
     def _decision_doc(self, snapshot, intent, risk, *, status, execution_rr,
                       structural_rr, execution=None):
@@ -168,11 +183,32 @@ class TradingOrchestrator:
                 )
                 if hasattr(self.execution, 'ensure_protection'):
                     for held in self.position_manager.positions.values():
-                        if held.status == 'OPEN' and held.symbol == snapshot.symbol and not held.protected:
+                        needs_sync = (not held.protected) or bool(getattr(held, 'protection_update_pending', False))
+                        if held.status != 'OPEN' or held.symbol != snapshot.symbol or not needs_sync:
+                            continue
+                        try:
                             await self.execution.ensure_protection(held)
                             held.protected = True
+                            held.protection_update_pending = False
                             held.revision += 1
                             changes['updated'].append(held)
+                            self.audit.event(
+                                'POSITION_PROTECTION_SYNCED', held.decision_id,
+                                user_id=user_id, mode=self.execution_mode, symbol=held.symbol,
+                                position_id=held.position_id, stop_price=held.stop_price,
+                                target_price=held.target_price,
+                                management_stage=getattr(held, 'management_stage', 'INITIAL'),
+                            )
+                        except Exception as exc:
+                            held.protection_update_pending = True
+                            self.audit.event(
+                                'POSITION_PROTECTION_SYNC_ERROR', held.decision_id, level='ERROR',
+                                user_id=user_id, mode=self.execution_mode, symbol=held.symbol,
+                                position_id=held.position_id, stop_price=held.stop_price,
+                                target_price=held.target_price,
+                                management_stage=getattr(held, 'management_stage', 'INITIAL'),
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
                 for position in changes.get("updated", []):
                     self.persistence.schedule_position_save(
                         position=position, user_id=user_id, mode=self.execution_mode,
@@ -192,6 +228,7 @@ class TradingOrchestrator:
                     ):
                         intent = pending.get("intent")
                         if intent is not None:
+                            apply_intent_management(position, intent)
                             position.strategy = getattr(intent.strategy, "value", str(intent.strategy))
                             position.quality = round(float(intent.quality), 2)
                             position.execution_rr = pending.get("execution_rr")
@@ -216,10 +253,46 @@ class TradingOrchestrator:
 
         if snapshot.last:
             price = snapshot.last if isinstance(snapshot.last, (int, float)) else snapshot.last.close
-            self.position_manager.mark(snapshot.symbol, price, now_ms,
-                                       bid=getattr(snapshot, "bid", None),
-                                       ask=getattr(snapshot, "ask", None),
-                                       quote_received_ms=getattr(snapshot, "quote_received_ms", None))
+            protection_changes = self.position_manager.mark(
+                snapshot.symbol, price, now_ms,
+                bid=getattr(snapshot, "bid", None),
+                ask=getattr(snapshot, "ask", None),
+                quote_received_ms=getattr(snapshot, "quote_received_ms", None),
+            )
+            if protection_changes and hasattr(self.execution, 'ensure_protection'):
+                for position in protection_changes:
+                    if position.status != 'OPEN':
+                        continue
+                    try:
+                        await self.execution.ensure_protection(position)
+                        position.protected = True
+                        position.protection_update_pending = False
+                        position.revision += 1
+                        self.persistence.schedule_position_save(
+                            position=position, user_id=user_id, mode=self.execution_mode,
+                            symbol=position.symbol,
+                        )
+                        self.audit.event(
+                            'POSITION_PROTECTION_SYNCED', position.decision_id,
+                            user_id=user_id, mode=self.execution_mode, symbol=position.symbol,
+                            position_id=position.position_id, stop_price=position.stop_price,
+                            target_price=position.target_price,
+                            management_stage=getattr(position, 'management_stage', 'INITIAL'),
+                        )
+                    except Exception as exc:
+                        position.protection_update_pending = True
+                        self.persistence.schedule_position_save(
+                            position=position, user_id=user_id, mode=self.execution_mode,
+                            symbol=position.symbol,
+                        )
+                        self.audit.event(
+                            'POSITION_PROTECTION_SYNC_ERROR', position.decision_id, level='ERROR',
+                            user_id=user_id, mode=self.execution_mode, symbol=position.symbol,
+                            position_id=position.position_id, stop_price=position.stop_price,
+                            target_price=position.target_price,
+                            management_stage=getattr(position, 'management_stage', 'INITIAL'),
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
 
         # An exchange-accepted but not-yet-confirmed order reserves the runtime.
         # Without this lock the scanner could submit a second symbol while CoinW

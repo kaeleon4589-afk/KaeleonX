@@ -34,3 +34,28 @@ Adicionalmente, ambas estrategias limitaban la distancia al SL con un máximo fi
 - Si aparece un cierre anormal, consultar POSITION_CLOSED del ID y sus campos exit_trigger_price, stop_gap_bps, quote_delay_ms, además de la secuencia de precios de Railway/CoinW. Estas mediciones distinguen un salto real de una demora del worker.
 
 Se adjunta ARCHIVOS_TOCADOS.txt con la comparación exacta contra la entrega previa.
+
+## Gestión adaptativa de salidas — 2026-09-25
+
+A partir de las operaciones que avanzaban casi hasta TP y después devolvían todo el recorrido hasta el SL, se cambió la gestión de salida sin alterar la lógica de entrada ni el SL estructural inicial.
+
+### Cambios aplicados
+1. **TP delante del nivel estructural**: el TP ejecutable se coloca por defecto al 92% de la distancia entre la entrada y el objetivo estructural. El nivel estructural original se conserva en `structural_target_price` para diagnóstico. La variable `TRADE_TARGET_FRONT_RUN_RATIO` permite ajustar el porcentaje entre 0.80 y 1.00. Una señal sigue siendo rechazada si, después de acercar el TP, su RR ejecutable queda por debajo del mínimo 0.95.
+2. **Break-even real y automático**: cuando el mejor precio observado recorre el 55% de la distancia hacia el TP ejecutable, el stop se mueve a un break-even que incorpora comisión de entrada, comisión estimada de salida y un pequeño colchón de ejecución. El movimiento solo puede endurecer el stop; nunca lo afloja.
+3. **Profit lock**: al alcanzar el 80% del recorrido hacia TP, el stop avanza para bloquear por defecto el 35% de la distancia total al objetivo. Si el mercado revierte desde esa zona, la operación ya no puede volver al SL estructural original.
+4. **DEMO y LIVE**: DEMO aplica el stop dinámico dentro del `PositionManager`. LIVE actualiza el TPSL nativo en CoinW. Si CoinW rechaza o demora una actualización, la posición queda con `protection_update_pending=true` y el motor la reintenta; la conciliación nunca sustituye un stop gestionado por otro menos protector.
+5. **Precisión CoinW**: los precios de SL/TP enviados al exchange se normalizan a `pricePrecision`. Para no degradar la protección, un SL LONG se redondea hacia arriba y un SL SHORT hacia abajo; el TP se redondea hacia el lado más cercano a la entrada.
+6. **Persistencia**: se guardan `initial_stop_price`, `structural_target_price`, `break_even_price`, `profit_lock_price`, `best_price`, `management_stage` y los ratios de gestión. Tras un reinicio, el motor puede continuar la protección sin volver al SL original.
+
+### Valores predeterminados
+- `TRADE_TARGET_FRONT_RUN_RATIO=0.92`
+- `TRADE_BREAK_EVEN_ACTIVATION_RATIO=0.55`
+- `TRADE_PROFIT_LOCK_ACTIVATION_RATIO=0.80`
+- `TRADE_PROFIT_LOCK_CAPTURE_RATIO=0.35`
+- `TRADE_EXIT_FEE_RATE_ESTIMATE=0.0006`
+- `TRADE_BREAK_EVEN_BUFFER_BPS=3.0`
+
+Las variables son ajustables, pero no conviene cambiarlas con una muestra pequeña. El cambio corrige el patrón de devolución total del beneficio flotante; no garantiza rentabilidad ni convierte una señal débil en una operación ganadora.
+
+### Validación
+`python -m compileall -q app` y `pytest -q`: **143 pruebas aprobadas**. Se añadieron pruebas LONG/SHORT de break-even y profit lock, sincronización de protección LIVE y protección contra una conciliación de CoinW que intente devolver el stop a un nivel menos protector. No se enviaron órdenes reales durante esta validación.

@@ -117,3 +117,29 @@ NUEVOS (1):
 frontend/src/components/trading/MarketMicrostructure.tsx
 
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — TP anticipado + break-even real + profit lock
+BASE COMPARADA: KaeleonX-sync-perfecta-precio-presion.zip
+
+MODIFICADOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+REVISION_LOGICA_OPERACIONES.md
+app/coinw/executor.py
+app/config/settings.py
+app/execution/live.py
+app/execution/paper.py
+app/models/trading.py
+app/orchestrator.py
+app/position/manager.py
+app/strategy/breakout_retest.py
+app/strategy/liquidity_sweep.py
+app/trading/runtime.py
+tests/test_entry_geometry_risk.py
+
+NUEVOS:
+app/position/protection.py
+tests/test_adaptive_exit_management.py
+
+ELIMINADOS: ninguno

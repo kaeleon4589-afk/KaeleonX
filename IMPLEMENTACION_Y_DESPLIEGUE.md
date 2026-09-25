@@ -97,3 +97,23 @@ La operación activa incorpora zona visual de beneficio/riesgo, historial de ent
 También se añadieron herramientas de dibujo de KLineChart (tendencia, segmento, horizontal, línea/canal de precio, paralelas, Fibonacci, anotación y pincel), edición de parámetros MA/EMA/BOLL/VOL/MACD/RSI, perfil de volumen aproximado de las velas y alertas de precio locales por símbolo. Las alertas se guardan en `localStorage` y pueden emitir una notificación del navegador si el usuario concede permiso mientras la página está activa; no existe todavía monitorización push en segundo plano ni sincronización entre dispositivos.
 
 Validación de esta ampliación: `python -m pytest -q` -> **138 pruebas aprobadas**. La instalación npm del entorno de revisión quedó bloqueada esperando al registro, por lo que la compilación TypeScript/Vite de esta ampliación debe repetirse con acceso npm antes de producción: `cd frontend && npm ci && npm run build`. La comprobación visual final debe hacerse después del deploy, especialmente en móvil, fullscreen y con un par que tenga una operación activa.
+
+## Gestión adaptativa TP / break-even / profit lock — 2026-09-25
+
+Las nuevas operaciones ya no colocan el TP exactamente sobre la resistencia/soporte estructural. El objetivo ejecutable queda por defecto al 92% del recorrido hacia ese nivel. El objetivo estructural se conserva para auditoría y el RR se vuelve a validar después del ajuste.
+
+Cuando una posición alcanza el 55% del recorrido al TP, el motor mueve el SL a un break-even que contempla fees y colchón de ejecución. Al 80% del recorrido, activa `PROFIT_LOCK` y bloquea por defecto el 35% de la distancia al TP. El stop solo se mueve a favor de la operación.
+
+En LIVE, cada cambio del stop se sincroniza con el TPSL de CoinW. Los precios se normalizan a la precisión del instrumento y las actualizaciones fallidas quedan pendientes para reintento. La conciliación con CoinW nunca puede aflojar un stop ya gestionado. En DEMO se aplica la misma lógica internamente.
+
+Variables opcionales de Railway (los valores indicados ya son los defaults):
+- `TRADE_TARGET_FRONT_RUN_RATIO=0.92`
+- `TRADE_BREAK_EVEN_ACTIVATION_RATIO=0.55`
+- `TRADE_PROFIT_LOCK_ACTIVATION_RATIO=0.80`
+- `TRADE_PROFIT_LOCK_CAPTURE_RATIO=0.35`
+- `TRADE_EXIT_FEE_RATE_ESTIMATE=0.0006`
+- `TRADE_BREAK_EVEN_BUFFER_BPS=3.0`
+
+La implementación aplica a operaciones nuevas. Una posición antigua conserva su TP existente, pero puede adoptar la protección dinámica al ser restaurada. Antes de activar LIVE, verificar una operación DEMO completa y revisar que `management_stage` pase `INITIAL -> BREAK_EVEN -> PROFIT_LOCK` cuando corresponda.
+
+Validación backend: **143 pruebas aprobadas** y `compileall` sin errores. No se modificó frontend en esta ampliación.

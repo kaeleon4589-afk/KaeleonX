@@ -74,3 +74,22 @@ async def candles(
         raise HTTPException(status, code) from exc
     except Exception as exc:
         raise HTTPException(502, f"coinw_market_candles_failed:{exc}") from exc
+
+
+
+@router.get("/snapshot")
+async def snapshot(
+    symbol: str = Query(min_length=2, max_length=32),
+    authorization: str | None = Header(default=None),
+):
+    authenticated(authorization)
+    try:
+        canonical = canonical_symbol(symbol)
+        payload = await service().snapshot(canonical)
+        return payload
+    except ValueError as exc:
+        code = str(exc)
+        status = 404 if code == "market_symbol_not_found" else 400
+        raise HTTPException(status, code) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"coinw_market_snapshot_failed:{exc}") from exc

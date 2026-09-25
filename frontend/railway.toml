@@ -1,6 +1,9 @@
 [build]
 builder = "RAILPACK"
-buildCommand = "npm ci --no-audit --no-fund && npm run build"
+# Railpack installs dependencies automatically during its install phase.
+# Running npm ci again here tries to remove the cached /app/node_modules mount
+# and can fail with EBUSY (for example /app/node_modules/.vite).
+buildCommand = "npm run build"
 
 [deploy]
 startCommand = "npm start"

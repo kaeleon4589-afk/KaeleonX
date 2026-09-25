@@ -35,7 +35,7 @@ export default function AdminStatisticsPanel() {
     try {
       await api.adminResetStatistics(body);
       pending.current = null;
-      setMessage(`Nueva etapa ${body.mode.toUpperCase()} iniciada: ${body.label}.`);
+      setMessage(`Estadísticas globales ${body.mode.toUpperCase()} reiniciadas: ${body.label}.`);
       setConfirmed(false); setLabel(''); setRefresh(v => v + 1);
     } catch (e) { setError(humanizeError(e)); }
     finally { setBusy(false); }
@@ -43,8 +43,8 @@ export default function AdminStatisticsPanel() {
 
   const metrics = data?.metrics;
   return <section className="admin-panel statistics-panel">
-    <h2>Estadísticas por setup</h2>
-    <p>Medición global de todos los usuarios del modo seleccionado. Este reinicio solo afecta a este apartado; el rendimiento histórico personal se conserva.</p>
+    <h2>Estadísticas globales</h2>
+    <p>Reinicia las métricas de todos los usuarios del modo seleccionado. DEMO vuelve al saldo virtual inicial de cada usuario; LIVE conserva el saldo real del exchange.</p>
     <div className="statistics-controls">
       <label>Modo<select value={mode} disabled={busy} onChange={e => {
         setMode(e.target.value as 'demo' | 'live'); setConfirmed(false); setMessage(''); pending.current = null;
@@ -64,11 +64,11 @@ export default function AdminStatisticsPanel() {
         <StatCard label="Abiertas en esta etapa" value={metrics!.open_positions}/>
       </div>
       {metrics!.trades === 0 && <p>No hay operaciones cerradas en esta etapa.</p>}
-      <p>Operaciones anteriores excluidas: {metrics!.excluded_positions}. Las abiertas antes del reinicio no entrarán en esta etapa cuando cierren.</p>
+      <p>Operaciones anteriores excluidas: {metrics!.excluded_positions}. El historial se conserva para auditoría.</p>
     </>}
     <form className="statistics-reset" onSubmit={e => {e.preventDefault(); void reset();}}>
       <h3>Reiniciar estadísticas {mode.toUpperCase()}</h3>
-      <p>Comienza una etapa nueva desde cero. Conserva saldos, historial, órdenes, posiciones abiertas y límites de riesgo. El otro modo permanece igual.</p>
+      <p>Se reinician las estadísticas y el PnL visible de todos los usuarios en este modo. DEMO recupera su saldo inicial; LIVE mantiene el saldo disponible en CoinW. Se requiere cerrar todas las posiciones y órdenes pendientes del modo antes de continuar. El historial y el otro modo se conservan.</p>
       <label>Nombre del setup / etapa<input maxLength={100} required value={label} disabled={busy} placeholder="Ej.: Setup v2 — filtro de tendencia" onChange={e => {setLabel(e.target.value); pending.current = null; setConfirmed(false);}}/></label>
       <label className="statistics-confirm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={e => setConfirmed(e.target.checked)}/>Confirmo iniciar una nueva medición global en {mode.toUpperCase()}.</label>
       <button className="danger-outline" disabled={busy || loading || !data || !confirmed || !label.trim()}>{busy ? 'Reiniciando…' : `Reiniciar ${mode.toUpperCase()}`}</button>

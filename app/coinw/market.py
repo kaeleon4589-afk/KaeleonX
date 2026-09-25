@@ -59,7 +59,10 @@ class CoinWMarketClient:
         key = (_base(instrument), period, size)
         cached = self._cache.get(key)
         # Cache only inside the current candle bucket. Boundary refresh is immediate.
-        span = {'5m': 300, '15m': 900, '1h': 3600}.get(period, 60)
+        span = {
+            '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+            '1h': 3600, '4h': 14400, '1d': 86400, '1w': 604800, '1M': 2592000,
+        }.get(period, 60)
         bucket = int(time.time()) // span
         if cached and cached[0] == bucket and time.monotonic() - cached[1] < 30:
             return cached[2]

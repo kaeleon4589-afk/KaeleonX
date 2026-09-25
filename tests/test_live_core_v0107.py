@@ -19,7 +19,7 @@ def test_risk_returns_quote_notional_for_coinw():
     assert r.margin_required + r.quantity * .0006 <= 1000
 
 
-def test_breakout_strategy_never_inverts_bearish_regime():
+def test_breakout_strategy_rejects_bearish_setup_when_history_is_insufficient():
     candles = []
     price = 100.0
     for i in range(60):
@@ -37,4 +37,4 @@ def test_breakout_strategy_never_inverts_bearish_regime():
     result = BreakoutRetestStrategy().evaluate(
         regime, candles, "D1", "BTC", "5m", candles[-1].close
     )
-    assert result is None or result.direction == Direction.BEARISH
+    assert result is None

@@ -234,7 +234,7 @@ def test_configured_margin_is_fully_allocated_and_second_symbol_waits_for_close(
     assert len([p for p in manager.positions.values() if p.status == 'OPEN']) == 1
 
 
-def test_scanner_uses_source_volume_oi_directional_trend_score_and_failsafe():
+def test_scanner_is_direction_neutral_and_keeps_failsafe_cache():
     import asyncio
     from app.market.scanner import CoinWMarketScanner
 
@@ -246,7 +246,8 @@ def test_scanner_uses_source_volume_oi_directional_trend_score_and_failsafe():
             if self.fail:
                 raise RuntimeError('temporary_coinw_failure')
             return {'data': [
-                # Equal volume: positive directional trend + OI must outrank negative trend.
+                # Equal liquidity and equal absolute move must receive equal ranking score,
+                # independent of direction.
                 {'instrument': 'AAAUSDT', 'last': '10', 'volume': '1000000', 'openInterest': '10000000', 'change24h': '0.03'},
                 {'instrument': 'BBBUSDT', 'last': '10', 'volume': '1000000', 'openInterest': '10000000', 'change24h': '-0.03'},
             ]}
@@ -255,9 +256,12 @@ def test_scanner_uses_source_volume_oi_directional_trend_score_and_failsafe():
     scanner = CoinWMarketScanner(client, depth=10, cache_seconds=0)
     first = asyncio.run(scanner.ranked())
     assert [row['symbol'] for row in first[:2]] == ['AAA', 'BBB']
-    assert first[0]['score'] == 1.0
-    assert first[1]['score'] == 0.8
+    assert first[0]['score'] == first[1]['score'] == 0.92
+    assert first[0]['momentum_score'] == first[1]['momentum_score'] == 0.6
+    assert first[0]['market_direction'] == 'up'
+    assert first[1]['market_direction'] == 'down'
     assert first[0]['change_24h'] == 3.0
+    assert first[1]['change_24h'] == -3.0
 
     client.fail = True
     fallback = asyncio.run(scanner.ranked())

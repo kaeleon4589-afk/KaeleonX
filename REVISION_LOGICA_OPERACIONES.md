@@ -1,0 +1,36 @@
+# Revisión de operaciones DEMO/LIVE — 2026-09-25
+
+## Evidencia y diagnóstico
+La revisión se basó en el código de la entrega anterior y en las capturas y mensajes facilitados por el usuario. No hubo acceso a los logs, a los ticks históricos de la cuenta en Railway/MongoDB ni a sus órdenes privadas CoinW. Las tres pérdidas visibles prueban un problema de geometría de entrada en los ejemplos ONDO/XPL y RR deteriorado en BB; por sí solas no prueban una tasa de pérdida del 100% en todo el historial.
+
+| Operación | Entrada | SL | TP | Hallazgo |
+| --- | ---: | ---: | ---: | --- |
+| ONDO LONG | 0.556311 | 0.555000 | 0.563446 | SL a 0.236% de la entrada; RR mostrado 5.4418. Entrada realizada después de una caída respecto de la vela que definió la señal. |
+| XPL LONG | 0.119674 | 0.119273 | 0.121099 | SL a 0.335% de la entrada. El cierre observado a 0.118336 muestra el riesgo de un salto entre cotizaciones. |
+| BB LONG | 0.010456 | 0.010372 | 0.010526 | RR ejecutable 0.8268; ya lo bloquea la validación de RR de la revisión anterior. |
+
+### Causa raíz
+La estrategia calculaba el SL y TP a partir del cierre de una vela 5m. La orden se ejecutaba con bid/ask posterior. Al sustituir el precio de entrada sin volver a validar la distancia al stop original, una cotización favorable para el precio LONG podía acercar el stop hasta menos de la mitad de su distancia prevista y mostrar un RR ilusoriamente alto. En el sentido opuesto, una entrada perseguida podía alejar demasiado el stop.
+
+Adicionalmente, ambas estrategias limitaban la distancia al SL con un máximo fijo aunque la volatilidad ATR o el nivel estructural requiriese un stop mayor. Esa limitación podía poner el SL dentro del movimiento que justificaba el setup. El tamaño de la posición usaba la pérdida bruta teórica en el SL, sin incluir comisiones de entrada/salida ni deslizamiento previsto. En el monitor, cada cotización de una posición abierta recorría a todos los usuarios, aun cuando solo su propietario necesitaba procesarla.
+
+### Correcciones
+1. Se mantiene el SL/TP del setup, pero se verifica antes de mandar una orden que la distancia desde la entrada ejecutable al SL esté entre el 80% y el 125% de la distancia prevista en la vela. Si el precio se aleja, se espera un setup nuevo. Esto afecta por igual DEMO y LIVE, LONG y SHORT. Los casos ONDO y XPL aportados quedarían rechazados por un SL demasiado próximo.
+2. El RR se sigue evaluando sobre bid/ask ejecutable con su límite mínimo existente de 0.95. BB habría sido rechazada por esa comprobación, ya incorporada en la revisión anterior.
+3. BREAKOUT_RETEST y LIQUIDITY_SWEEP rechazan un setup cuando su stop requerido por estructura/ATR supera el máximo configurado, en vez de recortarlo y simular una protección que la estrategia no pedía.
+4. El cálculo de tamaño incorpora una reserva de dos comisiones taker y deslizamiento de salida previsto, usando las variables ya configuradas PAPER_TAKER_FEE y PAPER_SLIPPAGE_BPS. En LIVE son una hipótesis de riesgo, no una afirmación sobre las comisiones efectivas de CoinW. Los huecos de mercado aún pueden superar la pérdida prevista.
+5. El monitor procesa las cotizaciones de seguimiento solo para usuarios con una posición abierta u orden pendiente en ese par. La hora de cierre DEMO proviene de la cotización recibida y se registra el retraso de procesamiento, el bid/ask que disparó la salida y la diferencia de ejecución respecto al SL. Los mensajes nuevos de cierre por SL incluyen esa diferencia.
+6. El panel muestra razones de rechazo comprensibles y mantiene los precios exactos ya corregidos. No se alteran las posiciones existentes.
+
+## Qué se verificó
+- 127 pruebas automatizadas aprobadas, incluida reproducción de entradas deterioradas como ONDO/XPL, coste de riesgo LONG/SHORT, SL mayor que el modelo, cierre desde bid/ask, propietario del monitor y operaciones válidas que todavía abren.
+- Frontend TypeScript y Vite compilaron.
+- No se colocaron órdenes reales y no se hizo un backtest histórico de la rentabilidad. La estrategia aún puede perder operaciones. La simulación DEMO usa mercado real, pero el stop sigue sujeto al precio observado y a los intervalos del monitor; LIVE utiliza la ejecución y liquidación de CoinW.
+
+## Despliegue y evaluación
+- Mantener FIXED_LEVERAGE=10 en todos los servicios y las variables de coste/riesgo actuales. No borrar base de datos ni reiniciar el saldo de una posición abierta.
+- Desplegar backend y frontend juntos. Verificar una operación DEMO completa en un mercado de precio bajo y los motivos de descarte en el panel.
+- En Administración → Estadísticas, iniciar una nueva etapa DEMO **después** del despliegue para comparar setups con operaciones nuevas. Evaluar win rate, PnL neto y diferencia entre SL y salida después de suficientes cierres. No prometer rentabilidad por las pruebas unitarias.
+- Si aparece un cierre anormal, consultar POSITION_CLOSED del ID y sus campos exit_trigger_price, stop_gap_bps, quote_delay_ms, además de la secuencia de precios de Railway/CoinW. Estas mediciones distinguen un salto real de una demora del worker.
+
+Se adjunta ARCHIVOS_TOCADOS.txt con la comparación exacta contra la entrega previa.

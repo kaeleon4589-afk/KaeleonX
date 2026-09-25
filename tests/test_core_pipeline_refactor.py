@@ -367,3 +367,25 @@ def test_source_router_defaults_range_no_trade_and_trend_probe_opt_in(monkeypatc
     selected = router.evaluate(trend_regime, [], 'd3', 'BTC', '5m', regime_metadata=meta)
     assert selected is sweep.result
     assert sweep.calls == 1
+
+
+def test_executable_rr_below_strategy_minimum_rejected_before_order_in_both_modes():
+    """A candle setup can deteriorate at the executable quote."""
+    for mode in ('demo', 'live'):
+        audit = CapturingAudit()
+        execution = (PaperExecutionEngine(audit=audit, initial_equity=100)
+                     if mode == 'demo' else PendingLiveExecution())
+        orchestrator, manager, _, _, _ = build_orchestrator(execution, audit=audit, mode=mode)
+
+        def bb_signal(regime, candles, decision_id, symbol, timeframe, current_price=None, snapshot=None, **kwargs):
+            return TradeIntent(decision_id, symbol, Strategy.BREAKOUT_RETEST, Direction.LONG,
+                               .01040, .010372, .010526, 85.0, 1.0, timeframe)
+
+        orchestrator.router.evaluate = bb_signal
+        result = asyncio.run(orchestrator.on_snapshot(snapshot('BB', .01045495), 100, user_id='u1'))
+        assert result is None
+        assert not manager.positions
+        assert not getattr(execution, 'submit_calls', [])
+        assert orchestrator.last_rejection == 'execution_rr_too_low'
+        assert any(e == 'SIGNAL_REJECTED' and d.get('execution_rr', 1) < .95
+                   for e, _, d in audit.events)

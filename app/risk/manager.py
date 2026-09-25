@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 
 @dataclass(frozen=True)
@@ -12,7 +13,7 @@ class RiskDecision:
 
 
 class RiskManager:
-    def __init__(self, max_risk_per_trade=.01, max_leverage=5, min_quality=60,
+    def __init__(self, max_risk_per_trade=.01, max_leverage=10, min_quality=60,
                  max_margin_fraction=.90):
         self.max_risk_per_trade = max_risk_per_trade
         self.max_leverage = max_leverage
@@ -20,6 +21,9 @@ class RiskManager:
         self.max_margin_fraction = max_margin_fraction
 
     def evaluate(self, intent, equity, leverage=1):
+        if not all(math.isfinite(float(v)) for v in (equity, intent.entry_price, intent.stop_price,
+                                                       intent.quality, intent.risk_multiplier)):
+            return RiskDecision(False, 0, 'invalid_numeric_input')
         if intent.quality < self.min_quality:
             return RiskDecision(False, 0, "quality_below_threshold")
         if equity <= 0:

@@ -1,3 +1,6 @@
+from typing import Literal
+from uuid import UUID
+from app.trading.statistics import TradingStatistics
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -249,3 +252,29 @@ def admin_operations(authorization: str | None = Header(default=None), limit: in
     current_admin(authorization)
     db, _, _ = deps()
     return {'items': [clean(x) for x in db.find_many('positions', limit=min(max(limit, 1), 500), sort_field='created_at')]}
+
+
+class ResetStatisticsRequest(BaseModel):
+    mode: Literal['demo', 'live']
+    label: str = Field(min_length=1, max_length=100)
+    confirm: Literal[True]
+    request_id: UUID
+
+
+@router.get('/trading/statistics')
+def trading_statistics(mode: Literal['demo', 'live'], authorization: str | None = Header(default=None)):
+    current_admin(authorization)
+    return TradingStatistics(deps()[0]).report(mode)
+
+
+@router.post('/trading/statistics/reset')
+def reset_trading_statistics(req: ResetStatisticsRequest, authorization: str | None = Header(default=None)):
+    admin = current_admin(authorization)
+    label = req.label.strip()
+    if not label:
+        raise HTTPException(422, 'setup_label_required')
+    try:
+        period = TradingStatistics(deps()[0]).reset(req.mode, label, admin['user_id'], str(req.request_id))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {'success': True, 'period': period}

@@ -7,6 +7,15 @@ import { api, humanizeError, session } from '../lib/api';
 import type { Entitlement, Execution, Operations, Performance, Position, ReferralSummary, TradingConfig, User } from '../types';
 
 const money=(n:unknown)=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2}).format(Number(n)||0);
+// Market prices need their own precision; USD balances and PnL stay at cents.
+const marketPrice=(value:unknown)=>{
+  if(value==null || value==='') return '—';
+  const n=Number(value);
+  if(!Number.isFinite(n) || n<=0) return '—';
+  const abs=Math.abs(n);
+  const digits=abs<0.0001?10:abs<0.01?8:abs<1?6:abs<1000?4:2;
+  return new Intl.NumberFormat('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits}).format(n);
+};
 const pct=(n:unknown)=>`${Number(n||0).toFixed(2)}%`;
 const num=(v:unknown)=>{const n=Number(v);return Number.isFinite(n)?n:0};
 const date=(v:unknown)=>{if(!v)return '—'; const n=typeof v==='number'&&v<1e12?v*1000:v; const d=new Date(n as string|number); return Number.isNaN(d.getTime())?'—':new Intl.DateTimeFormat('es-MX',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}).format(d)};
@@ -94,4 +103,8 @@ function MarketChip({icon,label,status}:{icon:string;label:string;status:string}
 function PanelTitle({icon,title,badge,badgeTone}:{icon:ReactNode;title:string;badge?:string;badgeTone?:string}){return <div className="panel-title"><span>{icon}</span><h3>{title}</h3>{badge&&<b className={`badge ${badgeTone}`}>● {badge}</b>}</div>}
 function EngineMetric({label,value}:{label:string;value:string}){return <div className="engine-metric"><span>{label}</span><strong>{value}</strong></div>}
 function Empty({text}:{text:string}){return <div className="empty-state"><span>◇</span><p>{text}</p></div>}
-function OpenPosition({p}:{p:Position}){return <div className="open-position"><div className="position-top"><div><span className="asset-badge">◈</span><strong>{symbol(p)}</strong><b className={side(p)==='LONG'?'long':'short'}>{side(p)}</b></div><span>{p.settlement_pending?'Confirmando cierre':`${p.leverage||10}x`}</span></div><div className="position-grid"><span>Entrada<strong>{money(p.entry_price)}</strong></span><span>Precio actual<strong>{money(p.current_price||p.entry_price)}</strong></span><span>PnL actual<strong className={num(p.unrealized_pnl)>=0?'green':'red'}>{money(p.unrealized_pnl)}</strong></span></div><div className="position-progress"><i/></div><div className="position-bottom"><span>SL<strong>{money(p.stop_price||p.stop_loss)}</strong></span><span>TP1<strong>{money(p.tp1_price||p.tp1||p.target_price||p.take_profit)}</strong></span><span>TP2<strong>{money(p.tp2_price||p.tp2)}</strong></span></div></div>}
+function OpenPosition({p}:{p:Position}){
+  const tp1=p.tp1_price??p.tp1;
+  const target=p.tp2_price??p.tp2??p.target_price??p.take_profit;
+  return <div className="open-position"><div className="position-top"><div><span className="asset-badge">◈</span><strong>{symbol(p)}</strong><b className={side(p)==='LONG'?'long':'short'}>{side(p)}</b></div><span>{p.settlement_pending?'Confirmando cierre':`${p.leverage||10}x`}</span></div><div className="position-grid"><span>Entrada<strong>{marketPrice(p.entry_price)}</strong></span><span>Precio actual<strong>{marketPrice(p.current_price)}</strong></span><span>PnL actual<strong className={num(p.unrealized_pnl)>=0?'green':'red'}>{money(p.unrealized_pnl)}</strong></span></div><div className="position-progress"><i/></div><div className="position-bottom"><span>SL<strong>{marketPrice(p.stop_price??p.stop_loss)}</strong></span>{tp1!=null&&<span>TP1<strong>{marketPrice(tp1)}</strong></span>}<span>{tp1!=null?'TP2':'TP'}<strong>{marketPrice(target)}</strong></span></div></div>;
+}

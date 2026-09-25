@@ -79,6 +79,12 @@ export type Position = Record<string, unknown> & {
   entry_fee?: number;
   exit_fee?: number;
   funding_pnl?: number;
+  margin?: number;
+  estimated_margin?: number;
+  position_margin?: number;
+  break_even_price?: number;
+  breakeven_price?: number;
+  breakEvenPrice?: number;
   opened_at?: string | number;
   closed_at?: string | number;
   created_at?: string | number;
@@ -215,5 +221,56 @@ export type MarketCandlesResponse = {
   price_precision: number;
   items: MarketCandle[];
   count: number;
+  source: string;
+};
+
+
+export type MarketDepthLevel = {
+  price: number;
+  quantity: number;
+};
+
+export type MarketOrderBook = {
+  asks: MarketDepthLevel[];
+  bids: MarketDepthLevel[];
+  timestamp?: number | null;
+};
+
+export type MarketTrade = {
+  id: string;
+  timestamp: number;
+  price: number;
+  quantity: number;
+  piece?: number;
+  direction: 'long' | 'short' | 'unknown';
+};
+
+export type MarketTicker = {
+  last?: number | null;
+  index_price?: number | null;
+  high?: number | null;
+  low?: number | null;
+  open?: number | null;
+  change_rate?: number | null;
+  volume?: number | null;
+  volume_quote?: number | null;
+  max_leverage?: number | null;
+  contract_size?: number | null;
+};
+
+export type MarketFunding = {
+  rate?: number | null;
+  timestamp?: number | null;
+  kind?: string;
+};
+
+export type MarketSnapshotResponse = {
+  symbol: string;
+  display: string;
+  price_precision: number;
+  order_book: MarketOrderBook;
+  trades: MarketTrade[];
+  ticker: MarketTicker;
+  funding: MarketFunding;
   source: string;
 };

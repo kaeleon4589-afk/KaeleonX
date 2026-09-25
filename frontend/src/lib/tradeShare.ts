@@ -93,8 +93,8 @@ function drawLabelValue(
   valueColor = '#ecf6fb',
 ) {
   ctx.save();
-  ctx.fillStyle = 'rgba(2, 16, 25, 0.72)';
-  ctx.strokeStyle = 'rgba(130, 188, 217, 0.16)';
+  ctx.fillStyle = 'rgba(2, 16, 25, 0.26)';
+  ctx.strokeStyle = 'rgba(130, 188, 217, 0.28)';
   ctx.lineWidth = 2;
   roundedRect(ctx, x, y, width, 98, 22);
   ctx.fill();
@@ -132,10 +132,10 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   ctx.drawImage(bg, 0, 0, CARD_SIZE, CARD_SIZE);
 
   const overlay = ctx.createLinearGradient(0, 0, 0, CARD_SIZE);
-  overlay.addColorStop(0, 'rgba(1, 8, 14, 0.22)');
-  overlay.addColorStop(0.45, 'rgba(1, 7, 12, 0.12)');
-  overlay.addColorStop(0.75, 'rgba(2, 9, 16, 0.82)');
-  overlay.addColorStop(1, 'rgba(2, 9, 16, 0.93)');
+  overlay.addColorStop(0, 'rgba(1, 8, 14, 0.08)');
+  overlay.addColorStop(0.45, 'rgba(1, 7, 12, 0.04)');
+  overlay.addColorStop(0.78, 'rgba(2, 9, 16, 0.26)');
+  overlay.addColorStop(1, 'rgba(2, 9, 16, 0.42)');
   ctx.fillStyle = overlay;
   ctx.fillRect(0, 0, CARD_SIZE, CARD_SIZE);
 
@@ -152,6 +152,9 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   drawBadge(ctx, snapshot.side, cursorX, 66, accent, '#02160e');
   drawBadge(ctx, `${Math.max(1, Number(snapshot.leverage) || 1)}x`, CARD_SIZE - 170, 66, 'rgba(242,184,62,0.92)', '#1b1202');
 
+  ctx.shadowColor = 'rgba(0,0,0,0.78)';
+  ctx.shadowBlur = 12;
+  ctx.shadowOffsetY = 2;
   ctx.fillStyle = '#ecf6fb';
   ctx.font = '900 66px Inter, system-ui, sans-serif';
   ctx.fillText(snapshot.symbol.replace(/[_-]/g, '/'), 66, 166);
@@ -160,7 +163,7 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   ctx.fillText(snapshot.status === 'LIVE' ? 'Operación compartida en vivo' : 'Resultado final compartido', 70, 205);
 
   if (options.showRoe) {
-    ctx.fillStyle = 'rgba(2, 16, 25, 0.68)';
+    ctx.fillStyle = 'rgba(2, 16, 25, 0.24)';
     ctx.strokeStyle = softAccent;
     ctx.lineWidth = 3;
     roundedRect(ctx, 60, 230, 380, 210, 28);
@@ -175,7 +178,7 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   }
 
   if (options.showPnl) {
-    ctx.fillStyle = 'rgba(2, 16, 25, 0.68)';
+    ctx.fillStyle = 'rgba(2, 16, 25, 0.24)';
     ctx.strokeStyle = softAccent;
     ctx.lineWidth = 3;
     roundedRect(ctx, 460, 230, 560, 210, 28);
@@ -194,8 +197,8 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   }
 
   const bottomY = 640;
-  ctx.fillStyle = 'rgba(2, 16, 25, 0.78)';
-  ctx.strokeStyle = 'rgba(120, 178, 202, 0.18)';
+  ctx.fillStyle = 'rgba(2, 16, 25, 0.18)';
+  ctx.strokeStyle = 'rgba(120, 178, 202, 0.24)';
   ctx.lineWidth = 2;
   roundedRect(ctx, 56, bottomY - 20, CARD_SIZE - 112, 320, 32);
   ctx.fill();
@@ -216,6 +219,8 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   drawLabelValue(ctx, 'Modo de cuenta', snapshot.mode === 'live' ? 'LIVE' : 'DEMO', 86, bottomY + 132, colWidth, '#ecf6fb');
   drawLabelValue(ctx, 'Compartido', formatDateTime(snapshot.sharedAt || Date.now()), 86 + colWidth + gap, bottomY + 132, colWidth, '#ecf6fb');
 
+  ctx.shadowColor = 'rgba(0,0,0,0.8)';
+  ctx.shadowBlur = 8;
   ctx.fillStyle = accent;
   ctx.font = '700 20px Inter, system-ui, sans-serif';
   ctx.fillText(snapshot.status === 'LIVE' ? 'Datos en vivo sincronizados con KAELEON' : 'Resultado final cerrado en KAELEON', 86, CARD_SIZE - 54);

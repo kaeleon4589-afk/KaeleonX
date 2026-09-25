@@ -61,3 +61,9 @@ svg{width:22px;height:22px}.green{color:var(--green)!important}.red{color:var(--
 .side-promo-art{display:block;width:100%;height:auto;aspect-ratio:1;object-fit:contain;border-radius:8px;margin-bottom:10px}
 @media(max-width:860px){.auth-mobile-brand{display:block;margin-bottom:16px;text-align:center}}
 @media(max-width:520px){.auth-mobile-brand img{width:min(100%,270px)}}
+
+/* Active position PnL: the line follows the sign of the current result. */
+.position-progress i.positive{background:linear-gradient(90deg,#41d6b6,#00e88b)}
+.position-progress i.negative{background:linear-gradient(90deg,#ff7991,#ff365f)}
+.position-progress i.neutral{background:#738997}
+.position-grid strong.neutral-pnl{color:#a6bbc8}

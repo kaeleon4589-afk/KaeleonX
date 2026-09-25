@@ -146,7 +146,8 @@ class TradingOrchestrator:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    async def on_snapshot(self, snapshot, equity, user_id=None, allow_entries=True):
+    async def on_snapshot(self, snapshot, equity, user_id=None, allow_entries=True,
+                          available_equity=None):
         now_ms = int(time.time() * 1000)
 
         # LIVE reconciliation runs even while new entries are paused. This is what
@@ -485,6 +486,7 @@ class TradingOrchestrator:
             try:
                 risk = self.risk.evaluate(
                     intent, equity, leverage=getattr(self.execution, "leverage", 1),
+                    available_equity=available_equity,
                 )
             except Exception as exc:
                 terminal_event_emitted = True
@@ -566,6 +568,16 @@ class TradingOrchestrator:
                                  mode=self.execution_mode, symbol=snapshot.symbol,
                                  reason='fill_outside_trade_geometry')
                 return {'accepted': False, 'filled': False, 'reason': 'fill_outside_trade_geometry'}
+            # A worker restart or delayed persistence must not bypass the
+            # one-position-per-user rule before placing a second order.
+            if user_id and (await asyncio.to_thread(
+                    self.db.find_one, 'positions', {'user_id': user_id, 'status': 'OPEN'})):
+                self.last_rejection = 'open_position_exists'
+                return {'accepted': False, 'filled': False, 'reason': 'open_position_exists'}
+            if user_id and (await asyncio.to_thread(
+                    self.db.find_one, 'execution_pending', {'user_id': user_id, 'active': True})):
+                self.last_rejection = 'execution_pending'
+                return {'accepted': False, 'filled': False, 'reason': 'execution_pending'}
             if self.entry_guard is not None and not self.entry_guard():
                 raise RuntimeError('trading_worker_lease_expired')
             if snapshot.candles:

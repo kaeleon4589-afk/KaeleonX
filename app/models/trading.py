@@ -7,6 +7,15 @@ class TradeIntent:
     entry_price:float; stop_price:float; target_price:float; quality:float
     risk_multiplier:float; timeframe:str; reasons:tuple[str,...]=(); metadata:dict=field(default_factory=dict)
 
+
+@dataclass(frozen=True)
+class ArmedSetup:
+    setup_id:str; symbol:str; strategy:Strategy; direction:Direction
+    armed_at_ms:int; expires_at_ms:int; trigger_price:float; invalidation_price:float
+    stop_price:float; target_price:float; entry_zone_low:float; entry_zone_high:float
+    quality:float; risk_multiplier:float; timeframe:str='5m'
+    reasons:tuple[str,...]=(); metadata:dict=field(default_factory=dict)
+
 @dataclass
 class Position:
     position_id:str; decision_id:str; symbol:str; direction:Direction; quantity:float

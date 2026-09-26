@@ -416,7 +416,7 @@ function estimatedBreakEven(position: Position | undefined): { value: number; es
   return Number.isFinite(value) && value > 0 ? { value, estimated: true } : null;
 }
 
-function getTradeLevels(position: Position | undefined): TradeLevel[] {
+function getTradeLevels(position: Position | undefined, dynamicProtectionEnabled = true): TradeLevel[] {
   if (!position) return [];
   const entry = toNumber(position.entry_price);
   const stop = toNumber(position.stop_price ?? position.stop_loss);
@@ -424,7 +424,7 @@ function getTradeLevels(position: Position | undefined): TradeLevel[] {
   const tp2 = toNumber(position.tp2_price ?? position.tp2 ?? position.target_price ?? position.take_profit);
   const levels: TradeLevel[] = [];
   if (entry && entry > 0) levels.push({ key: 'entry', label: 'ENTRY', value: entry, tone: 'entry', color: '#3cc9ff' });
-  const breakEven = estimatedBreakEven(position);
+  const breakEven = dynamicProtectionEnabled ? estimatedBreakEven(position) : null;
   if (breakEven && (!entry || Math.abs(breakEven.value - entry) > Number.EPSILON)) {
     levels.push({ key: 'be', label: breakEven.estimated ? 'BE EST.' : 'BE', value: breakEven.value, tone: 'be', color: '#f4c95d' });
   }
@@ -506,7 +506,7 @@ const BASE_STYLES = {
   },
 };
 
-export default function LiveMarketChart({ positions, closedPositions = [] }: { positions: Position[]; closedPositions?: Position[] }) {
+export default function LiveMarketChart({ positions, closedPositions = [], dynamicProtectionEnabled = true }: { positions: Position[]; closedPositions?: Position[]; dynamicProtectionEnabled?: boolean }) {
   const firstPositionSymbol = positions.length ? positionSymbol(positions[0]) : 'BTCUSDT';
   const [selected, setSelected] = useState<MarketInstrument>({
     symbol: firstPositionSymbol,
@@ -568,7 +568,7 @@ export default function LiveMarketChart({ positions, closedPositions = [] }: { p
     [positions],
   );
   const activePositionSymbolsKey = activePositionSymbols.join('|');
-  const tradeLevels = useMemo(() => getTradeLevels(activePosition), [activePosition]);
+  const tradeLevels = useMemo(() => getTradeLevels(activePosition, dynamicProtectionEnabled), [activePosition, dynamicProtectionEnabled]);
   const marketPressure = useMemo<MarketPressure | null>(() => {
     const bids = orderBook.bids.slice(0, 20);
     const asks = orderBook.asks.slice(0, 20);

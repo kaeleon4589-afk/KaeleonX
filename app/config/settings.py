@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     trade_post_loss_symbol_cooldown_seconds: float = Field(1800.0, ge=0.0, le=14400.0)
     trade_entry_max_chase_atr: float = Field(0.20, ge=0.0, le=2.0)
     trade_entry_max_adverse_reversal_atr: float = Field(0.15, ge=0.0, le=2.0)
-    trade_entry_min_stop_atr: float = Field(0.55, ge=0.0, le=5.0)
+    trade_entry_min_stop_atr: float = Field(0.90, ge=0.0, le=5.0)
     trade_entry_min_stop_spreads: float = Field(3.0, ge=0.0, le=20.0)
     trade_entry_orderbook_conflict_threshold: float = Field(0.35, ge=0.0, le=0.95)
     market_poll_seconds: float = Field(2.0, gt=0)

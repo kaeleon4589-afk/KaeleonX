@@ -331,3 +331,42 @@ ELIMINADOS: ninguno
 VALIDACIÓN:
 pytest -q -> 187 passed
 python -m compileall -q app -> sin errores
+
+AJUSTE — Perfil de validación Win Rate: TP proporcional + SL fijo
+BASE COMPARADA: KaeleonX-strategy-engine-v6-armed-entry.zip
+
+MODIFICADOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+KAELEON_V6_STRATEGY_ENGINE.md
+app/api/user_api.py
+app/config/settings.py
+app/position/manager.py
+app/position/protection.py
+app/strategy/armed_entry.py
+app/strategy/breakout_retest.py
+app/strategy/liquidity_sweep.py
+app/trading/runtime.py
+frontend/src/components/trading/LiveMarketChart.tsx
+frontend/src/pages/DashboardPage.tsx
+frontend/src/types.ts
+tests/test_adaptive_exit_management.py
+tests/test_entry_geometry_risk.py
+tests/test_live_market_chart.py
+
+NUEVOS: ninguno
+ELIMINADOS: ninguno
+
+COMPORTAMIENTO:
+- LIQUIDITY_SWEEP: TP ejecutable limitado por defecto a 1.30R.
+- BREAKOUT_RETEST: TP ejecutable limitado por defecto a 1.50R.
+- TRADE_DYNAMIC_PROTECTION_ENABLED=false por defecto durante validación.
+- Con protección dinámica desactivada no se mueve el SL a break-even ni se activa profit-lock.
+- El mejor precio favorable se sigue registrando para análisis.
+- El gráfico oculta la línea BE mientras la protección dinámica está desactivada.
+- Una posición cuyo SL ya hubiera sido ajustado antes de apagar la protección no se afloja automáticamente.
+
+VALIDACIÓN DE ESTE AJUSTE:
+pytest -q -> 189 passed
+python -m compileall -q app scripts -> sin errores
+Frontend build local -> no validado: npm ci quedó incompleto por timeout del entorno y faltaron type definitions; no se atribuye al cambio de código.

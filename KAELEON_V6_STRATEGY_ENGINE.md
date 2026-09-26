@@ -113,3 +113,24 @@ python scripts/replay_strategy.py \
 ```
 
 El simulador usa OHLC de 1m y, si SL y TP aparecen tocados dentro de la misma vela, asume SL primero. Es una regla conservadora y evita atribuir fills intrabar favorables que no pueden demostrarse con OHLC. Antes de aumentar capital LIVE debe ejecutarse con histórico real y revisar expectancy, drawdown, MAE/MFE y el funnel de rechazos.
+
+
+## Validation profile: proportional TP + fixed initial SL
+
+For the strategy-effectiveness phase, KAELEON uses a deliberately transparent
+exit profile:
+
+- `TRADE_LIQUIDITY_SWEEP_TARGET_RR=1.30`
+- `TRADE_BREAKOUT_RETEST_TARGET_RR=1.50`
+- `TRADE_DYNAMIC_PROTECTION_ENABLED=false`
+
+The structural target is still calculated and stored for diagnostics, but the
+executable TP is capped to the strategy RR above whenever the structural target
+is farther away. If structure is closer (and still clears the minimum RR gate),
+the closer structural TP is preserved.
+
+With dynamic protection disabled, KAELEON keeps the original stop unchanged; it
+does not move it to fee-aware break-even and does not activate profit-lock. The
+engine still tracks the best favorable price for analysis. Existing positions
+whose stop had already been tightened before disabling this setting are not
+automatically loosened.

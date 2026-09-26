@@ -36,6 +36,36 @@ class TxRequest(BaseModel):
     tx_hash: str = Field(min_length=20)
 
 
+def public_order(order: dict | None) -> dict | None:
+    """Return the user-facing payment order without Mongo/internal fields.
+
+    Mongo documents include ``_id`` (ObjectId), which FastAPI cannot JSON encode
+    by default.  Returning raw DB documents made /billing/orders and
+    /billing/orders/tx fail with HTTP 500 as soon as a persisted order existed.
+    Keep the API contract explicit and JSON-safe instead of leaking DB internals.
+    """
+    if not order:
+        return None
+    allowed = (
+        "payment_order_id",
+        "plan_code",
+        "duration_days",
+        "amount_usdt",
+        "network",
+        "destination_wallet",
+        "status",
+        "created_at",
+        "expires_at",
+        "tx_hash",
+        "submitted_at",
+        "verified_at",
+        "confirmed_at",
+        "verification_reason",
+        "verified_block_number",
+    )
+    return {key: order.get(key) for key in allowed if key in order}
+
+
 @router.get("/plans")
 def plans():
     return {"plans": [{"code": k, "days": v["days"], "price_usdt": str(v["price_usdt"])} for k, v in SUBSCRIPTIONS.items()]}
@@ -70,7 +100,7 @@ def user_orders(authorization: str | None = Header(default=None), limit: int = 2
         limit=min(max(limit, 1), 100),
         sort_field="created_at",
     )
-    return {"items": rows}
+    return {"items": [public_order(row) for row in rows]}
 
 
 @router.post("/orders")
@@ -78,7 +108,7 @@ def create_order(req: PaymentOrderRequest, authorization: str | None = Header(de
     user = current_user(authorization)
     s = get_settings()
     try:
-        return service().create_payment_order(user["user_id"], req.plan_code, s.payment_wallet, s.payment_network)
+        return public_order(service().create_payment_order(user["user_id"], req.plan_code, s.payment_wallet, s.payment_network))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
@@ -87,7 +117,7 @@ def create_order(req: PaymentOrderRequest, authorization: str | None = Header(de
 def submit_tx(req: TxRequest, authorization: str | None = Header(default=None)):
     user = current_user(authorization)
     try:
-        return service().submit_tx_hash(user["user_id"], req.payment_order_id, req.tx_hash)
+        return public_order(service().submit_tx_hash(user["user_id"], req.payment_order_id, req.tx_hash))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 

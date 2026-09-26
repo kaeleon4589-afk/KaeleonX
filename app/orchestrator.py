@@ -12,6 +12,7 @@ from app.models.enums import Direction
 from app.models.trading import Position
 from app.position.protection import apply_intent_management
 from app.trading.persistence import TradePersistence
+from app.trading.rejection_funnel import RejectionFunnel
 
 
 # Both strategies require at least this RR before generating a signal. Enforce
@@ -35,7 +36,9 @@ class TradingOrchestrator:
                  post_loss_symbol_cooldown_seconds=1800.0,
                  entry_max_chase_atr=0.20, entry_max_adverse_reversal_atr=0.15,
                  entry_min_stop_atr=0.55, entry_min_stop_spreads=3.0,
-                 entry_orderbook_conflict_threshold=0.35):
+                 entry_orderbook_conflict_threshold=0.35,
+                 armed_entry_enabled=True, legacy_entry_fallback_enabled=False,
+                 funnel_emit_seconds=300.0, funnel_emit_every=50):
         self.regime_engine = regime_engine
         self.router = router
         self.risk = risk
@@ -61,6 +64,12 @@ class TradingOrchestrator:
         self.entry_min_stop_atr = max(0.0, float(entry_min_stop_atr))
         self.entry_min_stop_spreads = max(0.0, float(entry_min_stop_spreads))
         self.entry_orderbook_conflict_threshold = min(0.95, max(0.0, float(entry_orderbook_conflict_threshold)))
+        self.armed_entry_enabled = bool(armed_entry_enabled)
+        self.legacy_entry_fallback_enabled = bool(legacy_entry_fallback_enabled)
+        self.armed_setups = {}
+        self.rejection_funnel = RejectionFunnel(
+            emit_seconds=funnel_emit_seconds, emit_every=funnel_emit_every
+        )
         self.last_loss_at = 0.0
         self.last_symbol_loss_at = {}
 
@@ -108,6 +117,16 @@ class TradingOrchestrator:
                 net_pnl=round(net, 8), global_seconds=self.post_loss_global_cooldown_seconds,
                 symbol_seconds=self.post_loss_symbol_cooldown_seconds,
             )
+
+    def _funnel(self, stage, reason=None, *, user_id=None, symbol=None):
+        self.rejection_funnel.record(stage, reason)
+        if self.rejection_funnel.should_emit():
+            self.audit.event(
+                'REJECTION_FUNNEL', 'system', user_id=user_id,
+                mode=self.execution_mode, symbol=symbol,
+                **self.rejection_funnel.payload(),
+            )
+            self.rejection_funnel.mark_emitted()
 
     def seed_loss_cooldowns(self, rows):
         now = time.time()
@@ -508,6 +527,7 @@ class TradingOrchestrator:
                 hard_block=regime.hard_block, risk_multiplier=regime.risk_multiplier,
             )
 
+            self._funnel("analyzed", user_id=user_id, symbol=snapshot.symbol)
             router_kwargs = {"snapshot": snapshot}
             try:
                 router_params = inspect.signature(self.router.evaluate).parameters.values()
@@ -517,21 +537,113 @@ class TradingOrchestrator:
                     router_kwargs["regime_metadata"] = regime_meta
             except (TypeError, ValueError):
                 pass
-            intent = self.router.evaluate(
-                regime, snapshot.candles, decision_id, snapshot.symbol,
-                snapshot.timeframe, snapshot.last, **router_kwargs,
+
+            intent = None
+            strategy_trace = {}
+            supports_armed = (
+                self.armed_entry_enabled
+                and hasattr(self.router, "discover_armed")
+                and hasattr(self.router, "trigger_armed")
+                and bool(getattr(snapshot, "timeframes", None))
             )
-            strategy_trace = getattr(self.router, "last_trace", {}) or {}
+            if supports_armed:
+                armed = self.armed_setups.get(snapshot.symbol)
+                if armed is not None:
+                    status, intent, armed_trace = self.router.trigger_armed(armed, snapshot, decision_id)
+                    strategy_trace = getattr(self.router, "last_trace", {}) or {}
+                    if status == "cancelled":
+                        self.armed_setups.pop(snapshot.symbol, None)
+                        reason = str((armed_trace or {}).get("reason") or "armed_setup_cancelled")
+                        self.last_rejection = reason
+                        self.last_decision[key] = now
+                        self._funnel("armed_cancelled", reason, user_id=user_id, symbol=snapshot.symbol)
+                        self.audit.event(
+                            "SETUP_CANCELLED", decision_id, user_id=user_id,
+                            mode=self.execution_mode, symbol=snapshot.symbol,
+                            setup_id=getattr(armed, "setup_id", None), reason=reason,
+                            trace=armed_trace,
+                        )
+                        return None
+                    if status == "pending":
+                        reason = str((armed_trace or {}).get("reason") or "armed_waiting")
+                        self.last_rejection = reason
+                        self._funnel("armed_pending", reason, user_id=user_id, symbol=snapshot.symbol)
+                        self.audit.event(
+                            "SETUP_PENDING", decision_id, level="DEBUG", persist=False,
+                            user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                            setup_id=getattr(armed, "setup_id", None), reason=reason,
+                            trace=armed_trace,
+                        )
+                        return None
+                    self.armed_setups.pop(snapshot.symbol, None)
+                    self._funnel("triggered", user_id=user_id, symbol=snapshot.symbol)
+                    self.audit.event(
+                        "SETUP_TRIGGERED", decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        setup_id=getattr(armed, "setup_id", None),
+                        strategy=getattr(getattr(intent, "strategy", None), "value", None),
+                        direction=getattr(getattr(intent, "direction", None), "value", None),
+                        trace=armed_trace,
+                    )
+                else:
+                    armed = self.router.discover_armed(
+                        regime, snapshot, snapshot.symbol, snapshot.timeframe,
+                        regime_metadata=regime_meta,
+                    )
+                    strategy_trace = getattr(self.router, "last_trace", {}) or {}
+                    if armed is not None:
+                        self.armed_setups[snapshot.symbol] = armed
+                        self.last_rejection = "setup_armed_waiting_trigger"
+                        self._funnel("armed", user_id=user_id, symbol=snapshot.symbol)
+                        self.audit.event(
+                            "SETUP_ARMED", decision_id, user_id=user_id,
+                            mode=self.execution_mode, symbol=snapshot.symbol,
+                            setup_id=armed.setup_id, strategy=armed.strategy.value,
+                            direction=armed.direction.value, quality=armed.quality,
+                            trigger_price=armed.trigger_price, invalidation_price=armed.invalidation_price,
+                            entry_zone_low=armed.entry_zone_low, entry_zone_high=armed.entry_zone_high,
+                            stop_price=armed.stop_price, target_price=armed.target_price,
+                            expires_at_ms=armed.expires_at_ms,
+                        )
+                        return None
+                    if not self.legacy_entry_fallback_enabled:
+                        armed_trace = strategy_trace.get("armed") if isinstance(strategy_trace, dict) else {}
+                        rejection_reason = str((armed_trace or {}).get("reason") or "no_armable_setup")
+                        self.last_rejection = rejection_reason
+                        self.last_decision[key] = now
+                        self._funnel("strategy_rejected", rejection_reason, user_id=user_id, symbol=snapshot.symbol)
+                        self.audit.event(
+                            "STRATEGY_EVALUATED", decision_id, user_id=user_id,
+                            mode=self.execution_mode, symbol=snapshot.symbol,
+                            regime=regime_meta.get("active"),
+                            selected_direction=None, trace=strategy_trace,
+                        )
+                        self.audit.event(
+                            "SIGNAL_REJECTED", decision_id, user_id=user_id,
+                            mode=self.execution_mode, symbol=snapshot.symbol,
+                            regime=regime_meta.get("active"), reason=rejection_reason,
+                        )
+                        return None
+
+            # Legacy immediate-entry path remains available for tests/custom routers
+            # and can be explicitly enabled in production as a rollback switch.
+            if intent is None:
+                intent = self.router.evaluate(
+                    regime, snapshot.candles, decision_id, snapshot.symbol,
+                    snapshot.timeframe, snapshot.last, **router_kwargs,
+                )
+                strategy_trace = getattr(self.router, "last_trace", {}) or {}
+
             compact_trace = {
                 "selected": strategy_trace.get("selected"),
                 "reason": strategy_trace.get("reason"),
             }
-            for name in ("breakout", "sweep"):
+            for name in ("breakout", "sweep", "armed"):
                 branch = strategy_trace.get(name)
                 if isinstance(branch, dict):
                     compact_trace[name] = {
                         k: branch.get(k)
-                        for k in ("accepted", "reason", "score", "side", "direction")
+                        for k in ("accepted", "reason", "score", "quality", "side", "direction", "status")
                         if k in branch
                     }
             self.audit.event(
@@ -549,7 +661,7 @@ class TradingOrchestrator:
             if not intent:
                 self.last_decision[key] = now
                 rejection_reason = "no_valid_setup"
-                for name in ("breakout", "sweep"):
+                for name in ("breakout", "sweep", "armed"):
                     branch = strategy_trace.get(name)
                     if isinstance(branch, dict) and branch.get("reason") not in (
                         None, "not_run", "regime_breakout_not_allowed",
@@ -558,6 +670,7 @@ class TradingOrchestrator:
                         rejection_reason = str(branch.get("reason"))
                         break
                 self.last_rejection = rejection_reason
+                self._funnel("strategy_rejected", rejection_reason, user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -766,6 +879,7 @@ class TradingOrchestrator:
                 risk_multiplier=intent.risk_multiplier,
             )
             accepted_signal = True
+            self._funnel("signal_accepted", user_id=user_id, symbol=snapshot.symbol)
 
             # -------------------------- RISK STAGE --------------------------
             try:
@@ -793,6 +907,7 @@ class TradingOrchestrator:
             )
 
             if not risk.approved:
+                self._funnel("risk_rejected", str(risk.reason), user_id=user_id, symbol=snapshot.symbol)
                 terminal_event_emitted = True
                 self.last_decision[key] = now
                 self.audit.event(
@@ -810,6 +925,7 @@ class TradingOrchestrator:
                 )
                 return {"accepted": False, "filled": False, "reason": str(risk.reason)}
 
+            self._funnel("risk_approved", user_id=user_id, symbol=snapshot.symbol)
             # ----------------------- EXECUTION STAGE ------------------------
             # No Mongo/Telegram work has run between SIGNAL_ACCEPTED and here.
             try:
@@ -882,6 +998,7 @@ class TradingOrchestrator:
                                'decision_id': decision_id, 'order_id': None, 'created_ms': now_ms}
                 await asyncio.to_thread(self.db.upsert, 'execution_pending', {'user_id': user_id}, reservation)
                 self.pending_execution = {**reservation, 'created_monotonic': time.monotonic()}
+            self._funnel("submitted", user_id=user_id, symbol=snapshot.symbol)
             try:
                 result = self.execution.submit(
                     intent,
@@ -924,6 +1041,7 @@ class TradingOrchestrator:
 
             if not result.get("filled"):
                 reason = str(result.get("reason") or "not_filled")
+                self._funnel("execution_rejected", reason, user_id=user_id, symbol=snapshot.symbol)
                 pending = bool(result.get("accepted"))
                 event = "EXECUTION_PENDING" if pending else "EXECUTION_REJECTED"
                 terminal_event_emitted = True
@@ -1026,6 +1144,7 @@ class TradingOrchestrator:
             if persisted and self.execution_mode == 'live':
                 await self._clear_pending(user_id)
             self.last_rejection = None
+            self._funnel("filled", user_id=user_id, symbol=snapshot.symbol)
             terminal_event_emitted = True
             self.last_decision[key] = now
             self.audit.event(

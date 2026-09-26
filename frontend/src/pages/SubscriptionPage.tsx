@@ -19,12 +19,26 @@ export default function SubscriptionPage({user,onBack}:{user:User;onBack:()=>voi
 
   const load=async()=>{
     setError('');
-    try{
-      const [p,e,o]=await Promise.all([api.billingPlans(),api.entitlement(),api.billingOrders()]);
-      setPlans(p.plans);setEntitlement(e);setOrders(o.items);
-      const active=o.items.find(x=>['AWAITING_PAYMENT','VERIFYING','INVALID'].includes(String(x.status||'')));
-      if(active)setOrder(active);
-    }catch(e){setError(humanizeError(e))}
+    const results=await Promise.allSettled([api.billingPlans(),api.entitlement(),api.billingOrders()]);
+    const failures:string[]=[];
+
+    const plansResult=results[0];
+    if(plansResult.status==='fulfilled')setPlans(plansResult.value.plans);
+    else failures.push(`planes: ${humanizeError(plansResult.reason)}`);
+
+    const entitlementResult=results[1];
+    if(entitlementResult.status==='fulfilled')setEntitlement(entitlementResult.value);
+    else failures.push(`estado LIVE: ${humanizeError(entitlementResult.reason)}`);
+
+    const ordersResult=results[2];
+    if(ordersResult.status==='fulfilled'){
+      setOrders(ordersResult.value.items);
+      const active=ordersResult.value.items.find(x=>['AWAITING_PAYMENT','VERIFYING','INVALID'].includes(String(x.status||'')));
+      setOrder(active||null);
+      if(active?.tx_hash)setTxHash(String(active.tx_hash));
+    }else failures.push(`historial: ${humanizeError(ordersResult.reason)}`);
+
+    if(failures.length)setError(failures.join(' · '));
   };
   useEffect(()=>{load()},[]);
 
@@ -47,7 +61,10 @@ export default function SubscriptionPage({user,onBack}:{user:User;onBack:()=>voi
       await api.submitBillingTx(activeOrder.payment_order_id,txHash.trim());
       const r=await api.verifyBillingPayment(activeOrder.payment_order_id,txHash.trim());
       setNotice(`Pago confirmado. LIVE activo hasta ${date(r.live_expires_at)}.`);setOrder(null);setTxHash('');await load();
-    }catch(e){setError(humanizeError(e))}finally{setBusy('')}
+    }catch(e){
+      setError(humanizeError(e));
+      await load();
+    }finally{setBusy('')}
   }
 
   return <div className="subscription-shell">

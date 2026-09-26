@@ -370,3 +370,55 @@ VALIDACIÓN DE ESTE AJUSTE:
 pytest -q -> 189 passed
 python -m compileall -q app scripts -> sin errores
 Frontend build local -> no validado: npm ci quedó incompleto por timeout del entorno y faltaron type definitions; no se atribuye al cambio de código.
+
+============================================================
+FASE: OPERATIVA MANUAL DEMO + LIVE (sobre v6 winrate validation)
+============================================================
+
+BASE COMPARADA: KaeleonX-v6-winrate-validation.zip
+
+ARCHIVOS MODIFICADOS (16):
+1. .env.example
+2. ARCHIVOS_TOCADOS.txt
+3. app/api/user_api.py
+4. app/coinw/executor.py
+5. app/coinw/orders.py
+6. app/config/settings.py
+7. app/models/trading.py
+8. app/orchestrator.py
+9. app/position/manager.py
+10. app/storage/database.py
+11. app/trading/runtime.py
+12. frontend/src/components/trading/LiveMarketChart.tsx
+13. frontend/src/lib/api.ts
+14. frontend/src/pages/DashboardPage.tsx
+15. frontend/src/styles.css
+16. frontend/src/types.ts
+
+ARCHIVOS NUEVOS (4):
+1. KAELEON_MANUAL_TRADING.md
+2. app/trading/manual.py
+3. frontend/src/components/trading/TradingTerminal.tsx
+4. tests/test_manual_trading_terminal.py
+
+ARCHIVOS ELIMINADOS: 0
+
+Objetivo de esta fase:
+- Operativa manual DEMO/LIVE desde el mismo gráfico KAELEON.
+- MARKET/LIMIT, LONG/SHORT, margen, leverage, TP/SL.
+- Posiciones, órdenes abiertas, historial, cancelación, cierre y edición TP/SL.
+- DEMO completamente aislado de órdenes privadas CoinW.
+- LIVE con confirmación explícita, API privada CoinW y reconciliación de fill.
+- Idempotencia financiera previa al submit para evitar órdenes duplicadas.
+- source=MANUAL separado de source=BOT.
+- Historial de trades manuales separado de auditoría de órdenes.
+- Las LIMIT DEMO pendientes reservan margen también frente al bot automático.
+- Si CoinW acepta pero se pierde la respuesta HTTP, se recupera por thirdOrderId; nunca se reenvía a ciegas.
+- Los fills LIVE se vinculan al openId exacto de CoinW cuando está disponible.
+- Si CoinW no confirma TP/SL tras un fill LIVE, KAELEON lo muestra como protección no confirmada.
+
+VALIDACIÓN DE ESTA FASE:
+- pytest -q -> 196 passed
+- python -m compileall -q app scripts -> sin errores
+- Transpilación sintáctica TypeScript/TSX de los 5 archivos frontend tocados principales -> sin errores
+- Build frontend completo -> no validado en este entorno: npm ci no terminó dentro del tiempo disponible. No se atribuye ese timeout al código.

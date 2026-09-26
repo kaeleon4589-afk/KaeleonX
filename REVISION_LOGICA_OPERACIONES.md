@@ -150,3 +150,17 @@ Protecciones añadidas:
 - telemetría de nivel estructural, edad del breakout, barras de retest, extensión y porcentaje de impulso consumido.
 
 El objetivo es impedir entradas tardías en la segunda/tercera vela de un rebote ya desarrollado, como el caso CC observado en DEMO.
+
+## Corrección BREAKOUT_RETEST v5 — Exhaustion guard + stop floor
+
+Motivo: operación ENA LONG observada cerca del máximo de 24h después de un movimiento vertical. La versión v4 validaba un breakout/retest local de 5m, pero no rechazaba un mercado ya exhausto en 1h/15m y permitía stops estructurales demasiado cercanos al ruido de 5m.
+
+Cambios:
+- Veto simétrico de agotamiento HTF usando las últimas 24 velas de 1h.
+- Rechazo de LONG cerca del extremo superior tras avance fuerte; espejo para SHORT.
+- Confirmación adicional de extensión contra EMA20 en 1h y 15m.
+- Retest debe tener profundidad mínima real, no una pausa microscópica.
+- Stop estructural de BREAKOUT_RETEST debe quedar al menos a 0.95 ATR(5m) de la entrada; si no, se descarta el setup en vez de ensancharlo artificialmente.
+- Guardia genérica de ejecución sube de 0.55 ATR a 0.90 ATR.
+- Telemetría: 24h move, posición en rango 24h, extensión EMA20 1h/15m, profundidad del retest y stop en ATR.
+- Identificador del modelo: structural_breakout_retest_fresh_confirmation_v5.

@@ -284,3 +284,19 @@ tests/test_billing_payment_flow_hardening.py
 
 NUEVOS: ninguno
 ELIMINADOS: ninguno
+
+CORRECCIÓN — BREAKOUT_RETEST v5: agotamiento HTF y SL fuera del ruido
+BASE: KaeleonX-fix-orden-nueva-billing.zip
+
+MODIFICADOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+REVISION_LOGICA_OPERACIONES.md
+app/config/settings.py
+app/strategy/breakout_retest.py
+tests/test_directional_symmetry.py
+
+NUEVO:
+tests/test_breakout_exhaustion_v5.py
+
+ELIMINADOS: ninguno

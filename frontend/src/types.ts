@@ -161,6 +161,13 @@ export type PaymentOrder = {
   created_at?: string;
   expires_at?: string;
   tx_hash?: string | null;
+  submitted_at?: string | null;
+  verified_at?: string | null;
+  confirmed_at?: string | null;
+  verification_reason?: string | null;
+  verified_block_number?: number | null;
+  cancellation_reason?: string | null;
+  reused_existing?: boolean;
 };
 
 export type ActivityEvent = {

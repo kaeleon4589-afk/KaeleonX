@@ -210,7 +210,22 @@ class UserTradingRuntimeManager:
                 timeout_seconds=self.settings.trade_persist_timeout_seconds,
                 retries=self.settings.trade_persist_retries,
             ),
+            post_loss_global_cooldown_seconds=self.settings.trade_post_loss_global_cooldown_seconds,
+            post_loss_symbol_cooldown_seconds=self.settings.trade_post_loss_symbol_cooldown_seconds,
+            entry_max_chase_atr=self.settings.trade_entry_max_chase_atr,
+            entry_max_adverse_reversal_atr=self.settings.trade_entry_max_adverse_reversal_atr,
+            entry_min_stop_atr=self.settings.trade_entry_min_stop_atr,
+            entry_min_stop_spreads=self.settings.trade_entry_min_stop_spreads,
+            entry_orderbook_conflict_threshold=self.settings.trade_entry_orderbook_conflict_threshold,
         )
+        orchestrator.seed_loss_cooldowns(persisted_positions)
+        # DEMO closes locally inside PositionManager; register the loss cooldown
+        # before notifying so the next scanner cycle cannot immediately re-enter.
+        def on_runtime_position_closed(position):
+            orchestrator.register_closed_position(position)
+            self.notifier.position_closed(user_id, mode, position)
+
+        position_manager.on_closed = on_runtime_position_closed
         orchestrator.entry_guard = self.entry_guard
         position_manager.persistence = orchestrator.persistence
         pending = await asyncio.to_thread(self.db.find_one, "execution_pending", {"user_id": user_id, "active": True})

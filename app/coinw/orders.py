@@ -23,6 +23,25 @@ class CoinWOrdersAPI:
             private=True,
         )
 
+    async def history(self, instrument: str, position_type: str = "execute", *, page: int = 1, page_size: int = 50):
+        """Executed orders from CoinW's 7-day history.
+
+        CoinW's current-order lookup is documented for unfulfilled orders, so
+        an order can disappear from that endpoint exactly when it fills.  The
+        historical endpoint carries both ``thirdOrderId`` and ``openId`` and is
+        therefore the authoritative bridge from our idempotency key to the
+        resulting position.
+        """
+        params = {
+            "instrument": instrument,
+            "originType": position_type,
+            "page": max(1, int(page)),
+            "pageSize": max(1, min(100, int(page_size))),
+        }
+        return await self.client.request(
+            "GET", "/v1/perpum/orders/history", params, private=True
+        )
+
     async def cancel(self, order_ids):
         ids = ",".join(map(str, order_ids)) if not isinstance(order_ids, str) else order_ids
         return await self.client.request(

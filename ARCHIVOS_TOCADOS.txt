@@ -252,3 +252,23 @@ NUEVO:
 tests/test_fresh_breakout_retest.py
 
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — Billing idempotente + verificación BSC robusta
+BASE COMPARADA: KaeleonX-breakout-retest-fresco-v4.zip
+
+MODIFICADOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+app/api/billing_api.py
+app/billing/service.py
+app/config/settings.py
+app/storage/database.py
+frontend/src/lib/api.ts
+frontend/src/pages/SubscriptionPage.tsx
+frontend/src/types.ts
+
+NUEVOS:
+tests/test_billing_api_serialization.py
+tests/test_billing_payment_flow_hardening.py
+
+ELIMINADOS: ninguno

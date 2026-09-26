@@ -60,7 +60,7 @@ def test_breakout_keeps_structural_stop_and_rejects_weak_target(monkeypatch):
                 'ema20':[99.5]*count,'ema50':[99.0]*count}
     monkeypatch.setattr(breakout, '_tf_values', tf)
     monkeypatch.setattr(breakout, '_bias', lambda *a, **k: ('long', {'adx':30.0,'stack_spread':.001}))
-    monkeypatch.setattr(breakout, '_trigger', lambda *a, **k: (True, 'OK', {'extension_atr':0.0}))
+    monkeypatch.setattr(breakout, '_trigger', lambda *a, **k: (True, 'OK', {'extension_atr':0.0,'retest_extreme':99.0,'structural_level':99.5,'retest_bars':1,'structure_extension_atr':0.2}))
     regime = SimpleNamespace(hard_block=False, breakout_allowed=True)
     frames = {'5m':[object()]*260,'15m':[object()]*200,'1h':[object()]*200}
     strategy = breakout.BreakoutRetestStrategy()

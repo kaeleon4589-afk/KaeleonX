@@ -26,26 +26,70 @@ def _trend_candles(*, direction: str, n: int = 300, start: float = 150.0, step: 
 
 def _breakout_setup(direction: str):
     sign = 1.0 if direction == "long" else -1.0
-    base = _trend_candles(direction=direction, n=254, start=70.0 if sign > 0 else 150.0, step=0.12)
-    candles = list(base)
-    price = candles[-1].close
-    pullback = 0.30
+    start_price = 60.0 if sign > 0 else 120.0
+    candles = []
+    price = start_price
 
-    # Five-bar reset back toward EMA20, mirrored for LONG and SHORT.
-    for index in range(5):
+    # Dominant trend first, then a tight 5m consolidation so EMA20 can catch up.
+    for _ in range(235):
         open_price = price
-        close_price = price - sign * pullback
-        high = max(open_price, close_price) + 0.05
-        low = min(open_price, close_price) - 0.05
-        candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1600 + index))
+        close_price = price + sign * 0.08
+        high = max(open_price, close_price) + 0.03
+        low = min(open_price, close_price) - 0.03
+        candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1000 + len(candles)))
+        price = close_price
+    for idx in range(22):
+        open_price = price
+        close_price = price + sign * 0.004
+        high = max(open_price, close_price) + 0.045
+        low = min(open_price, close_price) - 0.045
+        candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 900 + idx))
         price = close_price
 
-    # Continuation candle resumes the dominant trend.
-    open_price = price
-    close_price = price + sign * pullback * 1.8
-    high = max(open_price, close_price) + (0.08 if sign > 0 else 0.05)
-    low = min(open_price, close_price) - (0.05 if sign > 0 else 0.08)
-    candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1700))
+    level = max(x.high for x in candles[-20:]) if sign > 0 else min(x.low for x in candles[-20:])
+    atr_ref = 0.105
+
+    # 1) Structural breakout by close.
+    if sign > 0:
+        open_price = price
+        close_price = level + atr_ref * 0.18
+        high = close_price + atr_ref * 0.06
+        low = open_price - atr_ref * 0.03
+    else:
+        open_price = price
+        close_price = level - atr_ref * 0.18
+        low = close_price - atr_ref * 0.06
+        high = open_price + atr_ref * 0.03
+    candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1600))
+    price = close_price
+
+    # 2) Retest the broken structural level without invalidating it.
+    if sign > 0:
+        open_price = price
+        low = level - atr_ref * 0.06
+        close_price = level + atr_ref * 0.04
+        high = max(open_price, close_price) + atr_ref * 0.02
+    else:
+        open_price = price
+        high = level + atr_ref * 0.06
+        close_price = level - atr_ref * 0.04
+        low = min(open_price, close_price) - atr_ref * 0.02
+    candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1100))
+    price = close_price
+
+    # 3) Immediate fresh re-acceleration; this is the entry signal candle.
+    previous = candles[-1]
+    if sign > 0:
+        open_price = price
+        close_price = max(previous.high + atr_ref * 0.03, level + atr_ref * 0.32)
+        high = close_price + atr_ref * 0.05
+        low = open_price - atr_ref * 0.02
+    else:
+        open_price = price
+        close_price = min(previous.low - atr_ref * 0.03, level - atr_ref * 0.32)
+        low = close_price - atr_ref * 0.05
+        high = open_price + atr_ref * 0.02
+    candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1500))
     return candles
 
 
@@ -99,8 +143,8 @@ def test_bearish_market_features_classify_as_trend_with_short_bias():
 )
 def test_breakout_retest_emits_the_correct_direction_for_mirrored_valid_setups(side, expected):
     candles_5m = _breakout_setup(side)
-    candles_15m = _trend_candles(direction=side, n=300, start=50.0 if side == "long" else 200.0, step=0.15)
-    candles_1h = _trend_candles(direction=side, n=300, start=30.0 if side == "long" else 300.0, step=0.20)
+    candles_15m = _trend_candles(direction=side, n=300, start=50.0 if side == "long" else 140.0, step=0.15)
+    candles_1h = _trend_candles(direction=side, n=300, start=30.0 if side == "long" else 160.0, step=0.20)
     regime_direction = Direction.BULLISH if side == "long" else Direction.BEARISH
     regime = RegimeResult(
         RegimeState.TRENDING,

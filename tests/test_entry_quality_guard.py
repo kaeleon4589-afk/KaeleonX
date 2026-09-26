@@ -19,7 +19,7 @@ def _intent(direction=Direction.LONG, *, entry=100.0, stop=99.0, target=102.0, a
 
 
 def test_breakout_requires_close_confirmation_not_only_wick_break():
-    count = 210
+    count = 260
     o = [100.0] * count
     h = [100.7] * count
     l = [99.0] * count
@@ -39,9 +39,9 @@ def test_breakout_requires_close_confirmation_not_only_wick_break():
     }
     ok, reason, diag = breakout._trigger('long', tf)
     assert ok is False
-    assert reason == 'NO_5M_CONTINUATION_CONFIRM'
+    assert reason in {'NO_FRESH_CONFIRMATION', 'NO_FRESH_BREAKOUT_RETEST'}
     assert h[-1] > h[-2]  # wick did break the prior high
-    assert c[-1] < h[-2] + breakout.BREAKOUT_CONFIRM_BUFFER_ATR
+    assert c[-1] < h[-2] + breakout.BREAKOUT_CLOSE_BUFFER_ATR
     assert diag['trigger_body_ratio'] >= 0
 
 
@@ -50,7 +50,9 @@ def test_strategy_entry_thresholds_are_no_longer_permissive_defaults():
     assert breakout.H1_ADX_MIN >= 16
     assert breakout.M15_ADX_MIN >= 14
     assert breakout.M5_ADX_MIN >= 12
-    assert breakout.TRIGGER_MAX_EMA20_EXTENSION_ATR <= 0.70
+    assert breakout.ENTRY_MAX_STRUCTURE_EXTENSION_ATR <= 0.75
+    assert breakout.MAX_IMPULSE_CONSUMED_RATIO <= 0.45
+    assert breakout.RETEST_MAX_BARS_AFTER_BREAKOUT <= 3
     assert sweep.MIN_SCORE >= 78
     assert sweep.MIN_RR >= 1.05
     assert sweep.TRIGGER_EXTENSION_MAX_ATR <= 1.10

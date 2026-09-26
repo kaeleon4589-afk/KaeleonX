@@ -6,7 +6,7 @@ import type { BillingPlan, Entitlement, PaymentOrder, User } from '../types';
 const money=(n:unknown)=>`${Number(n||0).toFixed(2)} USDT`;
 const date=(v:unknown)=>{if(!v)return '—';const d=new Date(String(v));return Number.isNaN(d.getTime())?'—':new Intl.DateTimeFormat('es-MX',{dateStyle:'medium',timeStyle:'short'}).format(d)};
 const TX_HASH_RE=/^0x[0-9a-fA-F]{64}$/;
-const ACTIVE_STATUSES=new Set(['AWAITING_PAYMENT','VERIFYING','INVALID']);
+const ACTIVE_STATUSES=new Set(['AWAITING_PAYMENT','VERIFYING']);
 
 function paymentReason(reason?:string|null){
   if(!reason)return '';
@@ -81,6 +81,14 @@ export default function SubscriptionPage({user,onBack}:{user:User;onBack:()=>voi
       setOrders(prev=>[o,...prev.filter(x=>x.payment_order_id!==o.payment_order_id)]);
       setTxHash(o.tx_hash?String(o.tx_hash):'');
       setNotice(o.reused_existing?'Ya existía una orden activa; se recuperó la misma orden sin crear un duplicado.':'Orden creada. Envía exactamente el importe indicado y luego pega el hash completo de la transacción.');
+      // Releer el historial después de crear la orden evita que la UI conserve una
+      // orden INVALID antigua en memoria. La tarjeta activa debe ser exactamente
+      // la orden que acaba de devolver el backend.
+      const refreshed=await api.billingOrders();
+      setOrders(refreshed.items);
+      const exact=refreshed.items.find(x=>x.payment_order_id===o.payment_order_id) || o;
+      setOrder(ACTIVE_STATUSES.has(String(exact.status||''))?exact:o);
+      setTxHash(exact.tx_hash?String(exact.tx_hash):'');
     }catch(e){setError(humanizeError(e))}finally{setBusy('')}
   }
 

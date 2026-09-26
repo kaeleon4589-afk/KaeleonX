@@ -23,7 +23,7 @@ def test_create_payment_order_is_idempotent_while_one_is_active():
     assert len(rows) == 1
 
 
-def test_reconcile_prefers_paid_hash_and_cancels_duplicate_no_hash_orders():
+def test_reconcile_keeps_awaiting_order_active_and_releases_invalid_order_slot():
     db = Database(); seed_user(db)
     svc = BillingService(db)
     now = datetime.now(timezone.utc)
@@ -31,17 +31,21 @@ def test_reconcile_prefers_paid_hash_and_cancels_duplicate_no_hash_orders():
         'payment_order_id': 'PAY-A', 'user_id': 'u1', 'plan_code': '15D', 'duration_days': 15,
         'amount_usdt': '5', 'network': 'BNB_SMART_CHAIN', 'destination_wallet': '0x' + '1' * 40,
         'status': 'AWAITING_PAYMENT', 'created_at': now, 'expires_at': now + timedelta(minutes=30), 'tx_hash': None,
+        'active_order_key': 'u1',
     })
     db.write('payment_orders', {
         'payment_order_id': 'PAY-B', 'user_id': 'u1', 'plan_code': '15D', 'duration_days': 15,
         'amount_usdt': '5', 'network': 'BNB_SMART_CHAIN', 'destination_wallet': '0x' + '1' * 40,
         'status': 'INVALID', 'created_at': now + timedelta(seconds=1), 'expires_at': now + timedelta(minutes=30),
         'tx_hash': '0x' + 'a' * 64, 'submitted_at': now + timedelta(seconds=2),
+        'active_order_key': 'u1',
     })
 
     active = svc.reconcile_payment_orders('u1', now + timedelta(seconds=3))
-    assert active['payment_order_id'] == 'PAY-B'
-    assert db.find_one('payment_orders', {'payment_order_id': 'PAY-A'})['status'] == 'CANCELLED_DUPLICATE'
+    assert active['payment_order_id'] == 'PAY-A'
+    invalid = db.find_one('payment_orders', {'payment_order_id': 'PAY-B'})
+    assert invalid['status'] == 'INVALID'
+    assert invalid.get('active_order_key') is None
 
 
 def test_tx_hash_must_be_full_32_byte_evm_hash():
@@ -176,3 +180,46 @@ def test_invalid_order_with_hash_keeps_reverify_grace_after_expiry():
     updated = svc.submit_tx_hash('u1', order['payment_order_id'], corrected)
     assert updated['status'] == 'VERIFYING'
     assert updated['tx_hash'] == corrected
+
+
+def test_invalid_order_releases_slot_and_new_order_is_created():
+    db = Database()
+    user_id = "user-invalid-new-order"
+    db.write("users", {"user_id": user_id, "phone": "+15550000001"})
+    billing = BillingService(db)
+
+    first = billing.create_payment_order(user_id, "15D", "0xreceiver")
+    db.upsert("payment_orders", {"payment_order_id": first["payment_order_id"]}, {
+        "status": "INVALID",
+        "verification_reason": "amount_or_destination_mismatch",
+        "active_order_key": user_id,
+        "tx_hash": "0x" + "a" * 64,
+    })
+
+    second = billing.create_payment_order(user_id, "15D", "0xreceiver")
+    assert second["payment_order_id"] != first["payment_order_id"]
+    assert second["status"] == "AWAITING_PAYMENT"
+    assert not second.get("reused_existing", False)
+
+    old = db.find_one("payment_orders", {"payment_order_id": first["payment_order_id"]})
+    assert old["status"] == "INVALID"
+    assert old.get("active_order_key") is None
+
+
+def test_verifying_order_still_blocks_duplicate_creation():
+    db = Database()
+    user_id = "user-verifying-reuse"
+    db.write("users", {"user_id": user_id, "phone": "+15550000002"})
+    billing = BillingService(db)
+
+    first = billing.create_payment_order(user_id, "15D", "0xreceiver")
+    db.upsert("payment_orders", {"payment_order_id": first["payment_order_id"]}, {
+        "status": "VERIFYING",
+        "active_order_key": user_id,
+        "tx_hash": "0x" + "b" * 64,
+        "submitted_at": datetime.now(timezone.utc),
+    })
+
+    second = billing.create_payment_order(user_id, "15D", "0xreceiver")
+    assert second["payment_order_id"] == first["payment_order_id"]
+    assert second.get("reused_existing") is True

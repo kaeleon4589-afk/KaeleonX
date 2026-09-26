@@ -71,6 +71,9 @@ class Database:
     def ensure_indexes(self):
         self.db.decisions.create_index([('decision_id', ASCENDING)], unique=True)
         self.db.orders.create_index([('order_id', ASCENDING)])
+        self.db.manual_orders.create_index([('manual_order_id', ASCENDING)], unique=True)
+        self.db.manual_orders.create_index([('user_id', ASCENDING), ('client_order_id', ASCENDING)], unique=True)
+        self.db.manual_orders.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('status', ASCENDING)])
         self.db.positions.create_index([('position_id', ASCENDING)], unique=True)
         self.db.positions.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('status', ASCENDING)])
         self.db.pnl.create_index([('position_id', ASCENDING)])

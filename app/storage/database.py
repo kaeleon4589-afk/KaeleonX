@@ -91,6 +91,14 @@ class Database:
         self.db.payment_orders.create_index([('payment_order_id', ASCENDING)], unique=True)
         self.db.payment_orders.create_index([('tx_hash', ASCENDING)], sparse=True)
         self.db.payment_orders.create_index([('user_id', ASCENDING), ('created_at', DESCENDING)])
+        # Only one active payment order is allowed per user. Older documents do not
+        # contain this field, so this partial index can be added safely during rollout.
+        self.db.payment_orders.create_index(
+            [('active_order_key', ASCENDING)],
+            unique=True,
+            partialFilterExpression={'active_order_key': {'$type': 'string'}},
+            name='uniq_active_payment_order_per_user',
+        )
         self.db.registration_challenges.create_index([('challenge_hash', ASCENDING)], unique=True)
         self.db.telegram_verifications.create_index([('challenge_hash', ASCENDING)], unique=True)
         self.db.telegram_bot_sessions.create_index([('chat_id', ASCENDING)], unique=True)

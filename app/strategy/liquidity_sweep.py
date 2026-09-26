@@ -3,8 +3,8 @@ from __future__ import annotations
 from app.models.enums import Direction, Strategy
 from app.models.trading import TradeIntent
 from app.position.protection import (
-    break_even_activation_ratio, front_run_target,
-    profit_lock_activation_ratio, profit_lock_capture_ratio,
+    break_even_activation_ratio, cap_target_by_rr, front_run_target,
+    liquidity_sweep_target_rr, profit_lock_activation_ratio, profit_lock_capture_ratio,
 )
 from app.strategy.source_math import atr, candle_quality, clamp, ema, extract, relative_volume
 
@@ -246,6 +246,8 @@ class LiquiditySweepStrategy:
         structural_tp_pct = abs(target_level - close5) / max(close5, 1e-12) if target_level > 0 else 0.0
         stop = structural_stop
         target, target_ratio = front_run_target(close5, target_level, direction)
+        target_rr_cap = liquidity_sweep_target_rr()
+        target, target_capped = cap_target_by_rr(close5, stop, target, direction, target_rr_cap)
         tp_pct = abs(target - close5) / max(close5, 1e-12)
         execution_rr = tp_pct / sl_pct
         if target <= 0 or execution_rr < MIN_RR:
@@ -278,6 +280,8 @@ class LiquiditySweepStrategy:
             "target": target,
             "structural_target": target_level,
             "target_front_run_ratio": target_ratio,
+            "target_rr_cap": target_rr_cap,
+            "target_rr_capped": target_capped,
         }
         return TradeIntent(
             decision_id,
@@ -309,6 +313,8 @@ class LiquiditySweepStrategy:
                 "structural_tp_pct": structural_tp_pct,
                 "structural_target_price": target_level,
                 "target_front_run_ratio": target_ratio,
+                "target_rr_cap": target_rr_cap,
+                "target_rr_capped": target_capped,
                 "execution_rr": execution_rr,
                 "rr_estimate": candidate["rr_estimate"],
                 "sl_pct": sl_pct,

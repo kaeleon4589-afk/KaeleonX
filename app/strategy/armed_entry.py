@@ -8,7 +8,10 @@ from app.models.enums import Direction, Strategy
 from app.models.trading import ArmedSetup, TradeIntent
 from app.position.protection import (
     break_even_activation_ratio,
+    breakout_retest_target_rr,
+    cap_target_by_rr,
     front_run_target,
+    liquidity_sweep_target_rr,
     profit_lock_activation_ratio,
     profit_lock_capture_ratio,
 )
@@ -268,6 +271,8 @@ class ArmedEntryEngine:
 
             structural_target = breakout._structure_target(direction, trigger, h, l, tf15["h"], tf15["l"])
             target, target_ratio = front_run_target(trigger, structural_target, direction)
+            target_rr_cap = breakout_retest_target_rr()
+            target, target_capped = cap_target_by_rr(trigger, stop, target, direction, target_rr_cap)
             rr = abs(target - trigger) / max(abs(trigger - stop), 1e-12)
             if target <= 0 or rr < ARM_MIN_RR:
                 continue
@@ -311,6 +316,8 @@ class ArmedEntryEngine:
                     "breakout_age_bars": int(retest_count),
                     "structural_target_price": float(structural_target),
                     "target_front_run_ratio": float(target_ratio),
+                    "target_rr_cap": float(target_rr_cap),
+                    "target_rr_capped": bool(target_capped),
                     "structural_rr_estimate": float(rr),
                     "stop_atr_5m": float(stop_atr),
                     "regime": self._active_regime(regime_metadata),
@@ -391,6 +398,8 @@ class ArmedEntryEngine:
                 if not ARM_MIN_STOP_ATR <= stop_atr <= ARM_MAX_STOP_ATR:
                     continue
                 target, target_ratio = front_run_target(trigger, target_level, direction)
+                target_rr_cap = liquidity_sweep_target_rr()
+                target, target_capped = cap_target_by_rr(trigger, stop, target, direction, target_rr_cap)
                 rr = abs(target - trigger) / max(abs(trigger - stop), 1e-12)
                 if target <= 0 or rr < ARM_MIN_RR:
                     continue
@@ -433,6 +442,8 @@ class ArmedEntryEngine:
                         "bars_since_sweep": int(age),
                         "structural_target_price": float(target_level),
                         "target_front_run_ratio": float(target_ratio),
+                        "target_rr_cap": float(target_rr_cap),
+                        "target_rr_capped": bool(target_capped),
                         "structural_rr_estimate": float(rr),
                         "stop_atr_5m": float(stop_atr),
                         "regime": self._active_regime(regime_metadata),
@@ -504,6 +515,14 @@ class ArmedEntryEngine:
         executable = float(diag["price"])
         target = float(setup.target_price)
         stop = float(setup.stop_price)
+        target_rr_cap = (
+            liquidity_sweep_target_rr()
+            if setup.strategy == Strategy.LIQUIDITY_SWEEP
+            else breakout_retest_target_rr()
+        )
+        target, trigger_target_capped = cap_target_by_rr(
+            executable, stop, target, setup.direction, target_rr_cap
+        )
         geometry = (
             setup.direction == Direction.LONG and stop < executable < target
         ) or (
@@ -529,6 +548,8 @@ class ArmedEntryEngine:
             "entry_zone_low": setup.entry_zone_low,
             "entry_zone_high": setup.entry_zone_high,
             "micro_confirmation": diag,
+            "target_rr_cap": target_rr_cap,
+            "target_rr_capped_at_trigger": trigger_target_capped,
         }
         intent = TradeIntent(
             decision_id=decision_id,

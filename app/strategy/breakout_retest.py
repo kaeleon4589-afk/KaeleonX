@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.models.enums import Direction, Strategy
 from app.models.trading import TradeIntent
 from app.position.protection import (
-    break_even_activation_ratio, front_run_target,
+    break_even_activation_ratio, breakout_retest_target_rr, cap_target_by_rr, front_run_target,
     profit_lock_activation_ratio, profit_lock_capture_ratio,
 )
 from app.strategy.source_math import adx, atr, candle_quality, clamp, ema, extract, pct_change, relative_volume
@@ -493,6 +493,8 @@ class BreakoutRetestStrategy:
             )
 
         target, target_ratio = front_run_target(close5, structural_target, direction)
+        target_rr_cap = breakout_retest_target_rr()
+        target, target_capped = cap_target_by_rr(close5, stop, target, direction, target_rr_cap)
         structural_tp_pct = abs(structural_target - close5) / close5
         tp_pct = abs(target - close5) / close5
         execution_rr = tp_pct / sl_pct
@@ -523,6 +525,8 @@ class BreakoutRetestStrategy:
             "structural_target": structural_target,
             "structural_level": structural_level,
             "target_front_run_ratio": target_ratio,
+            "target_rr_cap": target_rr_cap,
+            "target_rr_capped": target_capped,
             "execution_rr": execution_rr,
             "structural_stop_pct": structural_pct,
             "trigger_body_ratio": trigger_diag.get("trigger_body_ratio"),
@@ -575,6 +579,8 @@ class BreakoutRetestStrategy:
                 "structural_tp_pct": structural_tp_pct,
                 "structural_target_price": structural_target,
                 "target_front_run_ratio": target_ratio,
+                "target_rr_cap": target_rr_cap,
+                "target_rr_capped": target_capped,
                 "execution_rr": execution_rr,
                 "structural_stop_pct": structural_pct,
                 "partial_tp_enabled": False,

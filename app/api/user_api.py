@@ -14,6 +14,7 @@ from app.trading.profile import UserTradingProfileService
 from app.trading.metrics import calculate_performance
 from app.trading.statistics import TradingStatistics
 from app.trading.metrics import position_net_pnl
+from app.trading.manual import ManualTradingService, ManualTradingError
 from app.referrals import new_referral_code
 
 router = APIRouter(prefix="/user", tags=["user"])
@@ -21,6 +22,7 @@ _db = None
 _auth = None
 _profiles = None
 _billing = None
+_manual = None
 
 
 def deps():
@@ -44,6 +46,14 @@ def deps():
     if _billing is None:
         _billing = BillingService(_db, trial_days=s.live_trial_days)
     return _db, _auth, _profiles, _billing
+
+
+def manual_service():
+    global _manual
+    db, _, profiles, billing = deps()
+    if _manual is None:
+        _manual = ManualTradingService(get_settings(), db, profiles, billing)
+    return _manual
 
 
 def current(authorization):
@@ -263,8 +273,10 @@ def operations(authorization: str | None = Header(default=None)):
     uid = user["user_id"]
     mode = profiles.public(uid).execution_mode
     query = {"user_id": uid, "mode": mode}
-    opened = db.find_many('positions', {**query, 'status': 'OPEN'}, limit=0, sort_field='opened_at')
-    closed = db.find_many('positions', {**query, 'status': 'CLOSED'}, limit=50, sort_field='closed_at')
+    opened = [p for p in db.find_many('positions', {**query, 'status': 'OPEN'}, limit=0, sort_field='opened_at')
+              if str(p.get('source') or 'BOT').upper() != 'MANUAL']
+    closed = [p for p in db.find_many('positions', {**query, 'status': 'CLOSED'}, limit=0, sort_field='closed_at')
+              if str(p.get('source') or 'BOT').upper() != 'MANUAL'][:50]
     if (TradingStatistics(db).current_period(mode) or {}).get('global_reset'):
         closed = TradingStatistics(db).active_positions(mode, closed)
     return {
@@ -283,7 +295,8 @@ def performance(authorization: str | None = Header(default=None)):
     mode = profile.execution_mode
     state = db.find_one("user_engine_state", {"user_id": uid, "mode": mode.upper()}) or {}
     capital = profiles.demo_account.opening_balance(uid) if mode == "demo" else float(profile.operating_capital)
-    positions = db.find_many("positions", {"user_id": uid, "mode": mode}, limit=0)
+    positions = [p for p in db.find_many("positions", {"user_id": uid, "mode": mode}, limit=0)
+                 if str(p.get('source') or 'BOT').upper() != 'MANUAL']
     period = TradingStatistics(db).current_period(mode)
     if period and period.get('global_reset'):
         positions = TradingStatistics(db).active_positions(mode, positions)
@@ -298,7 +311,9 @@ def performance(authorization: str | None = Header(default=None)):
         "capital": capital,
         "configured_capital": profile.operating_capital,
         **metrics,
-        "current_capital": profile.demo_available_equity if mode == "demo" else (
+        # Strategy performance deliberately excludes MANUAL trades. The terminal
+        # account bar is the source for real wallet equity; this metric remains BOT-only.
+        "current_capital": metrics['current_capital'] if mode == "demo" else (
             profile.coinw_available_equity if period and period.get('global_reset') else metrics['current_capital']),
         "available_equity": float(default_available if period and period.get('global_reset') else state.get("available_equity", default_available)),
     }
@@ -312,6 +327,106 @@ def decision(decision_id: str, authorization: str | None = Header(default=None))
         raise HTTPException(404, "decision_not_found")
     d.pop("_id", None)
     return d
+
+
+class ManualOrderRequest(BaseModel):
+    client_order_id: str = Field(min_length=6, max_length=50, pattern=r"^[A-Za-z0-9_-]+$")
+    mode: Literal["demo", "live"]
+    symbol: str = Field(min_length=2, max_length=32)
+    side: Literal["LONG", "SHORT"]
+    order_type: Literal["MARKET", "LIMIT"] = "MARKET"
+    margin: float = Field(gt=0)
+    leverage: int = Field(ge=1, le=125)
+    limit_price: float | None = Field(default=None, gt=0)
+    stop_loss: float = Field(gt=0)
+    take_profit: float = Field(gt=0)
+    confirm_live: bool = False
+
+
+class ManualCancelRequest(BaseModel):
+    confirm_live: bool = False
+
+
+class ManualCloseRequest(BaseModel):
+    confirm_live: bool = False
+
+
+class ManualProtectionRequest(BaseModel):
+    stop_loss: float = Field(gt=0)
+    take_profit: float = Field(gt=0)
+    confirm_live: bool = False
+
+
+def _manual_error(exc: Exception):
+    message = str(exc)
+    status = 409 if message in {
+        "manual_order_not_cancellable",
+        "only_manual_positions_can_be_closed_here",
+        "only_manual_positions_can_be_modified_here",
+    } else 400
+    if message in {"live_not_entitled"}:
+        status = 403
+    if message in {"manual_order_not_found", "manual_position_not_found"}:
+        status = 404
+    raise HTTPException(status, message) from exc
+
+
+@router.get("/manual-trading/state")
+async def manual_trading_state(authorization: str | None = Header(default=None)):
+    _, user, _, _ = current(authorization)
+    try:
+        return await manual_service().state(user["user_id"])
+    except ManualTradingError as exc:
+        _manual_error(exc)
+    except Exception as exc:
+        raise HTTPException(502, f"manual_trading_state_failed:{exc}") from exc
+
+
+@router.post("/manual-trading/orders")
+async def manual_place_order(req: ManualOrderRequest, authorization: str | None = Header(default=None)):
+    _, user, _, _ = current(authorization)
+    try:
+        return await manual_service().place_order(user["user_id"], req)
+    except ManualTradingError as exc:
+        _manual_error(exc)
+    except Exception as exc:
+        raise HTTPException(502, f"manual_order_submit_failed:{exc}") from exc
+
+
+@router.post("/manual-trading/orders/{manual_order_id}/cancel")
+async def manual_cancel_order(manual_order_id: str, req: ManualCancelRequest, authorization: str | None = Header(default=None)):
+    _, user, _, _ = current(authorization)
+    try:
+        return await manual_service().cancel_order(user["user_id"], manual_order_id, confirm_live=req.confirm_live)
+    except ManualTradingError as exc:
+        _manual_error(exc)
+    except Exception as exc:
+        raise HTTPException(502, f"manual_order_cancel_failed:{exc}") from exc
+
+
+@router.post("/manual-trading/positions/{position_id}/close")
+async def manual_close_position(position_id: str, req: ManualCloseRequest, authorization: str | None = Header(default=None)):
+    _, user, _, _ = current(authorization)
+    try:
+        return await manual_service().close_position(user["user_id"], position_id, confirm_live=req.confirm_live)
+    except ManualTradingError as exc:
+        _manual_error(exc)
+    except Exception as exc:
+        raise HTTPException(502, f"manual_position_close_failed:{exc}") from exc
+
+
+@router.put("/manual-trading/positions/{position_id}/protection")
+async def manual_update_protection(position_id: str, req: ManualProtectionRequest, authorization: str | None = Header(default=None)):
+    _, user, _, _ = current(authorization)
+    try:
+        return await manual_service().update_protection(
+            user["user_id"], position_id,
+            stop_loss=req.stop_loss, take_profit=req.take_profit, confirm_live=req.confirm_live,
+        )
+    except ManualTradingError as exc:
+        _manual_error(exc)
+    except Exception as exc:
+        raise HTTPException(502, f"manual_position_protection_failed:{exc}") from exc
 
 
 @router.get("/settings")

@@ -22,7 +22,7 @@ SUBSCRIPTIONS = {
 
 DEFAULT_BSC_USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
 PAYMENT_REVERIFY_GRACE = timedelta(hours=24)
-ACTIVE_PAYMENT_STATUSES = {"AWAITING_PAYMENT", "VERIFYING", "INVALID"}
+ACTIVE_PAYMENT_STATUSES = {"AWAITING_PAYMENT", "VERIFYING"}
 TERMINAL_PAYMENT_STATUSES = {"CONFIRMED", "ALREADY_USED", "EXPIRED", "CANCELLED_DUPLICATE"}
 _TX_HASH_RE = re.compile(r"^(?:0x|0X)[0-9a-fA-F]{64}$")
 _ORDER_CREATE_LOCK = RLock()
@@ -171,8 +171,16 @@ class BillingService:
         active: list[dict] = []
         for row in rows:
             row = self._expire_stale_order(row, now)
-            if str(row.get("status", "")) in ACTIVE_PAYMENT_STATUSES:
+            status = str(row.get("status", ""))
+            if status in ACTIVE_PAYMENT_STATUSES:
                 active.append(row)
+                continue
+            # Legacy builds could leave active_order_key set on INVALID/EXPIRED rows.
+            # Always release the slot so a stale/failed payment can never block a new order.
+            if row.get("active_order_key"):
+                self.db.upsert("payment_orders", {"payment_order_id": row["payment_order_id"]}, {
+                    "active_order_key": None,
+                })
         if not active:
             return None
 
@@ -316,7 +324,9 @@ class BillingService:
                 "status": "INVALID",
                 "verification_reason": reason,
                 "verified_at": utcnow(),
-                "active_order_key": order["user_id"],
+                # INVALID is terminal. Release the user's active-order slot immediately
+                # so the next attempt creates a genuinely new payment order.
+                "active_order_key": None,
             })
             raise ValueError(reason)
 

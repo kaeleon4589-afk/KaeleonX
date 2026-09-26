@@ -1,4 +1,4 @@
-import type { AdminStatistics, ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, MarketCandlesResponse, MarketInstrument, MarketSnapshotResponse, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
+import type { AdminStatistics, ActivityResponse, AdminDashboard, AdminReferral, AdminUser, BillingPlan, Entitlement, Execution, ManualOrderInput, ManualTradingState, MarketCandlesResponse, MarketInstrument, MarketSnapshotResponse, Operations, PaymentOrder, Performance, ReferralSummary, TradingConfig, User } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'kaeleon_access_token';
@@ -64,6 +64,11 @@ export const api = {
   execution: () => request<Execution>('/user/execution'),
   operations: () => request<Operations>('/user/operations'),
   performance: () => request<Performance>('/user/performance'),
+  manualTradingState: () => request<ManualTradingState>('/user/manual-trading/state'),
+  manualPlaceOrder: (body: ManualOrderInput) => request<Record<string, unknown>>('/user/manual-trading/orders', {method:'POST', body:JSON.stringify(body)}),
+  manualCancelOrder: (manualOrderId: string, confirmLive: boolean) => request<Record<string, unknown>>(`/user/manual-trading/orders/${encodeURIComponent(manualOrderId)}/cancel`, {method:'POST', body:JSON.stringify({confirm_live:confirmLive})}),
+  manualClosePosition: (positionId: string, confirmLive: boolean) => request<Record<string, unknown>>(`/user/manual-trading/positions/${encodeURIComponent(positionId)}/close`, {method:'POST', body:JSON.stringify({confirm_live:confirmLive})}),
+  manualUpdateProtection: (positionId: string, stopLoss: number, takeProfit: number, confirmLive: boolean) => request<Record<string, unknown>>(`/user/manual-trading/positions/${encodeURIComponent(positionId)}/protection`, {method:'PUT', body:JSON.stringify({stop_loss:stopLoss,take_profit:takeProfit,confirm_live:confirmLive})}),
   activity: (limit = 120, mode?: string) => request<ActivityResponse>(`/user/activity?limit=${limit}${mode ? `&mode=${encodeURIComponent(mode)}` : ''}`),
   entitlement: () => request<Entitlement>('/billing/entitlement'),
   activateTrial: () => request<Entitlement>('/billing/live/activate-trial', { method: 'POST' }),
@@ -125,6 +130,21 @@ export function humanizeError(error: unknown): string {
     close_positions_before_removing_credentials: 'Cierra las posiciones antes de eliminar las credenciales.',
     resolve_pending_execution_before_changing_account: 'Hay una orden pendiente de confirmar. Espera a su reconciliación antes de cambiar la cuenta.',
     live_capital_exceeds_available_balance: 'El capital LIVE supera el saldo USDT disponible en CoinW.',
+    manual_trading_disabled: 'La operativa manual está desactivada temporalmente.',
+    manual_mode_must_match_active_mode: 'La orden debe utilizar el modo DEMO/LIVE actualmente seleccionado.',
+    live_manual_confirmation_required: 'Confirma explícitamente la orden LIVE antes de enviarla a CoinW.',
+    coinw_verification_required_for_live_manual: 'Verifica la conexión CoinW antes de operar manualmente en LIVE.',
+    manual_margin_below_minimum: 'El margen de la orden está por debajo del mínimo permitido.',
+    manual_margin_exceeds_available_balance: 'El margen supera el saldo disponible.',
+    manual_leverage_out_of_range: 'El apalancamiento está fuera del rango permitido.',
+    manual_tp_sl_required: 'Indica un Stop Loss y un Take Profit válidos.',
+    invalid_manual_long_geometry: 'En LONG debe cumplirse SL < entrada < TP.',
+    invalid_manual_short_geometry: 'En SHORT debe cumplirse TP < entrada < SL.',
+    invalid_manual_long_protection: 'Para LONG, el SL debe quedar por debajo del precio y el TP por encima.',
+    invalid_manual_short_protection: 'Para SHORT, el TP debe quedar por debajo del precio y el SL por encima.',
+    manual_order_not_found: 'La orden manual ya no está disponible.',
+    manual_position_not_found: 'La posición manual ya no está abierta.',
+    manual_order_not_cancellable: 'La orden ya no se puede cancelar.',
     reset_requires_no_open_positions: 'Cierra todas las posiciones del modo seleccionado antes de reiniciar.',
     reset_requires_no_pending_orders: 'Espera a que terminen las órdenes pendientes antes de reiniciar.',
     pause_live_before_removing_credentials: 'Pausa LIVE antes de eliminar las credenciales CoinW.',

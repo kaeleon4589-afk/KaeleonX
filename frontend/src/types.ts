@@ -81,7 +81,6 @@ export type Position = Record<string, unknown> & {
   funding_pnl?: number;
   margin?: number;
   estimated_margin?: number;
-  position_margin?: number;
   break_even_price?: number;
   breakeven_price?: number;
   breakEvenPrice?: number;
@@ -96,6 +95,81 @@ export type Position = Record<string, unknown> & {
   tp1_price?: number;
   tp2?: number;
   tp2_price?: number;
+  source?: 'BOT' | 'MANUAL' | string;
+  order_type?: 'MARKET' | 'LIMIT' | string;
+  margin_mode?: 'ISOLATED' | 'CROSS' | string;
+  position_margin?: number;
+  liquidation_price?: number | null;
+  exchange_order_id?: string | null;
+  client_order_id?: string | null;
+  protected?: boolean;
+  close_requested?: boolean;
+};
+
+export type ManualTradingAccount = {
+  balance: number;
+  available: number;
+  used_margin: number;
+  frozen_margin: number;
+  unrealized_pnl: number;
+  equity: number;
+  exchange_available_margin?: number;
+  updated_at?: number | string | null;
+};
+
+export type ManualOrder = {
+  manual_order_id: string;
+  client_order_id: string;
+  order_id?: string | null;
+  position_id?: string | null;
+  mode: 'demo' | 'live';
+  source: 'MANUAL';
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  direction?: 'LONG' | 'SHORT';
+  order_type: 'MARKET' | 'LIMIT';
+  status: string;
+  margin: number;
+  leverage: number;
+  notional: number;
+  limit_price?: number | null;
+  stop_price: number;
+  target_price: number;
+  fill_price?: number | null;
+  created_at?: number | string;
+  filled_at?: number | string | null;
+  cancelled_at?: number | string | null;
+  exchange_status?: string | null;
+  protected?: boolean | null;
+  protection_error?: string | null;
+  reconcile_required?: boolean;
+};
+
+export type ManualTradingState = {
+  mode: 'demo' | 'live';
+  enabled: boolean;
+  account: ManualTradingAccount;
+  positions: Position[];
+  position_history: Position[];
+  open_orders: ManualOrder[];
+  order_history: ManualOrder[];
+  min_margin: number;
+  max_leverage: number;
+  live_confirmation_required: boolean;
+};
+
+export type ManualOrderInput = {
+  client_order_id: string;
+  mode: 'demo' | 'live';
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  order_type: 'MARKET' | 'LIMIT';
+  margin: number;
+  leverage: number;
+  limit_price?: number;
+  stop_loss: number;
+  take_profit: number;
+  confirm_live: boolean;
 };
 
 export type Operations = { mode?: 'demo'|'live'; dynamic_protection_enabled?: boolean; open: Position[]; closed: Position[] };

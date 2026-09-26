@@ -13,25 +13,25 @@ EMA_MID = 50
 MIN_CANDLES_REQUIRED = 260
 MIN_NONZERO_VOLUME_RATIO = 0.92
 SWEEP_LOOKBACK = 34
-SWEEP_MAX_AGE_BARS = 8
-SWEEP_MIN_DEPTH_ATR = 0.10
-SWEEP_MIN_WICK_RATIO = 0.28
-SWEEP_MIN_RVOL = 0.58
-SWEEP_RECOVER_TOL_ATR = 0.36
-TRIGGER_MIN_RVOL = 0.48
-TRIGGER_MIN_BODY_RATIO = 0.12
-TRIGGER_CLOSE_POS_LONG_MIN = 0.46
-TRIGGER_CLOSE_POS_SHORT_MAX = 0.54
-TRIGGER_EXTENSION_MAX_ATR = 2.25
-TRIGGER_EMA20_RECOVER_TOL_ATR = 0.55
-TRIGGER_EMA50_RECOVER_TOL_ATR = 1.05
-RETEST_INVALIDATION_ATR = 0.58
+SWEEP_MAX_AGE_BARS = 5
+SWEEP_MIN_DEPTH_ATR = 0.15
+SWEEP_MIN_WICK_RATIO = 0.32
+SWEEP_MIN_RVOL = 0.70
+SWEEP_RECOVER_TOL_ATR = 0.30
+TRIGGER_MIN_RVOL = 0.65
+TRIGGER_MIN_BODY_RATIO = 0.24
+TRIGGER_CLOSE_POS_LONG_MIN = 0.62
+TRIGGER_CLOSE_POS_SHORT_MAX = 0.38
+TRIGGER_EXTENSION_MAX_ATR = 1.10
+TRIGGER_EMA20_RECOVER_TOL_ATR = 0.35
+TRIGGER_EMA50_RECOVER_TOL_ATR = 0.75
+RETEST_INVALIDATION_ATR = 0.42
 SL_BUFFER_ATR = 0.18
 TARGET_LOOKBACK = 48
-MIN_RR = 0.95
+MIN_RR = 1.05
 ATR_PCT_MIN = 0.0013
 ATR_PCT_MAX = 0.0280
-MIN_SCORE = 74.0
+MIN_SCORE = 78.0
 
 
 def _body_ratio(o: float, h: float, l: float, c: float) -> float:
@@ -75,7 +75,7 @@ def _score_candidate(*, sweep_depth_atr: float, sweep_wick_ratio: float, sweep_r
         0.0,
         1.0,
     )
-    return round(min(100.0, 66.0 + 34.0 * quality), 2)
+    return round(min(100.0, 58.0 + 42.0 * quality), 2)
 
 
 def _detect(direction: str, *, o, h, l, c, v, ema20, ema50, atr_value):
@@ -292,8 +292,11 @@ class LiquiditySweepStrategy:
             timeframe,
             ("liquidity_swept", "level_reclaimed", "trigger_confirmed"),
             {
-                "strategy_model": "liquidity_sweep_reversal_5m_v1",
+                "strategy_model": "liquidity_sweep_reversal_5m_v2_entry_quality",
                 "score": score,
+                "atr_pct": atr_pct,
+                "atr_value": atr_value,
+                "trigger_extension_atr": candidate.get("trigger_extension_atr", 0.0),
                 "sweep_level": candidate["liquidity_level"],
                 "sweep_depth_atr": candidate["sweep_depth_atr"],
                 "sweep_wick_ratio": candidate["sweep_wick_ratio"],

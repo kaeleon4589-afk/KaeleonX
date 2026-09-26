@@ -16,20 +16,23 @@ EMA_SLOPE_LOOKBACK = 6
 MIN_CANDLES_REQUIRED = 260
 MIN_NONZERO_VOLUME_RATIO = 0.92
 
-H1_ADX_MIN = 12.0
-M15_ADX_MIN = 11.0
-M5_ADX_MIN = 9.5
+H1_ADX_MIN = 16.0
+M15_ADX_MIN = 14.0
+M5_ADX_MIN = 12.0
 ATR_PCT_MIN = 0.00075
 ATR_PCT_MAX = 0.0180
 TREND_STACK_MIN_PCT = 0.00030
 RESET_LOOKBACK_BARS = 5
 RESET_TOUCH_TOL_ATR = 0.38
 RESET_BREAK_TOL_ATR = 0.48
-TRIGGER_MAX_EMA20_EXTENSION_ATR = 0.95
-CONTINUATION_CONFIRM_TOL_ATR = 0.10
+TRIGGER_MAX_EMA20_EXTENSION_ATR = 0.70
+BREAKOUT_CONFIRM_BUFFER_ATR = 0.03
+TRIGGER_MIN_BODY_RATIO = 0.28
+TRIGGER_CLOSE_POS_LONG_MIN = 0.62
+TRIGGER_CLOSE_POS_SHORT_MAX = 0.38
 MTF_SL_BUFFER_ATR = 0.10
-MIN_RR_TO_SIGNAL = 0.95
-MIN_SCORE_TO_SIGNAL = 69.0
+MIN_RR_TO_SIGNAL = 1.05
+MIN_SCORE_TO_SIGNAL = 78.0
 MAX_SCORE = 100.0
 STRENGTH_MIN = 0.20
 STRENGTH_MAX = 0.97
@@ -115,7 +118,10 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
     extension_atr = abs(float(c[i]) - float(ema20[i])) / max(atr_value, 1e-12)
     prev_high = float(h[i - 1]) if i >= 1 else float(h[i])
     prev_low = float(l[i - 1]) if i >= 1 else float(l[i])
-    confirm_tol = atr_value * CONTINUATION_CONFIRM_TOL_ATR
+    confirm_buffer = atr_value * BREAKOUT_CONFIRM_BUFFER_ATR
+    trigger_range = max(float(h[i]) - float(l[i]), 1e-12)
+    trigger_body_ratio = abs(float(c[i]) - float(o[i])) / trigger_range
+    trigger_close_pos = clamp((float(c[i]) - float(l[i])) / trigger_range, 0.0, 1.0)
 
     if direction == "long":
         diag = {
@@ -124,6 +130,9 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
             "ema50_ref": min_ema50,
             "extension_atr": extension_atr,
             "prev_high": prev_high,
+            "trigger_body_ratio": trigger_body_ratio,
+            "trigger_close_pos": trigger_close_pos,
+            "confirm_buffer": confirm_buffer,
         }
         if reset_low > max_ema20 + atr_value * RESET_TOUCH_TOL_ATR:
             return False, "NO_5M_RESET_TOUCH", diag
@@ -132,7 +141,9 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
         reclaim_ok = (
             float(c[i]) > float(ema20[i])
             and float(c[i]) > float(o[i])
-            and (float(c[i]) >= prev_high - confirm_tol or float(h[i]) >= prev_high)
+            and float(c[i]) >= prev_high + confirm_buffer
+            and trigger_body_ratio >= TRIGGER_MIN_BODY_RATIO
+            and trigger_close_pos >= TRIGGER_CLOSE_POS_LONG_MIN
         )
         if not reclaim_ok:
             return False, "NO_5M_CONTINUATION_CONFIRM", diag
@@ -143,6 +154,9 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
             "ema50_ref": max_ema50,
             "extension_atr": extension_atr,
             "prev_low": prev_low,
+            "trigger_body_ratio": trigger_body_ratio,
+            "trigger_close_pos": trigger_close_pos,
+            "confirm_buffer": confirm_buffer,
         }
         if reset_high < min_ema20 - atr_value * RESET_TOUCH_TOL_ATR:
             return False, "NO_5M_RESET_TOUCH", diag
@@ -151,7 +165,9 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
         reclaim_ok = (
             float(c[i]) < float(ema20[i])
             and float(c[i]) < float(o[i])
-            and (float(c[i]) <= prev_low + confirm_tol or float(l[i]) <= prev_low)
+            and float(c[i]) <= prev_low - confirm_buffer
+            and trigger_body_ratio >= TRIGGER_MIN_BODY_RATIO
+            and trigger_close_pos <= TRIGGER_CLOSE_POS_SHORT_MAX
         )
         if not reclaim_ok:
             return False, "NO_5M_CONTINUATION_CONFIRM", diag
@@ -268,7 +284,7 @@ class BreakoutRetestStrategy:
             0.0,
             1.0,
         )
-        score = round(min(MAX_SCORE, 69.0 + 28.0 * quality), 2)
+        score = round(min(MAX_SCORE, 55.0 + 45.0 * quality), 2)
         if score < MIN_SCORE_TO_SIGNAL:
             return self._reject("score_too_low", score=score, min=MIN_SCORE_TO_SIGNAL)
 
@@ -305,6 +321,8 @@ class BreakoutRetestStrategy:
             "target_front_run_ratio": target_ratio,
             "execution_rr": execution_rr,
             "structural_stop_pct": structural_pct,
+            "trigger_body_ratio": trigger_diag.get("trigger_body_ratio"),
+            "trigger_close_pos": trigger_diag.get("trigger_close_pos"),
         }
         return TradeIntent(
             decision_id,
@@ -319,10 +337,14 @@ class BreakoutRetestStrategy:
             timeframe,
             ("mtf_1h_15m_alignment", "5m_reset_retest", "continuation_confirmed"),
             {
-                "strategy_model": "mtf_simple_continuation_5m_v2",
+                "strategy_model": "mtf_simple_continuation_5m_v3_entry_quality",
                 "score": score,
                 "strength": strength,
                 "atr_pct": atr_pct,
+                "atr_value": atr5,
+                "trigger_body_ratio": trigger_diag.get("trigger_body_ratio"),
+                "trigger_close_pos": trigger_diag.get("trigger_close_pos"),
+                "trigger_extension_atr": extension_atr,
                 "adx5": adx5,
                 "adx15": diag15["adx"],
                 "adx1h": diag1h["adx"],

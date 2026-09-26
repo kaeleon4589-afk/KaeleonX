@@ -16,7 +16,7 @@ from app.trading.persistence import TradePersistence
 
 # Both strategies require at least this RR before generating a signal. Enforce
 # the same limit after executable bid/ask and DEMO slippage alter the entry.
-MIN_EXECUTION_RR = 0.95
+MIN_EXECUTION_RR = 1.05
 
 
 class TradingOrchestrator:
@@ -31,7 +31,11 @@ class TradingOrchestrator:
     def __init__(self, regime_engine, router, risk, execution, db, audit,
                  position_manager, signal_factory, cooldown_seconds=30,
                  execution_mode=None, on_position_opened=None, on_position_closed=None,
-                 persistence=None):
+                 persistence=None, post_loss_global_cooldown_seconds=900.0,
+                 post_loss_symbol_cooldown_seconds=1800.0,
+                 entry_max_chase_atr=0.20, entry_max_adverse_reversal_atr=0.15,
+                 entry_min_stop_atr=0.55, entry_min_stop_spreads=3.0,
+                 entry_orderbook_conflict_threshold=0.35):
         self.regime_engine = regime_engine
         self.router = router
         self.risk = risk
@@ -50,6 +54,87 @@ class TradingOrchestrator:
         self.pending_execution = None
         self.last_rejection = None
         self.entry_guard = None
+        self.post_loss_global_cooldown_seconds = max(0.0, float(post_loss_global_cooldown_seconds))
+        self.post_loss_symbol_cooldown_seconds = max(0.0, float(post_loss_symbol_cooldown_seconds))
+        self.entry_max_chase_atr = max(0.0, float(entry_max_chase_atr))
+        self.entry_max_adverse_reversal_atr = max(0.0, float(entry_max_adverse_reversal_atr))
+        self.entry_min_stop_atr = max(0.0, float(entry_min_stop_atr))
+        self.entry_min_stop_spreads = max(0.0, float(entry_min_stop_spreads))
+        self.entry_orderbook_conflict_threshold = min(0.95, max(0.0, float(entry_orderbook_conflict_threshold)))
+        self.last_loss_at = 0.0
+        self.last_symbol_loss_at = {}
+
+    @staticmethod
+    def _epoch_seconds(value):
+        if value in (None, ''):
+            return 0.0
+        if isinstance(value, (int, float)):
+            raw = float(value)
+            return raw / 1000.0 if raw > 100_000_000_000 else raw
+        try:
+            text = str(value).replace('Z', '+00:00')
+            return datetime.fromisoformat(text).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _position_net_result(position):
+        try:
+            explicit = getattr(position, 'net_pnl', None)
+            if explicit is not None:
+                return float(explicit)
+            return (float(getattr(position, 'realized_pnl', 0.0) or 0.0)
+                    - float(getattr(position, 'entry_fee', 0.0) or 0.0)
+                    - float(getattr(position, 'exit_fee', 0.0) or 0.0)
+                    + float(getattr(position, 'funding_pnl', 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def register_closed_position(self, position):
+        if str(getattr(position, 'status', '')).upper() != 'CLOSED':
+            return
+        net = self._position_net_result(position)
+        if not math.isfinite(net) or net >= 0:
+            return
+        closed_at = self._epoch_seconds(getattr(position, 'closed_at', None)) or time.time()
+        symbol = str(getattr(position, 'symbol', '') or '')
+        self.last_loss_at = max(self.last_loss_at, closed_at)
+        if symbol:
+            self.last_symbol_loss_at[symbol] = max(self.last_symbol_loss_at.get(symbol, 0.0), closed_at)
+        if self.audit:
+            self.audit.event(
+                'POST_LOSS_COOLDOWN_STARTED', getattr(position, 'decision_id', 'loss'),
+                user_id=self.position_manager.owner_user_id, mode=self.execution_mode, symbol=symbol or None,
+                net_pnl=round(net, 8), global_seconds=self.post_loss_global_cooldown_seconds,
+                symbol_seconds=self.post_loss_symbol_cooldown_seconds,
+            )
+
+    def seed_loss_cooldowns(self, rows):
+        now = time.time()
+        horizon = max(self.post_loss_global_cooldown_seconds, self.post_loss_symbol_cooldown_seconds)
+        if horizon <= 0:
+            return
+        for row in rows or []:
+            if str(row.get('status', '')).upper() != 'CLOSED':
+                continue
+            closed_at = self._epoch_seconds(row.get('closed_at'))
+            if not closed_at or now - closed_at > horizon:
+                continue
+            try:
+                explicit = row.get('net_pnl')
+                net = (float(explicit) if explicit is not None else
+                       float(row.get('realized_pnl') or 0.0)
+                       - float(row.get('entry_fee') or 0.0)
+                       - float(row.get('exit_fee') or 0.0)
+                       + float(row.get('funding_pnl') or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(net) or net >= 0:
+                continue
+            symbol = str(row.get('symbol') or '')
+            self.last_loss_at = max(self.last_loss_at, closed_at)
+            if symbol:
+                self.last_symbol_loss_at[symbol] = max(self.last_symbol_loss_at.get(symbol, 0.0), closed_at)
 
     def _has_open_position(self, symbol=None, user_id=None):
         # Source-bot invariant: one open trade at a time per user/runtime.
@@ -215,6 +300,7 @@ class TradingOrchestrator:
                         symbol=position.symbol,
                     )
                 for position in changes.get("closed", []):
+                    self.register_closed_position(position)
                     self.persistence.schedule_position_save(
                         position=position, user_id=user_id, mode=self.execution_mode,
                         symbol=position.symbol,
@@ -340,6 +426,25 @@ class TradingOrchestrator:
 
         key = (snapshot.symbol, snapshot.timeframe)
         now = time.time()
+        global_remaining = self.post_loss_global_cooldown_seconds - (now - self.last_loss_at) if self.last_loss_at else 0.0
+        symbol_loss_at = self.last_symbol_loss_at.get(snapshot.symbol, 0.0)
+        symbol_remaining = self.post_loss_symbol_cooldown_seconds - (now - symbol_loss_at) if symbol_loss_at else 0.0
+        if global_remaining > 0:
+            self.last_rejection = 'post_loss_global_cooldown'
+            self.audit.event(
+                'ENTRY_SKIPPED', user_id, level='DEBUG', persist=False,
+                user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                reason='post_loss_global_cooldown', remaining_seconds=round(global_remaining, 2),
+            )
+            return None
+        if symbol_remaining > 0:
+            self.last_rejection = 'post_loss_symbol_cooldown'
+            self.audit.event(
+                'ENTRY_SKIPPED', user_id, level='DEBUG', persist=False,
+                user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                reason='post_loss_symbol_cooldown', remaining_seconds=round(symbol_remaining, 2),
+            )
+            return None
         if now - self.last_decision.get(key, 0) < self.cooldown_seconds:
             self.audit.event(
                 "ENTRY_SKIPPED", user_id, level="DEBUG", persist=False,
@@ -495,6 +600,105 @@ class TradingOrchestrator:
                     stop_price=stop, target_price=target, execution_rr=execution_rr,
                 )
                 return None
+
+            # Entry-quality guard. The strategy is evaluated on a closed 5m candle,
+            # while execution uses a newer bid/ask. If price has already chased the
+            # signal or invalidated the confirmation, wait for a fresh setup instead
+            # of buying/selling the exhausted move.
+            metadata = getattr(intent, 'metadata', {}) or {}
+            try:
+                atr_value = float(metadata.get('atr_value') or 0.0)
+            except (TypeError, ValueError):
+                atr_value = 0.0
+            if (not math.isfinite(atr_value) or atr_value <= 0) and signal_entry > 0:
+                try:
+                    atr_value = float(metadata.get('atr_pct') or 0.0) * signal_entry
+                except (TypeError, ValueError):
+                    atr_value = 0.0
+            if math.isfinite(atr_value) and atr_value > 0:
+                directional_move = ((entry - signal_entry) if intent.direction == Direction.LONG
+                                    else (signal_entry - entry))
+                adverse_reversal = ((signal_entry - entry) if intent.direction == Direction.LONG
+                                    else (entry - signal_entry))
+                chase_atr = max(0.0, directional_move) / atr_value
+                adverse_atr = max(0.0, adverse_reversal) / atr_value
+                if chase_atr > self.entry_max_chase_atr:
+                    self.last_decision[key] = now
+                    self.last_rejection = 'entry_chased_after_signal'
+                    self.audit.event(
+                        'SIGNAL_REJECTED', decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        reason='entry_chased_after_signal', entry_price=entry,
+                        signal_entry_price=signal_entry, atr_value=atr_value,
+                        move_atr=round(chase_atr, 4), maximum_atr=self.entry_max_chase_atr,
+                    )
+                    return None
+                if adverse_atr > self.entry_max_adverse_reversal_atr:
+                    self.last_decision[key] = now
+                    self.last_rejection = 'entry_confirmation_lost_before_fill'
+                    self.audit.event(
+                        'SIGNAL_REJECTED', decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        reason='entry_confirmation_lost_before_fill', entry_price=entry,
+                        signal_entry_price=signal_entry, atr_value=atr_value,
+                        move_atr=round(adverse_atr, 4), maximum_atr=self.entry_max_adverse_reversal_atr,
+                    )
+                    return None
+
+                spread_abs = 0.0
+                try:
+                    spread_abs = max(0.0, float(snapshot.ask) - float(snapshot.bid))
+                except (TypeError, ValueError):
+                    pass
+                minimum_stop_distance = max(
+                    atr_value * self.entry_min_stop_atr,
+                    spread_abs * self.entry_min_stop_spreads,
+                )
+                if minimum_stop_distance > 0 and risk_distance < minimum_stop_distance:
+                    self.last_decision[key] = now
+                    self.last_rejection = 'stop_inside_market_noise'
+                    self.audit.event(
+                        'SIGNAL_REJECTED', decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        reason='stop_inside_market_noise', entry_price=entry, stop_price=stop,
+                        stop_distance=risk_distance, minimum_stop_distance=minimum_stop_distance,
+                        stop_atr=round(risk_distance / atr_value, 4),
+                        minimum_stop_atr=self.entry_min_stop_atr, spread_abs=spread_abs,
+                    )
+                    return None
+
+            # Reject only a severe top-20 order-book conflict. Mild imbalance is
+            # noisy/spoofable and is logged by the market layer, but a large
+            # opposite wall immediately before execution is a useful final veto.
+            bids = list(getattr(snapshot, 'bids', []) or [])[:20]
+            asks = list(getattr(snapshot, 'asks', []) or [])[:20]
+            if len(bids) >= 5 and len(asks) >= 5 and self.entry_orderbook_conflict_threshold > 0:
+                try:
+                    bid_value = sum(float(level[0]) * float(level[1]) for level in bids)
+                    ask_value = sum(float(level[0]) * float(level[1]) for level in asks)
+                    total_value = bid_value + ask_value
+                    imbalance = ((bid_value - ask_value) / total_value) if total_value > 0 else 0.0
+                except (TypeError, ValueError, IndexError):
+                    imbalance = 0.0
+                conflicts = (
+                    (intent.direction == Direction.LONG and imbalance <= -self.entry_orderbook_conflict_threshold)
+                    or (intent.direction == Direction.SHORT and imbalance >= self.entry_orderbook_conflict_threshold)
+                )
+                if conflicts:
+                    self.last_decision[key] = now
+                    self.last_rejection = 'orderbook_conflict'
+                    self.audit.event(
+                        'SIGNAL_REJECTED', decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        reason='orderbook_conflict', direction=getattr(intent.direction, 'value', str(intent.direction)),
+                        orderbook_imbalance=round(imbalance, 4),
+                        threshold=self.entry_orderbook_conflict_threshold, levels=20,
+                    )
+                    return None
 
             # Signal SL/TP are anchored to the closed candle. A delayed quote can
             # improve apparent RR by bringing entry right next to the old stop.

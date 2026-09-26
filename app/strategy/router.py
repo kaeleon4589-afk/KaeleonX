@@ -5,6 +5,7 @@ from dataclasses import replace, is_dataclass
 from types import SimpleNamespace
 
 from app.strategy.breakout_retest import BreakoutRetestStrategy
+from app.strategy.armed_entry import ArmedEntryEngine
 from app.strategy.liquidity_sweep import LiquiditySweepStrategy
 
 
@@ -30,21 +31,19 @@ def _env_int(name: str, default: int) -> int:
 
 
 class StrategyRouter:
-    """Source-faithful executable router adapted to KAELEON TradeIntent objects.
+    """KAELEON strategy router with v6 armed-entry support.
 
-    Trading-X production defaults are enforced:
-    - TREND_CONTINUATION -> breakout/reset/retest
-    - VOLATILE_SWEEP -> liquidity-sweep reversal
-    - RANGE -> no executable trade (the source keeps range logic shadow-only)
-    - UNKNOWN -> no trade
-
-    The source's optional trend liquidity probe is supported behind the same
-    opt-in environment switch and is disabled by default.
+    Production v6 uses regime as context: TREND_CONTINUATION primarily arms
+    breakout/retest setups, while VOLATILE_SWEEP and RANGE can arm high-quality
+    liquidity sweeps. UNKNOWN remains blocked. The legacy immediate-entry router
+    is kept intact as an explicit rollback/compatibility path.
     """
 
-    def __init__(self):
+    def __init__(self, armed_ttl_seconds: float | None = None):
         self.breakout = BreakoutRetestStrategy()
         self.sweep = LiquiditySweepStrategy()
+        ttl = _env_float("TRADE_ARMED_SETUP_TTL_SECONDS", 600.0) if armed_ttl_seconds is None else armed_ttl_seconds
+        self.armed = ArmedEntryEngine(ttl_seconds=ttl)
         self.last_trace = {}
 
     @staticmethod
@@ -79,6 +78,26 @@ class StrategyRouter:
                 or (btc_shock >= 1.05 and atr_pct >= 0.0055)
             )
         )
+
+    def discover_armed(self, regime, snapshot, symbol, timeframe, regime_metadata=None):
+        setup = self.armed.discover(
+            regime, snapshot, symbol, timeframe, regime_metadata=regime_metadata
+        )
+        self.last_trace = {
+            "selected": None,
+            "reason": "setup_armed" if setup is not None else "no_armable_setup",
+            "armed": dict(self.armed.last_trace or {}),
+        }
+        return setup
+
+    def trigger_armed(self, setup, snapshot, decision_id):
+        status, intent, trace = self.armed.trigger(setup, snapshot, decision_id)
+        self.last_trace = {
+            "selected": getattr(getattr(intent, "strategy", None), "value", None) if intent else None,
+            "reason": f"armed_{status}",
+            "armed": {"status": status, **dict(trace or {})},
+        }
+        return status, intent, trace
 
     def evaluate(self, regime, candles, decision_id, symbol, timeframe,
                  current_price=None, snapshot=None, regime_metadata=None):

@@ -300,3 +300,34 @@ NUEVO:
 tests/test_breakout_exhaustion_v5.py
 
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — Strategy Engine v6 / ARMED + micro-confirmación 1m + rejection funnel
+BASE COMPARADA: KaeleonX-breakout-retest-v5-exhaustion-stop.zip
+
+MODIFICADOS (10):
+.env.example
+ARCHIVOS_TOCADOS.txt
+IMPLEMENTACION_Y_DESPLIEGUE.md
+app/config/settings.py
+app/logging/logger.py
+app/market/coordinator.py
+app/models/trading.py
+app/orchestrator.py
+app/strategy/router.py
+app/trading/runtime.py
+
+NUEVOS (8):
+KAELEON_V6_STRATEGY_ENGINE.md
+app/backtest/__init__.py
+app/backtest/replay.py
+app/strategy/armed_entry.py
+app/trading/rejection_funnel.py
+scripts/replay_strategy.py
+tests/test_armed_entry_v6.py
+tests/test_strategy_replay_v6.py
+
+ELIMINADOS: ninguno
+
+VALIDACIÓN:
+pytest -q -> 187 passed
+python -m compileall -q app -> sin errores

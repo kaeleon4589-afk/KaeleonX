@@ -117,3 +117,30 @@ Variables opcionales de Railway (los valores indicados ya son los defaults):
 La implementación aplica a operaciones nuevas. Una posición antigua conserva su TP existente, pero puede adoptar la protección dinámica al ser restaurada. Antes de activar LIVE, verificar una operación DEMO completa y revisar que `management_stage` pase `INITIAL -> BREAK_EVEN -> PROFIT_LOCK` cuando corresponda.
 
 Validación backend: **143 pruebas aprobadas** y `compileall` sin errores. No se modificó frontend en esta ampliación.
+
+## Strategy Engine v6 — ARMED + micro-confirmación
+
+La estrategia de producción utiliza ahora el flujo de dos etapas documentado en `KAELEON_V6_STRATEGY_ENGINE.md`.
+
+Variables recomendadas para Railway:
+
+```env
+TRADE_ENTRY_MIN_STOP_ATR=0.30
+TRADE_ARMED_ENTRY_ENABLED=true
+TRADE_LEGACY_ENTRY_FALLBACK_ENABLED=false
+TRADE_ARMED_SETUP_TTL_SECONDS=600
+TRADE_FUNNEL_EMIT_SECONDS=300
+TRADE_FUNNEL_EMIT_EVERY=50
+```
+
+Después del deploy, comprobar en Railway los eventos `SETUP_ARMED`, `SETUP_TRIGGERED`, `SETUP_CANCELLED` y `REJECTION_FUNNEL`. La ausencia de fills ya no debe diagnosticarse únicamente con `SIGNAL_REJECTED`: el funnel muestra la etapa y razón dominante.
+
+### Replay v6 antes de subir capital LIVE
+
+Con histórico OHLCV local puede ejecutarse:
+
+```bash
+python scripts/replay_strategy.py --symbol BTC --1m data/BTC-1m.csv --5m data/BTC-5m.csv --15m data/BTC-15m.csv --1h data/BTC-1h.csv --output replay-report.json
+```
+
+El JSON generado incluye expectancy, profit factor, drawdown, MAE/MFE, retorno aproximado y razones de rechazo/cancelación.

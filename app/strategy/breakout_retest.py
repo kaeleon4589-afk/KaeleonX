@@ -6,7 +6,7 @@ from app.position.protection import (
     break_even_activation_ratio, front_run_target,
     profit_lock_activation_ratio, profit_lock_capture_ratio,
 )
-from app.strategy.source_math import adx, atr, candle_quality, clamp, ema, extract, pct_change
+from app.strategy.source_math import adx, atr, candle_quality, clamp, ema, extract, pct_change, relative_volume
 
 EMA_FAST = 20
 EMA_MID = 50
@@ -22,14 +22,28 @@ M5_ADX_MIN = 12.0
 ATR_PCT_MIN = 0.00075
 ATR_PCT_MAX = 0.0180
 TREND_STACK_MIN_PCT = 0.00030
-RESET_LOOKBACK_BARS = 5
-RESET_TOUCH_TOL_ATR = 0.38
-RESET_BREAK_TOL_ATR = 0.48
-TRIGGER_MAX_EMA20_EXTENSION_ATR = 0.70
-BREAKOUT_CONFIRM_BUFFER_ATR = 0.03
-TRIGGER_MIN_BODY_RATIO = 0.28
-TRIGGER_CLOSE_POS_LONG_MIN = 0.62
-TRIGGER_CLOSE_POS_SHORT_MAX = 0.38
+
+# Real BREAKOUT -> RETEST -> FRESH CONFIRMATION model.
+STRUCTURE_LOOKBACK_BARS = 20
+RETEST_MAX_BARS_AFTER_BREAKOUT = 3
+BREAKOUT_CLOSE_BUFFER_ATR = 0.05
+BREAKOUT_MAX_EXTENSION_ATR = 0.60
+BREAKOUT_MIN_BODY_RATIO = 0.30
+BREAKOUT_CLOSE_POS_LONG_MIN = 0.64
+BREAKOUT_CLOSE_POS_SHORT_MAX = 0.36
+BREAKOUT_MIN_RVOL = 0.95
+RETEST_TOUCH_TOL_ATR = 0.18
+RETEST_MAX_PENETRATION_ATR = 0.30
+RETEST_CLOSE_INVALIDATION_ATR = 0.10
+RETEST_MAX_CLOSE_DISTANCE_ATR = 0.28
+CONFIRM_BREAK_BUFFER_ATR = 0.02
+TRIGGER_MIN_BODY_RATIO = 0.30
+TRIGGER_CLOSE_POS_LONG_MIN = 0.66
+TRIGGER_CLOSE_POS_SHORT_MAX = 0.34
+TRIGGER_MIN_RVOL = 0.90
+TRIGGER_MAX_EMA20_EXTENSION_ATR = 2.00  # telemetry guard; structural extension is the anti-late gate
+ENTRY_MAX_STRUCTURE_EXTENSION_ATR = 0.75
+MAX_IMPULSE_CONSUMED_RATIO = 0.45
 MTF_SL_BUFFER_ATR = 0.10
 MIN_RR_TO_SIGNAL = 1.05
 MIN_SCORE_TO_SIGNAL = 78.0
@@ -99,88 +113,181 @@ def _bias(tf: dict, *, adx_min: float) -> tuple[str, dict]:
     }
 
 
+def _candle_shape(o, h, l, c, idx: int) -> tuple[float, float]:
+    candle_range = max(float(h[idx]) - float(l[idx]), 1e-12)
+    body_ratio = abs(float(c[idx]) - float(o[idx])) / candle_range
+    close_pos = clamp((float(c[idx]) - float(l[idx])) / candle_range, 0.0, 1.0)
+    return body_ratio, close_pos
+
+
 def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
-    o, h, l, c = tf["o"], tf["h"], tf["l"], tf["c"]
-    ema20, ema50 = tf["ema20"], tf["ema50"]
+    """Validate a *fresh* structural breakout, retest and immediate re-acceleration.
+
+    The current closed 5m candle must be the confirmation candle.  The breakout
+    must have happened only 1-3 retest candles earlier; there is no allowance for
+    several continuation candles before entry.  This prevents buying/selling the
+    third developed candle of an already-consumed impulse.
+    """
+    o, h, l, c, v = tf["o"], tf["h"], tf["l"], tf["c"], tf.get("v", [])
+    ema20 = tf["ema20"]
     atr_value = float(tf["atr"])
-    if len(c) < max(EMA_SLOW + 5, 80):
+    if len(c) < max(EMA_SLOW + STRUCTURE_LOOKBACK_BARS + 6, 240):
         return False, "NOT_ENOUGH_BARS", {}
+    if atr_value <= 0:
+        return False, "INVALID_ATR", {}
+
     i = len(c) - 1
-    recent_idx = list(range(max(0, i - RESET_LOOKBACK_BARS), i))
-    if not recent_idx:
-        return False, "NO_RESET_WINDOW", {}
-    reset_low = min(l[j] for j in recent_idx)
-    reset_high = max(h[j] for j in recent_idx)
-    min_ema20 = min(float(ema20[j]) for j in recent_idx)
-    max_ema20 = max(float(ema20[j]) for j in recent_idx)
-    min_ema50 = min(float(ema50[j]) for j in recent_idx)
-    max_ema50 = max(float(ema50[j]) for j in recent_idx)
-    extension_atr = abs(float(c[i]) - float(ema20[i])) / max(atr_value, 1e-12)
-    prev_high = float(h[i - 1]) if i >= 1 else float(h[i])
-    prev_low = float(l[i - 1]) if i >= 1 else float(l[i])
-    confirm_buffer = atr_value * BREAKOUT_CONFIRM_BUFFER_ATR
-    trigger_range = max(float(h[i]) - float(l[i]), 1e-12)
-    trigger_body_ratio = abs(float(c[i]) - float(o[i])) / trigger_range
-    trigger_close_pos = clamp((float(c[i]) - float(l[i])) / trigger_range, 0.0, 1.0)
+    confirm_body_ratio, confirm_close_pos = _candle_shape(o, h, l, c, i)
+    confirm_rvol = relative_volume(v, i) if v else 1.0
+    ema_extension_atr = abs(float(c[i]) - float(ema20[i])) / atr_value
+
+    base_diag = {
+        "trigger_body_ratio": confirm_body_ratio,
+        "trigger_close_pos": confirm_close_pos,
+        "trigger_rvol": confirm_rvol,
+        "extension_atr": ema_extension_atr,
+    }
 
     if direction == "long":
-        diag = {
-            "reset_low": reset_low,
-            "ema20_ref": max_ema20,
-            "ema50_ref": min_ema50,
-            "extension_atr": extension_atr,
-            "prev_high": prev_high,
-            "trigger_body_ratio": trigger_body_ratio,
-            "trigger_close_pos": trigger_close_pos,
-            "confirm_buffer": confirm_buffer,
-        }
-        if reset_low > max_ema20 + atr_value * RESET_TOUCH_TOL_ATR:
-            return False, "NO_5M_RESET_TOUCH", diag
-        if reset_low < min_ema50 - atr_value * RESET_BREAK_TOL_ATR:
-            return False, "RESET_TOO_DEEP", diag
-        reclaim_ok = (
-            float(c[i]) > float(ema20[i])
-            and float(c[i]) > float(o[i])
-            and float(c[i]) >= prev_high + confirm_buffer
-            and trigger_body_ratio >= TRIGGER_MIN_BODY_RATIO
-            and trigger_close_pos >= TRIGGER_CLOSE_POS_LONG_MIN
-        )
-        if not reclaim_ok:
-            return False, "NO_5M_CONTINUATION_CONFIRM", diag
+        if not (
+            float(c[i]) > float(o[i])
+            and confirm_body_ratio >= TRIGGER_MIN_BODY_RATIO
+            and confirm_close_pos >= TRIGGER_CLOSE_POS_LONG_MIN
+            and confirm_rvol >= TRIGGER_MIN_RVOL
+        ):
+            return False, "NO_FRESH_CONFIRMATION", base_diag
     else:
-        diag = {
-            "reset_high": reset_high,
-            "ema20_ref": min_ema20,
-            "ema50_ref": max_ema50,
-            "extension_atr": extension_atr,
-            "prev_low": prev_low,
-            "trigger_body_ratio": trigger_body_ratio,
-            "trigger_close_pos": trigger_close_pos,
-            "confirm_buffer": confirm_buffer,
-        }
-        if reset_high < min_ema20 - atr_value * RESET_TOUCH_TOL_ATR:
-            return False, "NO_5M_RESET_TOUCH", diag
-        if reset_high > max_ema50 + atr_value * RESET_BREAK_TOL_ATR:
-            return False, "RESET_TOO_DEEP", diag
-        reclaim_ok = (
-            float(c[i]) < float(ema20[i])
-            and float(c[i]) < float(o[i])
-            and float(c[i]) <= prev_low - confirm_buffer
-            and trigger_body_ratio >= TRIGGER_MIN_BODY_RATIO
-            and trigger_close_pos <= TRIGGER_CLOSE_POS_SHORT_MAX
-        )
-        if not reclaim_ok:
-            return False, "NO_5M_CONTINUATION_CONFIRM", diag
+        if not (
+            float(c[i]) < float(o[i])
+            and confirm_body_ratio >= TRIGGER_MIN_BODY_RATIO
+            and confirm_close_pos <= TRIGGER_CLOSE_POS_SHORT_MAX
+            and confirm_rvol >= TRIGGER_MIN_RVOL
+        ):
+            return False, "NO_FRESH_CONFIRMATION", base_diag
 
-    if extension_atr > TRIGGER_MAX_EMA20_EXTENSION_ATR:
-        return False, "TOO_EXTENDED_AFTER_CONFIRM", diag
-    return True, "OK", diag
+    # Current candle must follow the retest immediately.  Search for the most
+    # recent valid breakout whose intervening 1-3 candles form the retest.
+    last_diag = dict(base_diag)
+    for retest_count in range(1, RETEST_MAX_BARS_AFTER_BREAKOUT + 1):
+        breakout_idx = i - retest_count - 1
+        if breakout_idx <= STRUCTURE_LOOKBACK_BARS:
+            continue
+        structure_start = breakout_idx - STRUCTURE_LOOKBACK_BARS
+        structure_end = breakout_idx
+        if direction == "long":
+            structural_level = max(float(x) for x in h[structure_start:structure_end])
+        else:
+            structural_level = min(float(x) for x in l[structure_start:structure_end])
+
+        breakout_body_ratio, breakout_close_pos = _candle_shape(o, h, l, c, breakout_idx)
+        breakout_rvol = relative_volume(v, breakout_idx) if v else 1.0
+        breakout_buffer = atr_value * BREAKOUT_CLOSE_BUFFER_ATR
+        breakout_extension_atr = abs(float(c[breakout_idx]) - structural_level) / atr_value
+        retest_indices = list(range(breakout_idx + 1, i))
+        if not retest_indices:
+            continue
+
+        if direction == "long":
+            breakout_ok = (
+                float(c[breakout_idx]) > float(o[breakout_idx])
+                and float(c[breakout_idx]) >= structural_level + breakout_buffer
+                and breakout_body_ratio >= BREAKOUT_MIN_BODY_RATIO
+                and breakout_close_pos >= BREAKOUT_CLOSE_POS_LONG_MIN
+                and breakout_rvol >= BREAKOUT_MIN_RVOL
+                and breakout_extension_atr <= BREAKOUT_MAX_EXTENSION_ATR
+            )
+            retest_low = min(float(l[j]) for j in retest_indices)
+            retest_extreme = retest_low
+            retest_touch = retest_low <= structural_level + atr_value * RETEST_TOUCH_TOL_ATR
+            no_deep_wick = retest_low >= structural_level - atr_value * RETEST_MAX_PENETRATION_ATR
+            no_failed_close = all(
+                float(c[j]) >= structural_level - atr_value * RETEST_CLOSE_INVALIDATION_ATR
+                for j in retest_indices
+            )
+            retest_stayed_near = all(
+                abs(float(c[j]) - structural_level) <= atr_value * RETEST_MAX_CLOSE_DISTANCE_ATR
+                for j in retest_indices
+            )
+            last_retest_idx = retest_indices[-1]
+            last_retest_near = (
+                float(l[last_retest_idx]) <= structural_level + atr_value * RETEST_TOUCH_TOL_ATR
+                and abs(float(c[last_retest_idx]) - structural_level) <= atr_value * RETEST_MAX_CLOSE_DISTANCE_ATR
+            )
+            confirm_level = max(structural_level, float(h[last_retest_idx]))
+            confirm_ok = (
+                float(c[i]) >= confirm_level + atr_value * CONFIRM_BREAK_BUFFER_ATR
+                and float(c[i]) > structural_level
+            )
+            structure_extension_atr = (float(c[i]) - structural_level) / atr_value
+        else:
+            breakout_ok = (
+                float(c[breakout_idx]) < float(o[breakout_idx])
+                and float(c[breakout_idx]) <= structural_level - breakout_buffer
+                and breakout_body_ratio >= BREAKOUT_MIN_BODY_RATIO
+                and breakout_close_pos <= BREAKOUT_CLOSE_POS_SHORT_MAX
+                and breakout_rvol >= BREAKOUT_MIN_RVOL
+                and breakout_extension_atr <= BREAKOUT_MAX_EXTENSION_ATR
+            )
+            retest_high = max(float(h[j]) for j in retest_indices)
+            retest_extreme = retest_high
+            retest_touch = retest_high >= structural_level - atr_value * RETEST_TOUCH_TOL_ATR
+            no_deep_wick = retest_high <= structural_level + atr_value * RETEST_MAX_PENETRATION_ATR
+            no_failed_close = all(
+                float(c[j]) <= structural_level + atr_value * RETEST_CLOSE_INVALIDATION_ATR
+                for j in retest_indices
+            )
+            retest_stayed_near = all(
+                abs(float(c[j]) - structural_level) <= atr_value * RETEST_MAX_CLOSE_DISTANCE_ATR
+                for j in retest_indices
+            )
+            last_retest_idx = retest_indices[-1]
+            last_retest_near = (
+                float(h[last_retest_idx]) >= structural_level - atr_value * RETEST_TOUCH_TOL_ATR
+                and abs(float(c[last_retest_idx]) - structural_level) <= atr_value * RETEST_MAX_CLOSE_DISTANCE_ATR
+            )
+            confirm_level = min(structural_level, float(l[last_retest_idx]))
+            confirm_ok = (
+                float(c[i]) <= confirm_level - atr_value * CONFIRM_BREAK_BUFFER_ATR
+                and float(c[i]) < structural_level
+            )
+            structure_extension_atr = (structural_level - float(c[i])) / atr_value
+
+        last_diag = {
+            **base_diag,
+            "structural_level": structural_level,
+            "breakout_idx": breakout_idx,
+            "breakout_age_bars": i - breakout_idx,
+            "retest_bars": retest_count,
+            "retest_extreme": retest_extreme,
+            "breakout_body_ratio": breakout_body_ratio,
+            "breakout_close_pos": breakout_close_pos,
+            "breakout_rvol": breakout_rvol,
+            "breakout_extension_atr": breakout_extension_atr,
+            "structure_extension_atr": structure_extension_atr,
+            "confirm_level": confirm_level,
+            "retest_touch": retest_touch,
+            "retest_no_deep_wick": no_deep_wick,
+            "retest_no_failed_close": no_failed_close,
+            "retest_stayed_near": retest_stayed_near,
+            "last_retest_near": last_retest_near,
+        }
+        if not breakout_ok:
+            continue
+        if not (retest_touch and no_deep_wick and no_failed_close and retest_stayed_near and last_retest_near):
+            continue
+        if not confirm_ok:
+            continue
+        if structure_extension_atr > ENTRY_MAX_STRUCTURE_EXTENSION_ATR:
+            return False, "IMPULSE_ALREADY_EXTENDED", last_diag
+        return True, "OK", last_diag
+
+    return False, "NO_FRESH_BREAKOUT_RETEST", last_diag
 
 
 def _structure_target(direction, close, highs5, lows5, highs15, lows15):
     """Nearest opposing swing, or a projection of the latest consolidation range."""
-    recent_high = max(highs5[-(RESET_LOOKBACK_BARS + 1):-1])
-    recent_low = min(lows5[-(RESET_LOOKBACK_BARS + 1):-1])
+    recent_high = max(highs5[-8:-1])
+    recent_low = min(lows5[-8:-1])
     range_size = recent_high - recent_low
     if direction == Direction.LONG:
         levels = [x for x in (max(highs5[-35:-1]), max(highs15[-25:-1])) if x > close]
@@ -250,20 +357,20 @@ class BreakoutRetestStrategy:
         if not ok_trigger:
             return self._reject(trigger_reason.lower(), **trigger_diag)
 
+        retest_extreme = float(trigger_diag.get("retest_extreme", close5))
         if bias1h == "long":
-            reset_extreme = min(tf5["l"][max(0, len(tf5["l"]) - 1 - RESET_LOOKBACK_BARS): len(tf5["l"]) - 1])
-            structural_pct = max(0.0, (close5 - reset_extreme) / max(close5, 1e-12))
             direction = Direction.LONG
+            structural_pct = max(0.0, (close5 - retest_extreme) / max(close5, 1e-12))
+            stop = retest_extreme - atr5 * MTF_SL_BUFFER_ATR
         else:
-            reset_extreme = max(tf5["h"][max(0, len(tf5["h"]) - 1 - RESET_LOOKBACK_BARS): len(tf5["h"]) - 1])
-            structural_pct = max(0.0, (reset_extreme - close5) / max(close5, 1e-12))
             direction = Direction.SHORT
+            structural_pct = max(0.0, (retest_extreme - close5) / max(close5, 1e-12))
+            stop = retest_extreme + atr5 * MTF_SL_BUFFER_ATR
 
-        stop = (reset_extreme - atr5 * MTF_SL_BUFFER_ATR if direction == Direction.LONG
-                else reset_extreme + atr5 * MTF_SL_BUFFER_ATR)
         sl_pct = abs(close5 - stop) / close5
         if stop <= 0 or sl_pct <= 0:
             return self._reject('invalid_structural_stop')
+
         extension_atr = float(trigger_diag.get("extension_atr", 0.0) or 0.0)
         h1_strength = clamp((float(diag1h.get("adx", 0.0)) - H1_ADX_MIN) / 15.0, 0.0, 1.0)
         m15_strength = clamp((float(diag15.get("adx", 0.0)) - M15_ADX_MIN) / 14.0, 0.0, 1.0)
@@ -274,13 +381,25 @@ class BreakoutRetestStrategy:
             0.0,
             1.0,
         )
-        reset_quality = clamp(1.0 - clamp(extension_atr / max(TRIGGER_MAX_EMA20_EXTENSION_ATR, 1e-12), 0.0, 1.0), 0.0, 1.0)
+        freshness_quality = clamp(
+            1.0 - (float(trigger_diag.get("retest_bars", RETEST_MAX_BARS_AFTER_BREAKOUT)) - 1.0)
+            / max(RETEST_MAX_BARS_AFTER_BREAKOUT, 1),
+            0.0,
+            1.0,
+        )
+        extension_quality = clamp(
+            1.0 - float(trigger_diag.get("structure_extension_atr", ENTRY_MAX_STRUCTURE_EXTENSION_ATR))
+            / max(ENTRY_MAX_STRUCTURE_EXTENSION_ATR, 1e-12),
+            0.0,
+            1.0,
+        )
         quality = clamp(
-            0.30 * h1_strength
-            + 0.25 * m15_strength
-            + 0.20 * m5_strength
-            + 0.15 * trend_alignment_quality
-            + 0.10 * reset_quality,
+            0.27 * h1_strength
+            + 0.23 * m15_strength
+            + 0.18 * m5_strength
+            + 0.14 * trend_alignment_quality
+            + 0.10 * freshness_quality
+            + 0.08 * extension_quality,
             0.0,
             1.0,
         )
@@ -289,6 +408,21 @@ class BreakoutRetestStrategy:
             return self._reject("score_too_low", score=score, min=MIN_SCORE_TO_SIGNAL)
 
         structural_target = _structure_target(direction, close5, tf5['h'], tf5['l'], tf15['h'], tf15['l'])
+        structural_level = float(trigger_diag.get("structural_level", close5))
+        path_from_breakout = abs(structural_target - structural_level)
+        path_consumed = abs(close5 - structural_level)
+        consumed_ratio = path_consumed / max(path_from_breakout, 1e-12)
+        # Only use the ratio gate when the remaining structural path is meaningful.
+        if path_from_breakout >= atr5 * 0.45 and consumed_ratio > MAX_IMPULSE_CONSUMED_RATIO:
+            return self._reject(
+                "impulse_already_consumed",
+                impulse_consumed_ratio=consumed_ratio,
+                max=MAX_IMPULSE_CONSUMED_RATIO,
+                structural_level=structural_level,
+                structural_target=structural_target,
+                entry=close5,
+            )
+
         target, target_ratio = front_run_target(close5, structural_target, direction)
         structural_tp_pct = abs(structural_target - close5) / close5
         tp_pct = abs(target - close5) / close5
@@ -305,7 +439,7 @@ class BreakoutRetestStrategy:
 
         self.last_trace = {
             "accepted": True,
-            "reason": "setup_valid",
+            "reason": "fresh_breakout_retest_confirmed",
             "score": score,
             "direction": direction.value,
             "atr_pct": atr_pct,
@@ -318,11 +452,16 @@ class BreakoutRetestStrategy:
             "stop": stop,
             "target": target,
             "structural_target": structural_target,
+            "structural_level": structural_level,
             "target_front_run_ratio": target_ratio,
             "execution_rr": execution_rr,
             "structural_stop_pct": structural_pct,
             "trigger_body_ratio": trigger_diag.get("trigger_body_ratio"),
             "trigger_close_pos": trigger_diag.get("trigger_close_pos"),
+            "breakout_age_bars": trigger_diag.get("breakout_age_bars"),
+            "retest_bars": trigger_diag.get("retest_bars"),
+            "structure_extension_atr": trigger_diag.get("structure_extension_atr"),
+            "impulse_consumed_ratio": consumed_ratio,
         }
         return TradeIntent(
             decision_id,
@@ -335,16 +474,26 @@ class BreakoutRetestStrategy:
             score,
             regime.risk_multiplier,
             timeframe,
-            ("mtf_1h_15m_alignment", "5m_reset_retest", "continuation_confirmed"),
+            ("mtf_1h_15m_alignment", "structural_breakout", "fresh_retest", "fresh_confirmation"),
             {
-                "strategy_model": "mtf_simple_continuation_5m_v3_entry_quality",
+                "strategy_model": "structural_breakout_retest_fresh_confirmation_v4",
                 "score": score,
                 "strength": strength,
                 "atr_pct": atr_pct,
                 "atr_value": atr5,
+                "structural_level": structural_level,
+                "breakout_age_bars": trigger_diag.get("breakout_age_bars"),
+                "retest_bars": trigger_diag.get("retest_bars"),
+                "retest_extreme": retest_extreme,
+                "breakout_body_ratio": trigger_diag.get("breakout_body_ratio"),
+                "breakout_rvol": trigger_diag.get("breakout_rvol"),
+                "breakout_extension_atr": trigger_diag.get("breakout_extension_atr"),
                 "trigger_body_ratio": trigger_diag.get("trigger_body_ratio"),
                 "trigger_close_pos": trigger_diag.get("trigger_close_pos"),
+                "trigger_rvol": trigger_diag.get("trigger_rvol"),
                 "trigger_extension_atr": extension_atr,
+                "structure_extension_atr": trigger_diag.get("structure_extension_atr"),
+                "impulse_consumed_ratio": consumed_ratio,
                 "adx5": adx5,
                 "adx15": diag15["adx"],
                 "adx1h": diag1h["adx"],

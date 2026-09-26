@@ -46,4 +46,13 @@ class Position:
     exit_trigger_price:float|None=None
     stop_gap_bps:float|None=None
     exit_quote_delay_ms:int|None=None
+    # Product provenance. BOT positions are created by the strategy engine;
+    # MANUAL positions are explicitly submitted by the authenticated user.
+    source:str='BOT'
+    order_type:str='MARKET'
+    margin_mode:str='ISOLATED'
+    position_margin:float|None=None
+    liquidation_price:float|None=None
+    exchange_order_id:str|None=None
+    client_order_id:str|None=None
     opened_at:int|None=None; closed_at:int|None=None; exit_price:float|None=None; exit_reason:str|None=None

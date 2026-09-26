@@ -272,3 +272,15 @@ tests/test_billing_api_serialization.py
 tests/test_billing_payment_flow_hardening.py
 
 ELIMINADOS: ninguno
+
+CORRECCIÓN — Orden INVALID antigua reutilizada/no aparece orden nueva
+BASE: KaeleonX-billing-idempotente-verificacion-BSC.zip
+
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+app/billing/service.py
+frontend/src/pages/SubscriptionPage.tsx
+tests/test_billing_payment_flow_hardening.py
+
+NUEVOS: ninguno
+ELIMINADOS: ninguno

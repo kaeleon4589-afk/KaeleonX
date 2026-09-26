@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from app.models.market import Candle
 
-TF_MS = {'5m': 300_000, '15m': 900_000, '1h': 3_600_000}
+TF_MS = {'1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000}
 
 
 class MarketCoordinator:
@@ -90,6 +90,16 @@ class MarketCoordinator:
         k5, k15, k1h = await asyncio.gather(
             self.client.klines(sym, '5m', 321), self.client.klines(sym, '15m', 241),
             self.client.klines(sym, '1h', 241))
+        # v6 uses closed 1m candles only for micro-confirmation. Keep this feed
+        # optional at the market-adapter boundary so monitoring/reconciliation
+        # remains available during a temporary 1m endpoint failure.
+        try:
+            k1m = await self.client.klines(sym, '1m', 181)
+        except Exception as exc:
+            k1m = None
+            if self.audit:
+                self.audit.event('MARKET_MICRODATA_ERROR', 'system', level='WARNING',
+                                 symbol=sym, error=f'{type(exc).__name__}: {exc}')
         # Fetch executable quotes after candles, not before potentially slow downloads.
         quote = await self.quote(sym)
         now = int(time.time() * 1000)
@@ -105,6 +115,18 @@ class MarketCoordinator:
             if any(b.timestamp - a.timestamp != span for a, b in zip(recent, recent[1:])):
                 raise RuntimeError(f'candle_gap:{sym}:{tf}')
             frames[tf] = candles
+        if k1m is not None:
+            span = TF_MS['1m']
+            micro = [c for c in self._parse_klines(k1m) if c.timestamp + span <= now]
+            if len(micro) >= 120:
+                recent_micro = micro[-120:]
+                fresh = now - recent_micro[-1].timestamp <= span * 2 + 15_000
+                contiguous = all(b.timestamp - a.timestamp == span for a, b in zip(recent_micro, recent_micro[1:]))
+                if fresh and contiguous:
+                    frames['1m'] = micro
+                elif self.audit:
+                    self.audit.event('MARKET_MICRODATA_INVALID', 'system', level='WARNING',
+                                     symbol=sym, bars=len(micro), fresh=fresh, contiguous=contiguous)
         quote.candles = frames['5m']
         quote.timeframes = frames
         quote.btc_candles = btc_candles

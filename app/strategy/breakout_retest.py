@@ -36,6 +36,7 @@ RETEST_TOUCH_TOL_ATR = 0.18
 RETEST_MAX_PENETRATION_ATR = 0.30
 RETEST_CLOSE_INVALIDATION_ATR = 0.10
 RETEST_MAX_CLOSE_DISTANCE_ATR = 0.28
+RETEST_MIN_PULLBACK_ATR = 0.18
 CONFIRM_BREAK_BUFFER_ATR = 0.02
 TRIGGER_MIN_BODY_RATIO = 0.30
 TRIGGER_CLOSE_POS_LONG_MIN = 0.66
@@ -44,7 +45,15 @@ TRIGGER_MIN_RVOL = 0.90
 TRIGGER_MAX_EMA20_EXTENSION_ATR = 2.00  # telemetry guard; structural extension is the anti-late gate
 ENTRY_MAX_STRUCTURE_EXTENSION_ATR = 0.75
 MAX_IMPULSE_CONSUMED_RATIO = 0.45
+# Higher-timeframe exhaustion guard: do not buy the top of a vertical 24h move
+# (or short the bottom) just because a small 5m breakout/retest appears locally.
+HTF_EXHAUSTION_LOOKBACK_1H = 24
+HTF_EXTREME_MOVE_PCT = 0.08
+HTF_RANGE_EDGE = 0.92
+H1_MAX_EMA20_EXTENSION_ATR = 1.65
+M15_MAX_EMA20_EXTENSION_ATR = 1.80
 MTF_SL_BUFFER_ATR = 0.10
+MIN_SIGNAL_STOP_ATR_5M = 0.95
 MIN_RR_TO_SIGNAL = 1.05
 MIN_SCORE_TO_SIGNAL = 78.0
 MAX_SCORE = 100.0
@@ -198,6 +207,7 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
             )
             retest_low = min(float(l[j]) for j in retest_indices)
             retest_extreme = retest_low
+            retest_pullback_atr = max(0.0, float(c[breakout_idx]) - retest_low) / atr_value
             retest_touch = retest_low <= structural_level + atr_value * RETEST_TOUCH_TOL_ATR
             no_deep_wick = retest_low >= structural_level - atr_value * RETEST_MAX_PENETRATION_ATR
             no_failed_close = all(
@@ -230,6 +240,7 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
             )
             retest_high = max(float(h[j]) for j in retest_indices)
             retest_extreme = retest_high
+            retest_pullback_atr = max(0.0, retest_high - float(c[breakout_idx])) / atr_value
             retest_touch = retest_high >= structural_level - atr_value * RETEST_TOUCH_TOL_ATR
             no_deep_wick = retest_high <= structural_level + atr_value * RETEST_MAX_PENETRATION_ATR
             no_failed_close = all(
@@ -270,10 +281,13 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
             "retest_no_failed_close": no_failed_close,
             "retest_stayed_near": retest_stayed_near,
             "last_retest_near": last_retest_near,
+            "retest_pullback_atr": retest_pullback_atr,
         }
         if not breakout_ok:
             continue
         if not (retest_touch and no_deep_wick and no_failed_close and retest_stayed_near and last_retest_near):
+            continue
+        if retest_pullback_atr < RETEST_MIN_PULLBACK_ATR:
             continue
         if not confirm_ok:
             continue
@@ -282,6 +296,48 @@ def _trigger(direction: str, tf: dict) -> tuple[bool, str, dict]:
         return True, "OK", last_diag
 
     return False, "NO_FRESH_BREAKOUT_RETEST", last_diag
+
+
+def _htf_exhaustion(direction: str, tf1h: dict, tf15: dict) -> tuple[bool, dict]:
+    """Detect a vertical, mature move near the 24h edge.
+
+    A local 5m breakout is not enough if the higher timeframe is already stretched.
+    This is deliberately symmetric for LONG/SHORT.
+    """
+    c1, h1, l1 = tf1h["c"], tf1h["h"], tf1h["l"]
+    c15 = tf15["c"]
+    if len(c1) < HTF_EXHAUSTION_LOOKBACK_1H + 1 or not c15:
+        return False, {}
+    lookback = HTF_EXHAUSTION_LOOKBACK_1H
+    close1 = float(c1[-1])
+    ref1 = float(c1[-lookback])
+    high24 = max(float(x) for x in h1[-lookback:])
+    low24 = min(float(x) for x in l1[-lookback:])
+    span = max(high24 - low24, 1e-12)
+    range_pos = clamp((close1 - low24) / span, 0.0, 1.0)
+    move_pct = (close1 - ref1) / max(abs(ref1), 1e-12)
+    atr1 = max(float(tf1h.get("atr") or 0.0), 1e-12)
+    atr15 = max(float(tf15.get("atr") or 0.0), 1e-12)
+    h1_ext = abs(close1 - float(tf1h["ema20"][-1])) / atr1
+    close15 = float(c15[-1])
+    m15_ext = abs(close15 - float(tf15["ema20"][-1])) / atr15
+
+    if direction == "long":
+        extreme_move = move_pct >= HTF_EXTREME_MOVE_PCT and range_pos >= HTF_RANGE_EDGE
+        stretched = move_pct >= 0.06 and range_pos >= 0.95 and h1_ext >= H1_MAX_EMA20_EXTENSION_ATR and m15_ext >= M15_MAX_EMA20_EXTENSION_ATR
+    else:
+        extreme_move = move_pct <= -HTF_EXTREME_MOVE_PCT and range_pos <= (1.0 - HTF_RANGE_EDGE)
+        stretched = move_pct <= -0.06 and range_pos <= 0.05 and h1_ext >= H1_MAX_EMA20_EXTENSION_ATR and m15_ext >= M15_MAX_EMA20_EXTENSION_ATR
+    return bool(extreme_move or stretched), {
+        "htf_24h_move_pct": move_pct,
+        "htf_24h_range_position": range_pos,
+        "htf_24h_high": high24,
+        "htf_24h_low": low24,
+        "h1_ema20_extension_atr": h1_ext,
+        "m15_ema20_extension_atr": m15_ext,
+        "htf_extreme_move": bool(extreme_move),
+        "htf_stretched": bool(stretched),
+    }
 
 
 def _structure_target(direction, close, highs5, lows5, highs15, lows15):
@@ -353,6 +409,10 @@ class BreakoutRetestStrategy:
         if bias1h != bias15:
             return self._reject("mtf_bias_mismatch", bias_1h=bias1h, bias_15m=bias15)
 
+        exhausted, exhaustion_diag = _htf_exhaustion(bias1h, tf1h, tf15)
+        if exhausted:
+            return self._reject("higher_timeframe_move_exhausted", **exhaustion_diag)
+
         ok_trigger, trigger_reason, trigger_diag = _trigger(bias1h, tf5)
         if not ok_trigger:
             return self._reject(trigger_reason.lower(), **trigger_diag)
@@ -370,6 +430,15 @@ class BreakoutRetestStrategy:
         sl_pct = abs(close5 - stop) / close5
         if stop <= 0 or sl_pct <= 0:
             return self._reject('invalid_structural_stop')
+        stop_distance = abs(close5 - stop)
+        stop_atr_5m = stop_distance / max(atr5, 1e-12)
+        if stop_atr_5m < MIN_SIGNAL_STOP_ATR_5M:
+            return self._reject(
+                'structural_stop_inside_5m_noise',
+                stop_distance=stop_distance, stop_atr_5m=stop_atr_5m,
+                minimum_stop_atr_5m=MIN_SIGNAL_STOP_ATR_5M,
+                entry=close5, stop=stop, atr_5m=atr5,
+            )
 
         extension_atr = float(trigger_diag.get("extension_atr", 0.0) or 0.0)
         h1_strength = clamp((float(diag1h.get("adx", 0.0)) - H1_ADX_MIN) / 15.0, 0.0, 1.0)
@@ -462,6 +531,8 @@ class BreakoutRetestStrategy:
             "retest_bars": trigger_diag.get("retest_bars"),
             "structure_extension_atr": trigger_diag.get("structure_extension_atr"),
             "impulse_consumed_ratio": consumed_ratio,
+            "stop_atr_5m": stop_atr_5m,
+            **exhaustion_diag,
         }
         return TradeIntent(
             decision_id,
@@ -476,7 +547,7 @@ class BreakoutRetestStrategy:
             timeframe,
             ("mtf_1h_15m_alignment", "structural_breakout", "fresh_retest", "fresh_confirmation"),
             {
-                "strategy_model": "structural_breakout_retest_fresh_confirmation_v4",
+                "strategy_model": "structural_breakout_retest_fresh_confirmation_v5",
                 "score": score,
                 "strength": strength,
                 "atr_pct": atr_pct,
@@ -494,6 +565,8 @@ class BreakoutRetestStrategy:
                 "trigger_extension_atr": extension_atr,
                 "structure_extension_atr": trigger_diag.get("structure_extension_atr"),
                 "impulse_consumed_ratio": consumed_ratio,
+                "stop_atr_5m": stop_atr_5m,
+                **exhaustion_diag,
                 "adx5": adx5,
                 "adx15": diag15["adx"],
                 "adx1h": diag1h["adx"],

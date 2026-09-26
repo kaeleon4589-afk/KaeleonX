@@ -117,6 +117,7 @@ class UserTradingRuntimeManager:
             estimated_exit_fee_rate=(self.settings.paper_taker_fee if mode == TradingEnvironment.DEMO.value
                                      else self.settings.trade_exit_fee_rate_estimate),
             break_even_buffer_bps=self.settings.trade_break_even_buffer_bps,
+            dynamic_protection_enabled=self.settings.trade_dynamic_protection_enabled,
         )
         if hasattr(execution, "on_realized"):
             position_manager.on_realized = execution.on_realized

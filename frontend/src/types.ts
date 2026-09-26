@@ -98,7 +98,7 @@ export type Position = Record<string, unknown> & {
   tp2_price?: number;
 };
 
-export type Operations = { mode?: 'demo'|'live'; open: Position[]; closed: Position[] };
+export type Operations = { mode?: 'demo'|'live'; dynamic_protection_enabled?: boolean; open: Position[]; closed: Position[] };
 export type Entitlement = {
   demo_allowed: boolean;
   live_allowed: boolean;

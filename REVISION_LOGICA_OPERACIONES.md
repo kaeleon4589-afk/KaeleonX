@@ -132,3 +132,21 @@ La señal se calcula sobre una vela 5m cerrada, pero la orden usa bid/ask poster
 - `pytest -q`: **157 pruebas aprobadas**.
 - Nuevas pruebas cubren: falsa ruptura solo por mecha, umbrales endurecidos, anti-chase, invalidación antes del fill, stop dentro del ruido, conflicto severo del Order Book, cooldown global/símbolo y reconstrucción del cooldown después de reiniciar.
 - No se enviaron órdenes reales durante esta validación y no se afirma rentabilidad por pruebas unitarias.
+
+## 2026-09-25 — BREAKOUT_RETEST v4: ruptura estructural + retest fresco + confirmación
+
+Se sustituyó la confirmación basada en superar la vela inmediatamente anterior por una secuencia estructural obligatoria de tres fases:
+
+1. Ruptura real por cierre sobre/bajo un nivel de las últimas 20 velas.
+2. Retest de 1 a 3 velas que permanezca cerca del nivel roto y no lo invalide.
+3. Confirmación inmediata en la vela siguiente al retest; no se aceptan varias velas de continuación antes de entrar.
+
+Protecciones añadidas:
+- ruptura máxima de 0.60 ATR sobre el nivel estructural;
+- retest con penetración máxima de 0.30 ATR y cierres a no más de 0.28 ATR del nivel;
+- entrada máxima a 0.75 ATR del nivel estructural;
+- rechazo si ya se consumió más del 45% del recorrido estructural hacia el objetivo;
+- SL anclado al extremo real del retest, manteniendo el filtro posterior contra stops dentro del ruido de mercado;
+- telemetría de nivel estructural, edad del breakout, barras de retest, extensión y porcentaje de impulso consumido.
+
+El objetivo es impedir entradas tardías en la segunda/tercera vela de un rebote ya desarrollado, como el caso CC observado en DEMO.

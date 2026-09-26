@@ -84,3 +84,51 @@ Los eventos `REGIME_EVALUATED` y `STRATEGY_EVALUATED` incluyen ahora dirección 
 - `pytest -q`: **149 pruebas aprobadas**.
 - Se añadieron pruebas que comprueban igualdad de score para movimientos `+X%/-X%`, simetría del alignment EMA, clasificación de tendencia bajista con `short` bias y generación real de intents `LONG` y `SHORT` sobre setups MTF espejo.
 - No se añadieron cuotas de dirección ni se obligó al motor a abrir SHORT cuando no existe un setup válido.
+
+## Protección de calidad de entrada y cooldown post-loss — 2026-09-25
+
+Se corrigió el patrón observado de operaciones que abrían y avanzaban casi de inmediato hacia SL, incluyendo reentradas rápidas tras una pérdida. El objetivo de esta revisión es reducir falsas rupturas, entradas perseguidas y stops situados dentro del ruido normal del mercado. No se amplía artificialmente el SL ni se fuerza una operación: si la geometría deja de ser buena, el setup se descarta.
+
+### BreakoutRetest endurecido
+- La ruptura 5m ya no se confirma por una mecha. LONG exige cierre real por encima del máximo previo más un buffer de 0.03 ATR; SHORT exige cierre real por debajo del mínimo previo menos el mismo buffer.
+- La vela de confirmación debe tener cuerpo mínimo del 28% de su rango y cerrar en el 38% superior/inferior correspondiente (`close_pos >= 0.62` para LONG, `<= 0.38` para SHORT).
+- ADX mínimo sube a 16 (1H), 14 (15m) y 12 (5m).
+- Extensión máxima respecto a EMA20 baja de 0.95 ATR a 0.70 ATR.
+- El score mínimo sube a 78 y deja de partir automáticamente en 69; ahora se construye desde 55 + calidad real.
+- RR mínimo de estrategia y ejecución sube de 0.95 a 1.05.
+
+### LiquiditySweep endurecido
+- La antigüedad máxima del sweep baja de 8 a 5 velas.
+- Profundidad mínima del sweep sube a 0.15 ATR, wick mínimo a 0.32 y RVOL mínimo del sweep a 0.70.
+- Trigger: RVOL mínimo 0.65, cuerpo mínimo 0.24 y cierre fuerte (`>= 0.62` LONG / `<= 0.38` SHORT).
+- Extensión máxima desde la liquidez baja de 2.25 ATR a 1.10 ATR.
+- Tolerancias de recuperación EMA e invalidación del retest se vuelven más estrictas.
+- Score mínimo sube a 78 y RR mínimo a 1.05.
+
+### Guardas justo antes de ejecutar
+La señal se calcula sobre una vela 5m cerrada, pero la orden usa bid/ask posterior. Antes de mandar una orden se vuelve a validar:
+1. `entry_chased_after_signal`: rechaza si el precio ejecutable continuó más de 0.20 ATR en la dirección de la señal después del cierre.
+2. `entry_confirmation_lost_before_fill`: rechaza si el mercado retrocedió más de 0.15 ATR contra la confirmación antes de ejecutar.
+3. `stop_inside_market_noise`: rechaza si ENTRY→SL es menor que el máximo entre 0.55 ATR y 3 spreads actuales. El SL no se ensancha para salvar la señal.
+4. `orderbook_conflict`: con al menos 5 niveles válidos por lado, rechaza únicamente un conflicto severo del top-20 del libro (imbalance contrario >= 35%). Esto es un veto final, no una señal de entrada por sí solo.
+
+### Cooldown después de una pérdida
+- Pérdida cerrada: 15 minutos sin nuevas entradas globales para ese runtime/usuario/modo.
+- Mismo símbolo: 30 minutos sin reentrada.
+- Si la posición cerró mediante profit lock o break-even con resultado neto positivo, no se considera pérdida y no inicia cooldown.
+- El cooldown se registra en cierres DEMO locales y cierres LIVE reconciliados, y se reconstruye desde las posiciones persistidas tras reiniciar el worker. Esto evita `SL -> nueva operación inmediata -> SL` incluso después de un restart.
+
+### Variables de entorno
+- `TRADE_POST_LOSS_GLOBAL_COOLDOWN_SECONDS=900`
+- `TRADE_POST_LOSS_SYMBOL_COOLDOWN_SECONDS=1800`
+- `TRADE_ENTRY_MAX_CHASE_ATR=0.20`
+- `TRADE_ENTRY_MAX_ADVERSE_REVERSAL_ATR=0.15`
+- `TRADE_ENTRY_MIN_STOP_ATR=0.55`
+- `TRADE_ENTRY_MIN_STOP_SPREADS=3.0`
+- `TRADE_ENTRY_ORDERBOOK_CONFLICT_THRESHOLD=0.35`
+
+### Validación
+- `python -m compileall -q app`: sin errores.
+- `pytest -q`: **157 pruebas aprobadas**.
+- Nuevas pruebas cubren: falsa ruptura solo por mecha, umbrales endurecidos, anti-chase, invalidación antes del fill, stop dentro del ruido, conflicto severo del Order Book, cooldown global/símbolo y reconstrucción del cooldown después de reiniciar.
+- No se enviaron órdenes reales durante esta validación y no se afirma rentabilidad por pruebas unitarias.

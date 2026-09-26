@@ -218,3 +218,21 @@ frontend/src/styles.css
 
 NUEVOS: ninguno
 ELIMINADOS: ninguno
+
+AMPLIACIÓN — Entry Quality / False Breakout / Cooldown post-loss
+BASE COMPARADA: KaeleonX-share-card-transparente.zip
+
+MODIFICADOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+REVISION_LOGICA_OPERACIONES.md
+app/config/settings.py
+app/orchestrator.py
+app/strategy/breakout_retest.py
+app/strategy/liquidity_sweep.py
+app/trading/runtime.py
+
+NUEVO:
+tests/test_entry_quality_guard.py
+
+ELIMINADOS: ninguno

@@ -42,6 +42,16 @@ type ChartMode = 'candle' | 'area';
 type DrawingTool = 'straightLine' | 'segment' | 'horizontalStraightLine' | 'priceLine' | 'priceChannelLine' | 'parallelStraightLine' | 'fibonacciLine' | 'simpleAnnotation' | 'brush';
 type PriceAlert = { id: string; price: number; direction: 'above' | 'below'; triggered: boolean };
 
+export type LiveMarketSelection = {
+  symbol: string;
+  display: string;
+  price: number | null;
+  bid: number | null;
+  ask: number | null;
+  pricePrecision: number;
+  maxLeverage: number | null;
+};
+
 const EMPTY_ORDER_BOOK: MarketOrderBook = { asks: [], bids: [], timestamp: null };
 const INDICATOR_DEFAULTS: Record<string, number[]> = {
   MA: [5, 10, 30, 60], EMA: [6, 12, 20], BOLL: [20, 2],
@@ -506,7 +516,7 @@ const BASE_STYLES = {
   },
 };
 
-export default function LiveMarketChart({ positions, closedPositions = [], dynamicProtectionEnabled = true }: { positions: Position[]; closedPositions?: Position[]; dynamicProtectionEnabled?: boolean }) {
+export default function LiveMarketChart({ positions, closedPositions = [], dynamicProtectionEnabled = true, onMarketChange }: { positions: Position[]; closedPositions?: Position[]; dynamicProtectionEnabled?: boolean; onMarketChange?: (market: LiveMarketSelection) => void }) {
   const firstPositionSymbol = positions.length ? positionSymbol(positions[0]) : 'BTCUSDT';
   const [selected, setSelected] = useState<MarketInstrument>({
     symbol: firstPositionSymbol,
@@ -1266,6 +1276,18 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
   const bestAsk = orderBook.asks[0]?.price ?? null;
   const bestBid = orderBook.bids[0]?.price ?? null;
   const spread = bestAsk != null && bestBid != null ? Math.max(0, bestAsk - bestBid) : null;
+
+  useEffect(() => {
+    onMarketChange?.({
+      symbol: selected.symbol,
+      display: selected.display,
+      price: livePrice ?? null,
+      bid: bestBid,
+      ask: bestAsk,
+      pricePrecision: selected.price_precision,
+      maxLeverage: ticker.max_leverage == null ? null : Number(ticker.max_leverage),
+    });
+  }, [bestAsk, bestBid, livePrice, onMarketChange, selected.display, selected.price_precision, selected.symbol, ticker.max_leverage]);
 
   return (
     <section className={`live-market-chart ${fullscreen ? 'is-fullscreen' : ''}`} ref={rootRef} aria-label="Gráfico de mercado CoinW">

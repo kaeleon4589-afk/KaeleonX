@@ -97,10 +97,15 @@ def test_sweep_front_runs_liquidity_target_and_keeps_sweep_extreme_stop(monkeypa
     assert intent.stop_price == 98.8
     assert intent.metadata['structural_target_price'] == 105
     assert intent.metadata['target_front_run_ratio'] == pytest.approx(.92)
-    assert intent.target_price == pytest.approx(104.6)
+    # Structural liquidity remains 105/104.6 front-run, but the executable TP
+    # is capped to 1.30R during the win-rate validation profile.
+    assert intent.target_price == pytest.approx(101.56)
+    assert intent.metadata['target_rr_cap'] == pytest.approx(1.30)
+    assert intent.metadata['target_rr_capped'] is True
+    assert intent.metadata['execution_rr'] == pytest.approx(1.30)
     assert intent.metadata['sl_pct'] == pytest.approx(.012)
     assert intent.metadata['structural_tp_pct'] == pytest.approx(.05)
-    assert intent.metadata['tp_pct'] == pytest.approx(.046)
+    assert intent.metadata['tp_pct'] == pytest.approx(.0156)
 
 
 @pytest.mark.parametrize('side,stop,observed', [

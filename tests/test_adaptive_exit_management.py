@@ -8,7 +8,7 @@ from app.models.trading import Position
 from app.orchestrator import TradingOrchestrator
 from app.position.exit_engine import ExitEngine
 from app.position.manager import PositionManager
-from app.position.protection import calculate_break_even_price, front_run_target
+from app.position.protection import calculate_break_even_price, cap_target_by_rr, front_run_target
 
 
 class Audit:
@@ -89,6 +89,47 @@ def test_break_even_is_fee_aware_and_profit_lock_prevents_full_reversal():
     assert any(event == "STOP_MOVED_TO_BREAK_EVEN" for event, _, _ in audit.events)
     assert any(event == "PROFIT_LOCK_ACTIVATED" for event, _, _ in audit.events)
 
+
+
+def test_validation_mode_keeps_original_stop_until_natural_tp_or_sl():
+    audit = Audit()
+    manager = PositionManager(
+        ExitEngine(), audit=audit, evaluate_local_exits=True,
+        dynamic_protection_enabled=False,
+    )
+    p = Position(
+        "eval", "d", "BTC", Direction.LONG, 1.0,
+        100.0, 99.0, 101.30, entry_fee=0.06,
+        break_even_activation_ratio=0.55,
+        profit_lock_activation_ratio=0.80,
+    )
+    manager.add(p, persist=False)
+
+    # Even deep into favorable excursion, the validation profile must not move SL.
+    manager.mark("BTC", 101.20, 1_000)
+    assert p.status == "OPEN"
+    assert p.stop_price == pytest.approx(99.0)
+    assert p.initial_stop_price == pytest.approx(99.0)
+    assert p.management_stage == "INITIAL"
+    assert p.stop_moved_to_breakeven is False
+    assert p.best_price == pytest.approx(101.20)
+    assert not any(event in {"STOP_MOVED_TO_BREAK_EVEN", "PROFIT_LOCK_ACTIVATED"} for event, _, _ in audit.events)
+
+    # The untouched setup can then resolve at its original TP.
+    manager.mark("BTC", 101.30, 2_000)
+    assert p.status == "CLOSED"
+    assert p.exit_reason == "TP2"
+
+
+def test_rr_cap_preserves_nearer_structure_and_caps_distant_target_symmetrically():
+    long_target, long_capped = cap_target_by_rr(100, 99, 110, Direction.LONG, 1.30)
+    short_target, short_capped = cap_target_by_rr(100, 101, 90, Direction.SHORT, 1.30)
+    near_target, near_capped = cap_target_by_rr(100, 99, 101.15, Direction.LONG, 1.30)
+    assert long_target == pytest.approx(101.30)
+    assert short_target == pytest.approx(98.70)
+    assert long_capped is True and short_capped is True
+    assert near_target == pytest.approx(101.15)
+    assert near_capped is False
 
 def test_short_profit_lock_is_symmetric():
     manager = PositionManager(ExitEngine(), evaluate_local_exits=True)

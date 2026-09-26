@@ -161,7 +161,7 @@ def test_frontend_chart_contract_contains_live_coinw_features():
     api = (ROOT / "frontend/src/lib/api.ts").read_text(encoding="utf-8")
     package = (ROOT / "frontend/package.json").read_text(encoding="utf-8")
 
-    assert "<LiveMarketChart positions={ops.open} closedPositions={ops.closed}/>" in dashboard
+    assert "dynamicProtectionEnabled={ops.dynamic_protection_enabled!==false}" in dashboard
     assert "candles_swap_utc" in chart
     assert "mark_price" in chart
     assert "index_price" in chart

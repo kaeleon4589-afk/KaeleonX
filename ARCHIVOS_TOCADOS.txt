@@ -236,3 +236,16 @@ NUEVO:
 tests/test_entry_quality_guard.py
 
 ELIMINADOS: ninguno
+
+CORRECCIÓN — Billing: Internal Server Error tras pegar Tx Hash
+BASE COMPARADA: KaeleonX-entry-quality-false-breakout-cooldown.zip
+
+MODIFICADOS:
+ARCHIVOS_TOCADOS.txt
+app/api/billing_api.py
+frontend/src/pages/SubscriptionPage.tsx
+
+NUEVOS:
+tests/test_billing_api_serialization.py
+
+ELIMINADOS: ninguno

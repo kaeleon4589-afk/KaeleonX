@@ -63,7 +63,8 @@ class Settings(BaseSettings):
     payment_wallet: str = ''
     payment_network: str = 'BNB_SMART_CHAIN'
     bsc_rpc_url: str = 'https://bsc-dataseed.binance.org/'
-    usdt_bsc_contract: str = ''
+    # Binance-Peg USDT on BNB Smart Chain; override with USDT_BSC_CONTRACT if needed.
+    usdt_bsc_contract: str = '0x55d398326f99059fF775485246999027B3197955'
     usdt_decimals: int = Field(18, ge=0, le=36)
 
     # telegram registration verification

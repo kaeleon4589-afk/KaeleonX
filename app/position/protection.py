@@ -8,6 +8,8 @@ from app.models.enums import Direction
 
 
 DEFAULT_TARGET_FRONT_RUN_RATIO = 0.92
+DEFAULT_LIQUIDITY_SWEEP_TARGET_RR = 1.30
+DEFAULT_BREAKOUT_RETEST_TARGET_RR = 1.50
 DEFAULT_BREAK_EVEN_ACTIVATION_RATIO = 0.55
 DEFAULT_PROFIT_LOCK_ACTIVATION_RATIO = 0.80
 DEFAULT_PROFIT_LOCK_CAPTURE_RATIO = 0.35
@@ -29,6 +31,24 @@ def target_front_run_ratio() -> float:
         DEFAULT_TARGET_FRONT_RUN_RATIO,
         0.80,
         1.0,
+    )
+
+
+def liquidity_sweep_target_rr() -> float:
+    return _env_float(
+        "TRADE_LIQUIDITY_SWEEP_TARGET_RR",
+        DEFAULT_LIQUIDITY_SWEEP_TARGET_RR,
+        1.05,
+        1.50,
+    )
+
+
+def breakout_retest_target_rr() -> float:
+    return _env_float(
+        "TRADE_BREAKOUT_RETEST_TARGET_RR",
+        DEFAULT_BREAKOUT_RETEST_TARGET_RR,
+        1.05,
+        1.80,
     )
 
 
@@ -102,6 +122,37 @@ def front_run_target(
         return structural_target, used_ratio
     return entry - (entry - structural_target) * used_ratio, used_ratio
 
+
+
+def cap_target_by_rr(
+    entry: float,
+    stop: float,
+    target: float,
+    direction: Direction,
+    max_rr: float,
+) -> tuple[float, bool]:
+    """Cap an executable target to a strategy RR while preserving nearer structure.
+
+    Structural liquidity is still used as a validity/reference target.  During
+    the win-rate validation phase we simply refuse to demand an unusually large
+    extension from price when a closer proportional TP is available.
+    """
+    entry = float(entry)
+    stop = float(stop)
+    target = float(target)
+    max_rr = max(0.0, float(max_rr))
+    risk = abs(entry - stop)
+    if entry <= 0 or stop <= 0 or target <= 0 or risk <= 1e-12 or max_rr <= 0:
+        return target, False
+    if direction == Direction.LONG:
+        if not (stop < entry < target):
+            return target, False
+        capped = min(target, entry + risk * max_rr)
+    else:
+        if not (target < entry < stop):
+            return target, False
+        capped = max(target, entry - risk * max_rr)
+    return float(capped), abs(float(capped) - target) > max(abs(target) * 1e-12, 1e-12)
 
 def calculate_break_even_price(
     position: Any,

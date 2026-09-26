@@ -19,7 +19,8 @@ class PositionManager:
     def __init__(self, exit_engine, audit=None, on_realized=None, db=None,
                  evaluate_local_exits=True, owner_user_id=None, owner_mode=None,
                  on_closed=None, on_opened=None, persist_interval_seconds=15.0,
-                 estimated_exit_fee_rate=0.0006, break_even_buffer_bps=3.0):
+                 estimated_exit_fee_rate=0.0006, break_even_buffer_bps=3.0,
+                 dynamic_protection_enabled=True):
         self.exit_engine = exit_engine
         self.positions: dict[str, Position] = {}
         self.audit = audit
@@ -36,6 +37,7 @@ class PositionManager:
         self.exit_slippage_bps = 0.0
         self.estimated_exit_fee_rate = max(0.0, float(estimated_exit_fee_rate))
         self.break_even_buffer_bps = max(0.0, float(break_even_buffer_bps))
+        self.dynamic_protection_enabled = bool(dynamic_protection_enabled)
         self.state_changed = False
 
     def add(self, position, *, persist=True):
@@ -112,6 +114,11 @@ class PositionManager:
             p.best_price = max(float(p.best_price), float(price))
         else:
             p.best_price = min(float(p.best_price), float(price))
+
+        # Validation mode: still track favorable excursion, but never tighten the
+        # original SL. This lets the trade resolve naturally at initial SL/TP.
+        if not self.dynamic_protection_enabled:
+            return False
 
         progress = self._management_progress(p)
         target_distance = abs(float(p.target_price) - float(p.entry_price))
@@ -288,7 +295,7 @@ class PositionManager:
             remote_stop = self._float(row.get("stopLossPrice"), p.stop_price)
             local_stop = float(p.stop_price)
             stage = str(getattr(p, "management_stage", "INITIAL") or "INITIAL")
-            if stage != "INITIAL":
+            if stage != "INITIAL" and self.dynamic_protection_enabled:
                 # Exchange reconciliation must never loosen a stop already moved
                 # to break-even/profit-lock. If the exchange is lagging, keep the
                 # tighter local stop and reassert it after reconciliation.

@@ -66,12 +66,12 @@ def _breakout_setup(direction: str):
     # 2) Retest the broken structural level without invalidating it.
     if sign > 0:
         open_price = price
-        low = level - atr_ref * 0.06
+        low = level - atr_ref * 0.26
         close_price = level + atr_ref * 0.04
         high = max(open_price, close_price) + atr_ref * 0.02
     else:
         open_price = price
-        high = level + atr_ref * 0.06
+        high = level + atr_ref * 0.26
         close_price = level - atr_ref * 0.04
         low = min(open_price, close_price) - atr_ref * 0.02
     candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1100))
@@ -81,12 +81,12 @@ def _breakout_setup(direction: str):
     previous = candles[-1]
     if sign > 0:
         open_price = price
-        close_price = max(previous.high + atr_ref * 0.03, level + atr_ref * 0.32)
+        close_price = max(previous.high + atr_ref * 0.03, level + atr_ref * 0.58)
         high = close_price + atr_ref * 0.05
         low = open_price - atr_ref * 0.02
     else:
         open_price = price
-        close_price = min(previous.low - atr_ref * 0.03, level - atr_ref * 0.32)
+        close_price = min(previous.low - atr_ref * 0.03, level - atr_ref * 0.58)
         low = close_price - atr_ref * 0.05
         high = open_price + atr_ref * 0.02
     candles.append(Candle(len(candles) * 300_000, open_price, high, low, close_price, 1500))
@@ -178,6 +178,7 @@ def test_breakout_retest_emits_the_correct_direction_for_mirrored_valid_setups(s
 
     assert intent is not None, strategy.last_trace
     assert intent.direction == expected
+    assert intent.metadata['stop_atr_5m'] >= 0.95
     if expected == Direction.LONG:
         assert intent.stop_price < intent.entry_price < intent.target_price
     else:

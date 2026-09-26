@@ -267,8 +267,12 @@ def operations(authorization: str | None = Header(default=None)):
     closed = db.find_many('positions', {**query, 'status': 'CLOSED'}, limit=50, sort_field='closed_at')
     if (TradingStatistics(db).current_period(mode) or {}).get('global_reset'):
         closed = TradingStatistics(db).active_positions(mode, closed)
-    return {"mode": mode, "open": [{k: v for k, v in p.items() if k != '_id'} for p in opened],
-            "closed": [{k: v for k, v in p.items() if k != '_id'} for p in closed]}
+    return {
+        "mode": mode,
+        "dynamic_protection_enabled": get_settings().trade_dynamic_protection_enabled,
+        "open": [{k: v for k, v in p.items() if k != "_id"} for p in opened],
+        "closed": [{k: v for k, v in p.items() if k != "_id"} for p in closed],
+    }
 
 
 @router.get("/performance")

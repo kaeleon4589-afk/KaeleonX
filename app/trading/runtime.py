@@ -191,7 +191,7 @@ class UserTradingRuntimeManager:
 
         orchestrator = TradingOrchestrator(
             RegimeEngine(),
-            StrategyRouter(),
+            StrategyRouter(armed_ttl_seconds=self.settings.trade_armed_setup_ttl_seconds),
             RiskManager(
                 max_leverage=self.settings.fixed_leverage,
                 fee_rate=self.settings.paper_taker_fee,
@@ -217,6 +217,10 @@ class UserTradingRuntimeManager:
             entry_min_stop_atr=self.settings.trade_entry_min_stop_atr,
             entry_min_stop_spreads=self.settings.trade_entry_min_stop_spreads,
             entry_orderbook_conflict_threshold=self.settings.trade_entry_orderbook_conflict_threshold,
+            armed_entry_enabled=self.settings.trade_armed_entry_enabled,
+            legacy_entry_fallback_enabled=self.settings.trade_legacy_entry_fallback_enabled,
+            funnel_emit_seconds=self.settings.trade_funnel_emit_seconds,
+            funnel_emit_every=self.settings.trade_funnel_emit_every,
         )
         orchestrator.seed_loss_cooldowns(persisted_positions)
         # DEMO closes locally inside PositionManager; register the loss cooldown

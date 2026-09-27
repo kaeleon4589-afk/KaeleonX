@@ -162,6 +162,10 @@ def test_frontend_chart_contract_contains_live_coinw_features():
     package = (ROOT / "frontend/package.json").read_text(encoding="utf-8")
 
     assert "dynamicProtectionEnabled={ops.dynamic_protection_enabled!==false}" in dashboard
+    assert "TradingTerminal" not in dashboard
+    assert "Mercado ▾" in chart
+    assert "market-details-drawer" in chart
+    assert "/manual" not in api
     assert "candles_swap_utc" in chart
     assert "mark_price" in chart
     assert "index_price" in chart

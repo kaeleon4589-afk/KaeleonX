@@ -304,9 +304,9 @@ class CoinWExecutor:
 
         position = self._position_from_exchange(intent, position_row)
         position.leverage = int(leverage)
-        position.stop_price = normalized_stop
-        position.target_price = normalized_target
-        position.tp2_price = normalized_target
+        position.stop_price = float(normalized_stop or 0.0)
+        position.target_price = float(normalized_target or 0.0)
+        position.tp2_price = float(normalized_target or 0.0)
 
         # Reassert exchange-native protection against an entry/fill race.
         try:
@@ -390,9 +390,16 @@ class CoinWExecutor:
                 "minimum_base_quantity": min_base, "quantity": notional,
             }
 
-        normalized_stop, normalized_target = self._protection_prices(
-            direction, float(stop_loss), float(take_profit), precision
-        )
+        normalized_stop = None
+        normalized_target = None
+        if stop_loss is not None and float(stop_loss) > 0:
+            normalized_stop = self._round_price(
+                float(stop_loss), precision, "up" if direction == Direction.LONG else "down"
+            )
+        if take_profit is not None and float(take_profit) > 0:
+            normalized_target = self._round_price(
+                float(take_profit), precision, "down" if direction == Direction.LONG else "up"
+            )
         payload = {
             'instrument': instrument,
             'direction': 'long' if direction == Direction.LONG else 'short',
@@ -402,9 +409,11 @@ class CoinWExecutor:
             'positionModel': int(position_model),
             'positionType': 'execute' if order_type == 'MARKET' else 'plan',
             'thirdOrderId': str(client_order_id)[:50],
-            'stopLossPrice': normalized_stop,
-            'stopProfitPrice': normalized_target,
         }
+        if normalized_stop is not None:
+            payload['stopLossPrice'] = normalized_stop
+        if normalized_target is not None:
+            payload['stopProfitPrice'] = normalized_target
         if order_type == 'LIMIT':
             payload['openPrice'] = self._round_price(float(limit_price), precision, 'nearest')
 
@@ -429,7 +438,7 @@ class CoinWExecutor:
         intent = TradeIntent(
             decision_id=str(client_order_id), symbol=str(symbol), strategy=Strategy.NO_TRADE,
             direction=direction, entry_price=float(reference_price),
-            stop_price=normalized_stop, target_price=normalized_target,
+            stop_price=float(normalized_stop or 0.0), target_price=float(normalized_target or 0.0),
             quality=100.0, risk_multiplier=1.0, timeframe='manual',
             reasons=('manual_live_order',), metadata={'source': 'MANUAL'},
         )
@@ -440,9 +449,9 @@ class CoinWExecutor:
 
         position = self._position_from_exchange(intent, position_row)
         position.leverage = int(leverage)
-        position.stop_price = normalized_stop
-        position.target_price = normalized_target
-        position.tp2_price = normalized_target
+        position.stop_price = float(normalized_stop or 0.0)
+        position.target_price = float(normalized_target or 0.0)
+        position.tp2_price = float(normalized_target or 0.0)
         position.source = 'MANUAL'
         position.order_type = 'MARKET'
         position.margin_mode = 'ISOLATED' if int(position_model) == 0 else 'CROSS'
@@ -453,17 +462,22 @@ class CoinWExecutor:
         position.client_order_id = str(client_order_id)
         position.unrealized_pnl = float(position_row.get('profitUnreal') or 0)
 
-        try:
-            await self.orders.set_tpsl(
-                position.position_id, instrument,
-                stop_loss=normalized_stop, take_profit=normalized_target,
-            )
+        if normalized_stop is not None or normalized_target is not None:
+            try:
+                await self.orders.set_tpsl(
+                    position.position_id, instrument,
+                    stop_loss=normalized_stop, take_profit=normalized_target,
+                )
+                position.protected = True
+            except Exception as exc:
+                position.protected = False
+                return {**common, 'filled': True, 'status': 'OPEN', 'protected': False,
+                        'position_id': position.position_id, 'position': position,
+                        'error': f'exchange_protection_failed:{type(exc).__name__}'}
+        else:
+            # No TP/SL was requested. This is a valid manual position, not a
+            # failed protection attempt; the user may attach protection later.
             position.protected = True
-        except Exception as exc:
-            position.protected = False
-            return {**common, 'filled': True, 'status': 'OPEN', 'protected': False,
-                    'position_id': position.position_id, 'position': position,
-                    'error': f'exchange_protection_failed:{type(exc).__name__}'}
         return {**common, 'filled': True, 'status': 'OPEN', 'protected': True,
                 'position_id': position.position_id, 'position': position,
                 'fill_price': position.entry_price, 'order_state': order_row}

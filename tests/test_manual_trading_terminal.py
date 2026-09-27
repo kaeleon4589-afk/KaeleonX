@@ -401,3 +401,53 @@ def test_live_unknown_without_order_id_recovers_by_third_order_id_without_resubm
         assert state["open_orders"][0]["status"] == "OPEN"
 
     asyncio.run(scenario())
+
+
+def test_demo_manual_market_allows_open_without_tp_sl():
+    async def scenario():
+        service, db, _, _ = make_service()
+        request = order_request(
+            client_order_id="MANUAL-no-protection-1",
+            stop_loss=None,
+            take_profit=None,
+        )
+        result = await service.place_order("u", request)
+        assert result["filled"] is True
+        position = db.find_one("positions", {"position_id": result["position_id"]})
+        assert position["stop_price"] == pytest.approx(0.0)
+        assert position["target_price"] == pytest.approx(0.0)
+    asyncio.run(scenario())
+
+
+def test_demo_marketable_limit_fills_immediately_instead_of_staying_pending():
+    async def scenario():
+        service, db, _, _ = make_service()
+        # Ask is 100. A LONG limit at 100.5 is already marketable and must fill
+        # at the best ask rather than being left indefinitely in OPEN state.
+        result = await service.place_order("u", order_request(
+            client_order_id="MANUAL-marketable-limit-1",
+            order_type="LIMIT",
+            limit_price=100.5,
+            stop_loss=None,
+            take_profit=None,
+        ))
+        assert result["filled"] is True
+        assert result["status"] == "FILLED"
+        assert result["fill_price"] == pytest.approx(100.0)
+        stored = db.find_one("manual_orders", {"manual_order_id": result["manual_order_id"]})
+        assert stored["status"] == "FILLED"
+    asyncio.run(scenario())
+
+
+def test_monitor_only_snapshot_keeps_owner_of_pending_manual_limit():
+    from app.trading.runtime import UserTradingRuntimeManager
+
+    manager = object.__new__(UserTradingRuntimeManager)
+    manager._manual_order_users_by_symbol = {"ADAUSDT": {"u"}}
+    runtime = SimpleNamespace(
+        user_id="u",
+        position_manager=SimpleNamespace(positions={}),
+        orchestrator=SimpleNamespace(pending_execution=None),
+    )
+    assert manager._runtime_tracks_monitor_symbol(runtime, "ADAUSDT") is True
+    assert manager._runtime_tracks_monitor_symbol(runtime, "BTCUSDT") is False

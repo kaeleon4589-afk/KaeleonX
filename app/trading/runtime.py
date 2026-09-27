@@ -197,6 +197,8 @@ class UserTradingRuntimeManager:
                 armed_chase_tolerance_atr=self.settings.trade_armed_chase_tolerance_atr,
                 armed_trigger_close_tolerance_atr=self.settings.trade_armed_trigger_close_tolerance_atr,
                 armed_consumed_ttl_seconds=self.settings.trade_armed_consumed_ttl_seconds,
+                armed_fast_confirm_enabled=self.settings.trade_armed_fast_confirm_enabled,
+                armed_fast_confirm_max_age_seconds=self.settings.trade_armed_fast_confirm_max_age_seconds,
             ),
             RiskManager(
                 max_leverage=self.settings.fixed_leverage,

@@ -45,6 +45,8 @@ class StrategyRouter:
         armed_chase_tolerance_atr: float | None = None,
         armed_trigger_close_tolerance_atr: float | None = None,
         armed_consumed_ttl_seconds: float | None = None,
+        armed_fast_confirm_enabled: bool | None = None,
+        armed_fast_confirm_max_age_seconds: float | None = None,
     ):
         self.breakout = BreakoutRetestStrategy()
         self.sweep = LiquiditySweepStrategy()
@@ -61,11 +63,21 @@ class StrategyRouter:
             _env_float("TRADE_ARMED_CONSUMED_TTL_SECONDS", 3600.0)
             if armed_consumed_ttl_seconds is None else armed_consumed_ttl_seconds
         )
+        fast_confirm_enabled = (
+            _env_bool("TRADE_ARMED_FAST_CONFIRM_ENABLED", True)
+            if armed_fast_confirm_enabled is None else bool(armed_fast_confirm_enabled)
+        )
+        fast_confirm_max_age = (
+            _env_float("TRADE_ARMED_FAST_CONFIRM_MAX_AGE_SECONDS", 30.0)
+            if armed_fast_confirm_max_age_seconds is None else armed_fast_confirm_max_age_seconds
+        )
         self.armed = ArmedEntryEngine(
             ttl_seconds=ttl,
             chase_tolerance_atr=chase_tolerance,
             trigger_close_tolerance_atr=close_tolerance,
             consumed_ttl_seconds=consumed_ttl,
+            fast_confirm_enabled=fast_confirm_enabled,
+            fast_confirm_max_age_seconds=fast_confirm_max_age,
         )
         self.last_trace = {}
 

@@ -33,6 +33,15 @@ MICRO_TRIGGER_MIN_BODY_RATIO = 0.22
 MICRO_TRIGGER_MIN_RVOL = 0.70
 MICRO_TRIGGER_CLOSE_LONG = 0.60
 MICRO_TRIGGER_CLOSE_SHORT = 0.40
+# Fast confirmation is intentionally stricter than the normal post-arm 1m path.
+# It may reuse the most recent CLOSED 1m candle only when that candle closed
+# immediately before arming and already showed strong directional acceptance.
+FAST_CONFIRM_MIN_SETUP_QUALITY = 78.0
+FAST_CONFIRM_MIN_BODY_RATIO = 0.45
+FAST_CONFIRM_MIN_RVOL = 0.90
+FAST_CONFIRM_CLOSE_LONG = 0.72
+FAST_CONFIRM_CLOSE_SHORT = 0.28
+CHASE_EDGE_MAX_ATR = 0.02
 
 
 def _now_ms() -> int:
@@ -46,12 +55,63 @@ def _shape(candle) -> tuple[float, float]:
     return body, pos
 
 
+
+def _book_tick_size(snapshot) -> float:
+    """Best-effort tick estimate from the visible order book.
+
+    CoinW depth does not expose tick size on this lightweight path.  We infer the
+    smallest positive step from the top levels and use it only as a *tiny* edge
+    tolerance around the anti-chase boundary.  It never replaces the ATR chase
+    limit and is hard-capped below.
+    """
+    prices: list[float] = []
+    for side_name in ("bids", "asks"):
+        for level in list(getattr(snapshot, side_name, []) or [])[:12]:
+            try:
+                price = float(level[0] if isinstance(level, (list, tuple)) else level.get("price"))
+            except (TypeError, ValueError, AttributeError, IndexError):
+                continue
+            if math.isfinite(price) and price > 0:
+                prices.append(price)
+    uniq = sorted(set(prices))
+    diffs = [b - a for a, b in zip(uniq, uniq[1:]) if b > a]
+    return min(diffs) if diffs else 0.0
+
+
+def _closed_1m_quality(setup: ArmedSetup, candle, candles_1m, *, close_buffer: float, chase_limit: float,
+                       strict: bool = False) -> tuple[bool, dict]:
+    body, close_pos = _shape(candle)
+    volumes = [float(c.volume) for c in candles_1m]
+    rvol = relative_volume(volumes, len(volumes) - 1, 20)
+    close = float(candle.close)
+    opened = float(candle.open)
+    min_body = FAST_CONFIRM_MIN_BODY_RATIO if strict else MICRO_TRIGGER_MIN_BODY_RATIO
+    min_rvol = FAST_CONFIRM_MIN_RVOL if strict else MICRO_TRIGGER_MIN_RVOL
+    long_close = FAST_CONFIRM_CLOSE_LONG if strict else MICRO_TRIGGER_CLOSE_LONG
+    short_close = FAST_CONFIRM_CLOSE_SHORT if strict else MICRO_TRIGGER_CLOSE_SHORT
+    if setup.direction == Direction.LONG:
+        close_in_trigger_band = close >= setup.trigger_price - close_buffer and close <= chase_limit
+        ok = close > opened and close_in_trigger_band and body >= min_body and close_pos >= long_close and rvol >= min_rvol
+    else:
+        close_in_trigger_band = close <= setup.trigger_price + close_buffer and close >= chase_limit
+        ok = close < opened and close_in_trigger_band and body >= min_body and close_pos <= short_close and rvol >= min_rvol
+    return ok, {
+        "1m_close": close,
+        "1m_body_ratio": round(body, 4),
+        "1m_close_pos": round(close_pos, 4),
+        "1m_rvol": round(rvol, 4),
+        "trigger_close_buffer": close_buffer,
+        "chase_limit": chase_limit,
+    }
+
 def _micro_confirmation(
     setup: ArmedSetup,
     snapshot,
     *,
     chase_tolerance_atr: float,
     trigger_close_tolerance_atr: float,
+    fast_confirm_enabled: bool,
+    fast_confirm_max_age_seconds: float,
 ) -> tuple[bool, str, dict]:
     frames = getattr(snapshot, "timeframes", {}) or {}
     candles_1m = list(frames.get("1m", []) or [])
@@ -81,8 +141,15 @@ def _micro_confirmation(
     chase_buffer = max(atr_buffer, spread_buffer)
     trigger_close_buffer = atr_value * max(trigger_close_tolerance_atr, 0.0)
 
+    # A one-tick / tiny-spread boundary miss must not turn a valid setup into
+    # setup_chased. This tolerance is deliberately tiny and capped to 0.02 ATR.
+    book_tick = _book_tick_size(snapshot)
+    edge_raw = max(book_tick * 1.25, spread * 0.10, executable * 1e-9)
+    chase_edge_tolerance = min(edge_raw, atr_value * CHASE_EDGE_MAX_ATR) if atr_value > 0 else edge_raw
+
     if setup.direction == Direction.LONG:
-        chase_limit = setup.entry_zone_high + chase_buffer
+        chase_base_limit = setup.entry_zone_high + chase_buffer
+        chase_limit = chase_base_limit + chase_edge_tolerance
         if executable <= setup.invalidation_price:
             return False, "setup_invalidated", {"price": executable}
         if executable > chase_limit:
@@ -90,11 +157,15 @@ def _micro_confirmation(
                 "price": executable,
                 "entry_zone_high": setup.entry_zone_high,
                 "chase_limit": chase_limit,
+                "chase_base_limit": chase_base_limit,
                 "chase_buffer": chase_buffer,
+                "chase_edge_tolerance": chase_edge_tolerance,
+                "book_tick_size": book_tick,
             }
         crossed = executable >= setup.trigger_price
     else:
-        chase_limit = setup.entry_zone_low - chase_buffer
+        chase_base_limit = setup.entry_zone_low - chase_buffer
+        chase_limit = chase_base_limit - chase_edge_tolerance
         if executable >= setup.invalidation_price:
             return False, "setup_invalidated", {"price": executable}
         if executable < chase_limit:
@@ -102,78 +173,99 @@ def _micro_confirmation(
                 "price": executable,
                 "entry_zone_low": setup.entry_zone_low,
                 "chase_limit": chase_limit,
+                "chase_base_limit": chase_base_limit,
                 "chase_buffer": chase_buffer,
+                "chase_edge_tolerance": chase_edge_tolerance,
+                "book_tick_size": book_tick,
             }
         crossed = executable <= setup.trigger_price
     if not crossed:
         return False, "waiting_trigger", {"price": executable, "trigger_price": setup.trigger_price}
 
-    # We intentionally require a CLOSED 1m candle when available.  This prevents
-    # a single quote spike from triggering the setup.  If the provider omitted 1m
-    # data, keep waiting instead of degrading silently to the old late-entry path.
+    # A quote crossing alone is never enough. We always require CLOSED 1m evidence.
     if not candles_1m:
         return False, "waiting_1m_confirmation", {"price": executable}
     last = candles_1m[-1]
-    # Never let a candle that closed before the setup was armed act as the
-    # confirmation. Otherwise the next 2s scanner pass could reuse stale 1m
-    # evidence and recreate the same late-entry problem v6 is meant to remove.
     micro_close_ms = int(getattr(last, "timestamp", 0) or 0) + 60_000
-    if micro_close_ms <= int(setup.armed_at_ms):
+    armed_at_ms = int(setup.armed_at_ms)
+    snapshot_ms = int(getattr(snapshot, "quote_received_ms", 0) or 0) or _now_ms()
+
+    # Fast path: reuse only the immediately preceding CLOSED 1m candle.  It is
+    # stricter than the normal path and additionally requires a healthy order book.
+    # This closes the timing hole where a setup arms seconds after a strong 1m
+    # confirmation and otherwise waits almost a full minute while price escapes.
+    if micro_close_ms <= armed_at_ms:
+        max_age_ms = int(max(0.0, fast_confirm_max_age_seconds) * 1000)
+        prearm_age_ms = max(0, armed_at_ms - micro_close_ms)
+        confirmation_age_ms = max(0, snapshot_ms - micro_close_ms)
+        book_valid = bool(getattr(snapshot, "orderbook_valid", False)) and bool(
+            getattr(snapshot, "bids", None)
+        ) and bool(getattr(snapshot, "asks", None))
+        strong_enough = float(setup.quality) >= FAST_CONFIRM_MIN_SETUP_QUALITY
+        fast_ok, fast_diag = _closed_1m_quality(
+            setup, last, candles_1m, close_buffer=trigger_close_buffer,
+            chase_limit=chase_limit, strict=True,
+        )
+        eligible = (
+            bool(fast_confirm_enabled)
+            and max_age_ms > 0
+            and prearm_age_ms <= max_age_ms
+            and confirmation_age_ms <= max_age_ms
+            and book_valid
+            and strong_enough
+            and fast_ok
+        )
+        if eligible:
+            return True, "triggered", {
+                "price": executable,
+                **fast_diag,
+                "confirmation_mode": "recent_prearm_closed_1m",
+                "confirmation_age_ms": confirmation_age_ms,
+                "prearm_age_ms": prearm_age_ms,
+                "fast_confirm_max_age_ms": max_age_ms,
+                "fast_confirm_setup_quality": float(setup.quality),
+                "chase_base_limit": chase_base_limit,
+                "chase_edge_tolerance": chase_edge_tolerance,
+                "book_tick_size": book_tick,
+            }
         return False, "waiting_fresh_1m_confirmation", {
-            "price": executable, "micro_close_ms": micro_close_ms,
-            "armed_at_ms": int(setup.armed_at_ms),
+            "price": executable,
+            **fast_diag,
+            "micro_close_ms": micro_close_ms,
+            "armed_at_ms": armed_at_ms,
+            "confirmation_age_ms": confirmation_age_ms,
+            "prearm_age_ms": prearm_age_ms,
+            "fast_confirm_max_age_ms": max_age_ms,
+            "fast_confirm_book_valid": bool(book_valid),
+            "fast_confirm_setup_quality": float(setup.quality),
+            "fast_confirm_quality_ok": bool(fast_ok),
+            "confirmation_mode": "waiting_new_closed_1m",
         }
+
+    # Normal path: the 1m candle closed after arming.  Preserve the existing
+    # invalidation and quality rules exactly.
     if setup.direction == Direction.LONG and float(last.low) <= setup.invalidation_price:
         return False, "setup_invalidated", {"price": executable, "1m_low": float(last.low)}
     if setup.direction == Direction.SHORT and float(last.high) >= setup.invalidation_price:
         return False, "setup_invalidated", {"price": executable, "1m_high": float(last.high)}
-    body, close_pos = _shape(last)
-    volumes = [float(c.volume) for c in candles_1m]
-    rvol = relative_volume(volumes, len(volumes) - 1, 20)
-    close = float(last.close)
-    opened = float(last.open)
-    if setup.direction == Direction.LONG:
-        close_in_trigger_band = (
-            close >= setup.trigger_price - trigger_close_buffer
-            and close <= chase_limit
-        )
-        ok = (
-            close > opened
-            and close_in_trigger_band
-            and body >= MICRO_TRIGGER_MIN_BODY_RATIO
-            and close_pos >= MICRO_TRIGGER_CLOSE_LONG
-            and rvol >= MICRO_TRIGGER_MIN_RVOL
-        )
-    else:
-        close_in_trigger_band = (
-            close <= setup.trigger_price + trigger_close_buffer
-            and close >= chase_limit
-        )
-        ok = (
-            close < opened
-            and close_in_trigger_band
-            and body >= MICRO_TRIGGER_MIN_BODY_RATIO
-            and close_pos <= MICRO_TRIGGER_CLOSE_SHORT
-            and rvol >= MICRO_TRIGGER_MIN_RVOL
-        )
+    ok, diag = _closed_1m_quality(
+        setup, last, candles_1m, close_buffer=trigger_close_buffer,
+        chase_limit=chase_limit, strict=False,
+    )
     if not ok:
         return False, "waiting_1m_confirmation", {
-            "price": executable,
-            "1m_close": close,
-            "1m_body_ratio": round(body, 4),
-            "1m_close_pos": round(close_pos, 4),
-            "1m_rvol": round(rvol, 4),
-            "trigger_close_buffer": trigger_close_buffer,
-            "chase_limit": chase_limit,
+            "price": executable, **diag,
+            "confirmation_mode": "postarm_closed_1m",
+            "chase_base_limit": chase_base_limit,
+            "chase_edge_tolerance": chase_edge_tolerance,
+            "book_tick_size": book_tick,
         }
     return True, "triggered", {
-        "price": executable,
-        "1m_close": close,
-        "1m_body_ratio": round(body, 4),
-        "1m_close_pos": round(close_pos, 4),
-        "1m_rvol": round(rvol, 4),
-        "trigger_close_buffer": trigger_close_buffer,
-        "chase_limit": chase_limit,
+        "price": executable, **diag,
+        "confirmation_mode": "postarm_closed_1m",
+        "chase_base_limit": chase_base_limit,
+        "chase_edge_tolerance": chase_edge_tolerance,
+        "book_tick_size": book_tick,
     }
 
 
@@ -208,11 +300,15 @@ class ArmedEntryEngine:
         chase_tolerance_atr: float = 0.15,
         trigger_close_tolerance_atr: float = 0.08,
         consumed_ttl_seconds: float = 3600.0,
+        fast_confirm_enabled: bool = True,
+        fast_confirm_max_age_seconds: float = 30.0,
     ):
         self.ttl_seconds = max(60.0, float(ttl_seconds))
         self.chase_tolerance_atr = max(0.0, float(chase_tolerance_atr))
         self.trigger_close_tolerance_atr = max(0.0, float(trigger_close_tolerance_atr))
         self.consumed_ttl_seconds = max(self.ttl_seconds, float(consumed_ttl_seconds))
+        self.fast_confirm_enabled = bool(fast_confirm_enabled)
+        self.fast_confirm_max_age_seconds = max(0.0, float(fast_confirm_max_age_seconds))
         self._consumed_setups: dict[str, tuple[int, str]] = {}
         self.last_trace: dict[str, Any] = {}
         self.branch_trace: dict[str, dict[str, Any]] = {}
@@ -633,6 +729,8 @@ class ArmedEntryEngine:
             snapshot,
             chase_tolerance_atr=self.chase_tolerance_atr,
             trigger_close_tolerance_atr=self.trigger_close_tolerance_atr,
+            fast_confirm_enabled=self.fast_confirm_enabled,
+            fast_confirm_max_age_seconds=self.fast_confirm_max_age_seconds,
         )
         if not ok:
             if reason in {"setup_invalidated", "setup_chased"}:
@@ -680,6 +778,11 @@ class ArmedEntryEngine:
             "target_rr_cap": target_rr_cap,
             "target_rr_capped_at_trigger": trigger_target_capped,
         }
+        confirm_reason = (
+            "micro_confirmation_fast_1m"
+            if diag.get("confirmation_mode") == "recent_prearm_closed_1m"
+            else "micro_confirmation_1m"
+        )
         self._consume(setup, "setup_triggered", now_ms)
         intent = TradeIntent(
             decision_id=decision_id,
@@ -692,7 +795,7 @@ class ArmedEntryEngine:
             quality=min(100.0, float(setup.quality) + 5.0),
             risk_multiplier=setup.risk_multiplier,
             timeframe=setup.timeframe,
-            reasons=tuple(setup.reasons) + ("micro_confirmation_1m",),
+            reasons=tuple(setup.reasons) + (confirm_reason,),
             metadata=metadata,
         )
-        return "triggered", intent, {"reason": "micro_confirmation_1m", "execution_rr": rr, **diag}
+        return "triggered", intent, {"reason": confirm_reason, "execution_rr": rr, **diag}

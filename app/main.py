@@ -42,6 +42,7 @@ async def run():
     market = MultiMarketCoordinator(
         client, scanner, poll_seconds=s.market_poll_seconds, audit=audit,
         max_parallel=s.market_scanner_parallel, heartbeat_seconds=s.engine_heartbeat_seconds,
+        armed_poll_seconds=s.trade_armed_monitor_poll_seconds,
     )
 
     lease = WorkerLease(db)
@@ -59,6 +60,7 @@ async def run():
             group.create_task(lease.run())
             group.create_task(market.run(on_snapshot))
             group.create_task(market.monitor(on_snapshot, runtimes.tracked_symbols))
+            group.create_task(market.monitor_armed(on_snapshot, runtimes.armed_symbols))
             group.create_task(runtimes.notifier.run())
     finally:
         await client.close()

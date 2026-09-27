@@ -21,10 +21,14 @@ class ManualTradingError(ValueError):
 
 def _f(value, default=0.0) -> float:
     try:
-        n = float(value if value is not None else default)
-        return n if math.isfinite(n) else float(default)
+        fallback = float(default if default is not None else 0.0)
     except (TypeError, ValueError):
-        return float(default)
+        fallback = 0.0
+    try:
+        n = float(value if value is not None else fallback)
+        return n if math.isfinite(n) else fallback
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _rows(payload):
@@ -196,7 +200,7 @@ class ManualTradingService:
             raise ManualTradingError("live_manual_confirmation_required")
 
     def _validate_order(self, *, side: str, margin: float, leverage: int, order_type: str,
-                        reference_price: float, stop_loss: float, take_profit: float,
+                        reference_price: float, stop_loss: float | None, take_profit: float | None,
                         limit_price: float | None):
         side = str(side).upper()
         if side not in {"LONG", "SHORT"}:
@@ -208,17 +212,28 @@ class ManualTradingService:
         order_type = str(order_type).upper()
         if order_type not in {"MARKET", "LIMIT"}:
             raise ManualTradingError("unsupported_manual_order_type")
-        entry = float(limit_price) if order_type == "LIMIT" else float(reference_price)
+        entry = float(limit_price) if order_type == "LIMIT" and limit_price is not None else float(reference_price)
         if not math.isfinite(entry) or entry <= 0:
             raise ManualTradingError("invalid_manual_entry_price")
         if order_type == "LIMIT" and (limit_price is None or not math.isfinite(float(limit_price)) or float(limit_price) <= 0):
             raise ManualTradingError("manual_limit_price_required")
-        if not math.isfinite(stop_loss) or not math.isfinite(take_profit) or stop_loss <= 0 or take_profit <= 0:
-            raise ManualTradingError("manual_tp_sl_required")
-        if side == "LONG" and not (stop_loss < entry < take_profit):
-            raise ManualTradingError("invalid_manual_long_geometry")
-        if side == "SHORT" and not (take_profit < entry < stop_loss):
-            raise ManualTradingError("invalid_manual_short_geometry")
+
+        sl = None if stop_loss is None else float(stop_loss)
+        tp = None if take_profit is None else float(take_profit)
+        if sl is not None and (not math.isfinite(sl) or sl <= 0):
+            raise ManualTradingError("invalid_manual_stop_loss")
+        if tp is not None and (not math.isfinite(tp) or tp <= 0):
+            raise ManualTradingError("invalid_manual_take_profit")
+        if side == "LONG":
+            if sl is not None and sl >= entry:
+                raise ManualTradingError("invalid_manual_long_geometry")
+            if tp is not None and tp <= entry:
+                raise ManualTradingError("invalid_manual_long_geometry")
+        else:
+            if sl is not None and sl <= entry:
+                raise ManualTradingError("invalid_manual_short_geometry")
+            if tp is not None and tp >= entry:
+                raise ManualTradingError("invalid_manual_short_geometry")
         return Direction.LONG if side == "LONG" else Direction.SHORT, entry
 
     def _demo_account(self, user_id: str) -> dict:
@@ -490,7 +505,8 @@ class ManualTradingService:
         direction, entry_reference = self._validate_order(
             side=request.side, margin=float(request.margin), leverage=int(request.leverage),
             order_type=request.order_type, reference_price=reference,
-            stop_loss=float(request.stop_loss), take_profit=float(request.take_profit),
+            stop_loss=(float(request.stop_loss) if request.stop_loss is not None else None),
+            take_profit=(float(request.take_profit) if request.take_profit is not None else None),
             limit_price=request.limit_price,
         )
         order_type = str(request.order_type).upper()
@@ -516,8 +532,8 @@ class ManualTradingService:
             "leverage": int(request.leverage),
             "notional": float(request.margin) * int(request.leverage),
             "limit_price": float(request.limit_price) if request.limit_price is not None else None,
-            "stop_price": float(request.stop_loss),
-            "target_price": float(request.take_profit),
+            "stop_price": (float(request.stop_loss) if request.stop_loss is not None else None),
+            "target_price": (float(request.take_profit) if request.take_profit is not None else None),
             "margin_mode": "ISOLATED",
             "created_at": now_ms,
         }
@@ -536,6 +552,24 @@ class ManualTradingService:
 
         if mode == "demo":
             if order_type == "LIMIT":
+                limit = float(request.limit_price)
+                marketable = (direction == Direction.LONG and best_ask > 0 and limit >= best_ask) or (
+                    direction == Direction.SHORT and best_bid > 0 and limit <= best_bid
+                )
+                if marketable:
+                    # CoinW-style behavior: a marketable LIMIT fills immediately at
+                    # the best executable quote, never at a worse price than the limit.
+                    fill = min(best_ask, limit) if direction == Direction.LONG else max(best_bid, limit)
+                    position = build_demo_limit_fill(base_doc, fill, self.settings)
+                    self.db.upsert("positions", {"position_id": position.position_id}, {
+                        **asdict(position), "strategy": "MANUAL", "user_id": user_id, "mode": mode,
+                    })
+                    doc = {**base_doc, "status": "FILLED", "accepted": True, "filled": True,
+                           "position_id": position.position_id, "order_id": position.exchange_order_id,
+                           "fill_price": fill, "filled_at": now_ms}
+                    self.db.upsert("manual_orders", {"manual_order_id": manual_order_id}, doc)
+                    return {**doc, "position": asdict(position)}
+
                 doc = {**base_doc, "status": "OPEN", "entry_reference": entry_reference}
                 self.db.upsert("manual_orders", {"manual_order_id": manual_order_id}, doc)
                 return {**doc, "accepted": True, "filled": False}
@@ -551,7 +585,8 @@ class ManualTradingService:
             intent = TradeIntent(
                 decision_id=request.client_order_id, symbol=symbol, strategy=Strategy.NO_TRADE,
                 direction=direction, entry_price=reference,
-                stop_price=float(request.stop_loss), target_price=float(request.take_profit),
+                stop_price=(float(request.stop_loss) if request.stop_loss is not None else 0.0),
+                target_price=(float(request.take_profit) if request.take_profit is not None else 0.0),
                 quality=100.0, risk_multiplier=1.0, timeframe="manual",
                 reasons=("manual_demo_order",), metadata={"source": "MANUAL"},
             )
@@ -591,7 +626,8 @@ class ManualTradingService:
                 direction=direction,
                 margin=float(request.margin), leverage=int(request.leverage),
                 order_type=order_type,
-                stop_loss=float(request.stop_loss), take_profit=float(request.take_profit),
+                stop_loss=(float(request.stop_loss) if request.stop_loss is not None else None),
+                take_profit=(float(request.take_profit) if request.take_profit is not None else None),
                 limit_price=request.limit_price, reference_price=reference,
                 position_model=0,
             )
@@ -704,20 +740,32 @@ class ManualTradingService:
         self.db.upsert("positions", {"position_id": position_id}, update)
         return {"accepted": True, "pending": False, "position": {k: v for k, v in update.items() if k != "_id"}}
 
-    async def update_protection(self, user_id: str, position_id: str, *, stop_loss: float,
-                                take_profit: float, confirm_live: bool) -> dict:
+    async def update_protection(self, user_id: str, position_id: str, *, stop_loss: float | None,
+                                take_profit: float | None, confirm_live: bool) -> dict:
         self._assert_enabled()
         row = self.db.find_one("positions", {"position_id": position_id, "user_id": user_id, "status": "OPEN"})
         if not row:
             raise ManualTradingError("manual_position_not_found")
         if str(row.get("source") or "BOT").upper() != "MANUAL":
             raise ManualTradingError("only_manual_positions_can_be_modified_here")
+        if stop_loss is None and take_profit is None:
+            raise ManualTradingError("manual_protection_value_required")
+
         direction = Direction(str(row.get("direction") or "LONG").upper())
         current = _f(row.get("current_price") or row.get("entry_price"))
-        if direction == Direction.LONG and not (stop_loss < current < take_profit):
-            raise ManualTradingError("invalid_manual_long_protection")
-        if direction == Direction.SHORT and not (take_profit < current < stop_loss):
-            raise ManualTradingError("invalid_manual_short_protection")
+        next_stop = _f(stop_loss, row.get("stop_price")) if stop_loss is not None else _f(row.get("stop_price"))
+        next_target = _f(take_profit, row.get("target_price")) if take_profit is not None else _f(row.get("target_price"))
+        if direction == Direction.LONG:
+            if next_stop > 0 and next_stop >= current:
+                raise ManualTradingError("invalid_manual_long_geometry")
+            if next_target > 0 and next_target <= current:
+                raise ManualTradingError("invalid_manual_long_geometry")
+        else:
+            if next_stop > 0 and next_stop <= current:
+                raise ManualTradingError("invalid_manual_short_geometry")
+            if next_target > 0 and next_target >= current:
+                raise ManualTradingError("invalid_manual_short_geometry")
+
         mode = str(row.get("mode") or "demo")
         if mode == "live":
             profile = self._profile(user_id)
@@ -725,13 +773,14 @@ class ManualTradingService:
             adapter = await self._live_adapter(user_id)
             await adapter.orders.set_tpsl(
                 position_id, adapter._instrument(str(row.get("symbol"))),
-                stop_loss=stop_loss, take_profit=take_profit,
+                stop_loss=(next_stop if next_stop > 0 else None),
+                take_profit=(next_target if next_target > 0 else None),
             )
         update = {
             **row,
-            "stop_price": float(stop_loss),
-            "target_price": float(take_profit),
-            "tp2_price": float(take_profit),
+            "stop_price": float(next_stop),
+            "target_price": float(next_target),
+            "tp2_price": float(next_target),
             "protected": True,
             "revision": int(row.get("revision") or 0) + 1,
         }

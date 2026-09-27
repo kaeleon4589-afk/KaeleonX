@@ -67,6 +67,7 @@ class UserTradingRuntimeManager:
         self._lock = asyncio.Lock()
         self._processing_lock = asyncio.Lock()
         self._manual_order_symbols: set[str] = set()
+        self._manual_order_users_by_symbol: dict[str, set[str]] = {}
 
     @staticmethod
     def _fingerprint(row: dict) -> str:
@@ -388,6 +389,12 @@ class UserTradingRuntimeManager:
             self._manual_order_symbols = {
                 str(row.get("symbol")) for row in manual_rows if row.get("symbol")
             }
+            self._manual_order_users_by_symbol = {}
+            for row in manual_rows:
+                symbol = str(row.get("symbol") or "")
+                user_id = str(row.get("user_id") or "")
+                if symbol and user_id:
+                    self._manual_order_users_by_symbol.setdefault(symbol, set()).add(user_id)
             live_user_ids = set()
             for user in users:
                 uid = str(user["user_id"])
@@ -438,6 +445,15 @@ class UserTradingRuntimeManager:
         symbols.update(self._manual_order_symbols)
         return symbols
 
+    def _runtime_tracks_monitor_symbol(self, runtime: UserRuntime, symbol: str) -> bool:
+        if any(p.status == 'OPEN' and p.symbol == symbol
+               for p in runtime.position_manager.positions.values()):
+            return True
+        if (runtime.orchestrator.pending_execution or {}).get('symbol') == symbol:
+            return True
+        owners = getattr(self, '_manual_order_users_by_symbol', {})
+        return runtime.user_id in owners.get(str(symbol), set())
+
     async def run_snapshot(self, snapshot) -> None:
         async with self._processing_lock:
             await self._run_snapshot(snapshot)
@@ -455,9 +471,7 @@ class UserTradingRuntimeManager:
             # unresolved order in this symbol. Visiting every other user would
             # delay stops as the account count grows.
             runtimes = [runtime for runtime in runtimes
-                        if any(p.status == 'OPEN' and p.symbol == snapshot.symbol
-                               for p in runtime.position_manager.positions.values())
-                        or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol]
+                        if self._runtime_tracks_monitor_symbol(runtime, snapshot.symbol)]
         for runtime in runtimes:
             try:
                 period = periods[runtime.mode] if periods is not None else None

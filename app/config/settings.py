@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     trade_armed_entry_enabled: bool = True
     trade_legacy_entry_fallback_enabled: bool = False
     trade_armed_setup_ttl_seconds: float = Field(600.0, ge=60.0, le=1800.0)
+    # v6.1 ARMED->TRIGGERED calibration. Small ATR-based buffers absorb quote
+    # noise without reopening the old late-entry/chasing behavior.
+    trade_armed_chase_tolerance_atr: float = Field(0.15, ge=0.0, le=0.50)
+    trade_armed_trigger_close_tolerance_atr: float = Field(0.08, ge=0.0, le=0.30)
+    trade_armed_consumed_ttl_seconds: float = Field(3600.0, ge=600.0, le=21600.0)
     trade_funnel_emit_seconds: float = Field(300.0, ge=30.0, le=3600.0)
     trade_funnel_emit_every: int = Field(50, ge=5, le=1000)
     market_poll_seconds: float = Field(2.0, gt=0)

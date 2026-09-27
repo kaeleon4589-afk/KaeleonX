@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -98,12 +99,26 @@ def _redact(value, key: str | None = None):
     return value
 
 
+class _BelowWarning(logging.Filter):
+    """Route INFO/DEBUG to stdout while keeping warnings/errors on stderr."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.WARNING
+
+
 def get_logger(name):
     logger = logging.getLogger(name)
     if not logger.handlers:
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter('%(message)s'))
-        logger.addHandler(h)
+        stdout = logging.StreamHandler(sys.stdout)
+        stdout.addFilter(_BelowWarning())
+        stdout.setFormatter(logging.Formatter('%(message)s'))
+
+        stderr = logging.StreamHandler(sys.stderr)
+        stderr.setLevel(logging.WARNING)
+        stderr.setFormatter(logging.Formatter('%(message)s'))
+
+        logger.addHandler(stdout)
+        logger.addHandler(stderr)
         logger.propagate = False
     logger.setLevel(_level())
     return logger
@@ -112,8 +127,8 @@ def get_logger(name):
 class AuditLogger:
     """Lean structured logs for Railway.
 
-    Operational logs are written to stdout only. They are deliberately *not*
-    persisted to MongoDB: business data already lives in positions/orders and
+    Normal operational logs are written to stdout; warnings/errors go to stderr.
+    They are deliberately *not* persisted to MongoDB: business data already lives in positions/orders and
     the latest engine state is an upsert, so duplicating logs in Mongo would add
     cost without improving recovery.
     """
@@ -184,5 +199,13 @@ class AuditLogger:
             **_redact(data),
         }
         numeric = getattr(logging, effective, logging.INFO)
-        self.logger.log(numeric, json.dumps(record, default=str, separators=(',', ':')))
+        # Railway treats a message that is *only* JSON as structured attributes.
+        # In the web UI that looks useful, but exported .log files can then contain
+        # an empty message (only the timestamp/[err] prefix).  Prefix the compact
+        # JSON so the full diagnostic payload remains a normal, downloadable line.
+        # The event name is duplicated outside the JSON on purpose: it makes grep
+        # and Railway's text filter useful without sacrificing the complete payload.
+        payload = json.dumps(record, default=str, separators=(',', ':'))
+        message = f'KAELEON event={event} payload={payload}'
+        self.logger.log(numeric, message)
         return record

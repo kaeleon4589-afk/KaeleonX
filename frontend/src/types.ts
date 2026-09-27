@@ -133,8 +133,8 @@ export type ManualOrder = {
   leverage: number;
   notional: number;
   limit_price?: number | null;
-  stop_price: number;
-  target_price: number;
+  stop_price?: number | null;
+  target_price?: number | null;
   fill_price?: number | null;
   created_at?: number | string;
   filled_at?: number | string | null;
@@ -167,8 +167,8 @@ export type ManualOrderInput = {
   margin: number;
   leverage: number;
   limit_price?: number;
-  stop_loss: number;
-  take_profit: number;
+  stop_loss?: number;
+  take_profit?: number;
   confirm_live: boolean;
 };
 

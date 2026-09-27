@@ -338,8 +338,8 @@ class ManualOrderRequest(BaseModel):
     margin: float = Field(gt=0)
     leverage: int = Field(ge=1, le=125)
     limit_price: float | None = Field(default=None, gt=0)
-    stop_loss: float = Field(gt=0)
-    take_profit: float = Field(gt=0)
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
     confirm_live: bool = False
 
 
@@ -352,8 +352,8 @@ class ManualCloseRequest(BaseModel):
 
 
 class ManualProtectionRequest(BaseModel):
-    stop_loss: float = Field(gt=0)
-    take_profit: float = Field(gt=0)
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
     confirm_live: bool = False
 
 

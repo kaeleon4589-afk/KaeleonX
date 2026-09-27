@@ -1,3 +1,4 @@
+import { drawQrCode } from './qrCode';
 export type TradeShareSnapshot = {
   symbol: string;
   side: 'LONG' | 'SHORT';
@@ -11,6 +12,8 @@ export type TradeShareSnapshot = {
   roePct?: number | null;
   sharedAt?: number;
   pricePrecision?: number | null;
+  referralCode?: string | null;
+  referralUrl?: string | null;
 };
 
 export type TradeShareOptions = {
@@ -18,7 +21,8 @@ export type TradeShareOptions = {
   showPnl: boolean;
 };
 
-const CARD_SIZE = 1080;
+const CARD_WIDTH = 1080;
+const CARD_HEIGHT = 1280;
 const BASE_IMAGE_SRC = '/images/kaeleon-trading-art.jpg';
 
 const money = (n: unknown) =>
@@ -120,8 +124,8 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 
 export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options: TradeShareOptions): Promise<Blob> {
   const canvas = document.createElement('canvas');
-  canvas.width = CARD_SIZE;
-  canvas.height = CARD_SIZE;
+  canvas.width = CARD_WIDTH;
+  canvas.height = CARD_HEIGHT;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('No fue posible crear la tarjeta para compartir.');
 
@@ -129,20 +133,27 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   const softAccent = (snapshot.pnlValue ?? 0) >= 0 ? 'rgba(0,232,139,0.22)' : 'rgba(255,54,95,0.22)';
   const bg = await loadImage(BASE_IMAGE_SRC);
 
-  ctx.drawImage(bg, 0, 0, CARD_SIZE, CARD_SIZE);
+  ctx.fillStyle = '#020910';
+  ctx.fillRect(0, 0, CARD_WIDTH, CARD_HEIGHT);
+  ctx.drawImage(bg, 0, 0, CARD_WIDTH, CARD_WIDTH);
+  const extension = ctx.createLinearGradient(0, CARD_WIDTH - 80, 0, CARD_HEIGHT);
+  extension.addColorStop(0, 'rgba(2,9,16,0.18)');
+  extension.addColorStop(1, 'rgba(2,9,16,0.98)');
+  ctx.fillStyle = extension;
+  ctx.fillRect(0, CARD_WIDTH - 90, CARD_WIDTH, CARD_HEIGHT - CARD_WIDTH + 90);
 
-  const overlay = ctx.createLinearGradient(0, 0, 0, CARD_SIZE);
+  const overlay = ctx.createLinearGradient(0, 0, 0, CARD_HEIGHT);
   overlay.addColorStop(0, 'rgba(1, 8, 14, 0.08)');
   overlay.addColorStop(0.45, 'rgba(1, 7, 12, 0.04)');
   overlay.addColorStop(0.78, 'rgba(2, 9, 16, 0.26)');
   overlay.addColorStop(1, 'rgba(2, 9, 16, 0.42)');
   ctx.fillStyle = overlay;
-  ctx.fillRect(0, 0, CARD_SIZE, CARD_SIZE);
+  ctx.fillRect(0, 0, CARD_WIDTH, CARD_HEIGHT);
 
   ctx.save();
   ctx.strokeStyle = softAccent;
   ctx.lineWidth = 5;
-  roundedRect(ctx, 32, 32, CARD_SIZE - 64, CARD_SIZE - 64, 34);
+  roundedRect(ctx, 32, 32, CARD_WIDTH - 64, CARD_HEIGHT - 64, 34);
   ctx.stroke();
   ctx.restore();
 
@@ -150,7 +161,7 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   cursorX += drawBadge(ctx, snapshot.mode === 'live' ? 'LIVE' : 'DEMO', cursorX, 66, 'rgba(4, 20, 30, 0.86)', '#eef6fb') + 10;
   cursorX += drawBadge(ctx, snapshot.status, cursorX, 66, snapshot.status === 'LIVE' ? 'rgba(11,187,232,0.9)' : 'rgba(8, 34, 46, 0.9)', snapshot.status === 'LIVE' ? '#04131b' : '#eef6fb') + 10;
   drawBadge(ctx, snapshot.side, cursorX, 66, accent, '#02160e');
-  drawBadge(ctx, `${Math.max(1, Number(snapshot.leverage) || 1)}x`, CARD_SIZE - 170, 66, 'rgba(242,184,62,0.92)', '#1b1202');
+  drawBadge(ctx, `${Math.max(1, Number(snapshot.leverage) || 1)}x`, CARD_WIDTH - 170, 66, 'rgba(242,184,62,0.92)', '#1b1202');
 
   ctx.shadowColor = 'rgba(0,0,0,0.78)';
   ctx.shadowBlur = 12;
@@ -200,12 +211,12 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   ctx.fillStyle = 'rgba(2, 16, 25, 0.18)';
   ctx.strokeStyle = 'rgba(120, 178, 202, 0.24)';
   ctx.lineWidth = 2;
-  roundedRect(ctx, 56, bottomY - 20, CARD_SIZE - 112, 320, 32);
+  roundedRect(ctx, 56, bottomY - 20, CARD_WIDTH - 112, 320, 32);
   ctx.fill();
   ctx.stroke();
 
   const gap = 24;
-  const colWidth = (CARD_SIZE - 112 - gap * 3) / 2;
+  const colWidth = (CARD_WIDTH - 112 - gap * 3) / 2;
   drawLabelValue(ctx, 'Precio de entrada', formatPrice(snapshot.entryPrice, snapshot.pricePrecision), 86, bottomY + 16, colWidth, '#ecf6fb');
   drawLabelValue(
     ctx,
@@ -223,7 +234,36 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   ctx.shadowBlur = 8;
   ctx.fillStyle = accent;
   ctx.font = '700 20px Inter, system-ui, sans-serif';
-  ctx.fillText(snapshot.status === 'LIVE' ? 'Datos en vivo sincronizados con KAELEON' : 'Resultado final cerrado en KAELEON', 86, CARD_SIZE - 54);
+  ctx.fillText(snapshot.status === 'LIVE' ? 'Datos en vivo sincronizados con KAELEON' : 'Resultado final cerrado en KAELEON', 86, 1012);
+
+  const referralCode = String(snapshot.referralCode || '').trim();
+  const referralUrl = String(snapshot.referralUrl || '').trim();
+  if (referralCode && referralUrl) {
+    ctx.save();
+    ctx.shadowColor = 'transparent';
+    ctx.fillStyle = 'rgba(2, 16, 25, 0.88)';
+    ctx.strokeStyle = 'rgba(0, 232, 139, 0.34)';
+    ctx.lineWidth = 2;
+    roundedRect(ctx, 56, 1040, CARD_WIDTH - 112, 184, 28);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#ecf6fb';
+    ctx.font = '800 27px Inter, system-ui, sans-serif';
+    ctx.fillText('Únete a KAELEON con mi enlace', 86, 1082);
+    ctx.fillStyle = 'rgba(174, 197, 212, 0.88)';
+    ctx.font = '600 20px Inter, system-ui, sans-serif';
+    ctx.fillText(`Código: ${referralCode}`, 86, 1118);
+    ctx.fillStyle = '#8ff2c3';
+    ctx.font = '700 18px Inter, system-ui, sans-serif';
+    const visibleUrl = referralUrl.length > 72 ? `${referralUrl.slice(0, 69)}…` : referralUrl;
+    ctx.fillText(visibleUrl, 86, 1154);
+    ctx.fillStyle = 'rgba(174, 197, 212, 0.72)';
+    ctx.font = '600 17px Inter, system-ui, sans-serif';
+    ctx.fillText('Escanea el QR para registrarte con mi referido', 86, 1191);
+    drawQrCode(ctx, referralUrl, 832, 1042, 180);
+    ctx.restore();
+  }
 
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((value) => {
@@ -247,7 +287,10 @@ export async function shareTradeShareCard(snapshot: TradeShareSnapshot, options:
     await navigator.share({
       files: [file],
       title: `${snapshot.symbol} · ${snapshot.side}`,
-      text: `Operación ${snapshot.status === 'LIVE' ? 'en vivo' : 'cerrada'} compartida desde KAELEON`,
+      text: [
+        `Operación ${snapshot.status === 'LIVE' ? 'en vivo' : 'cerrada'} compartida desde KAELEON`,
+        snapshot.referralUrl ? `Únete con mi enlace de referido: ${snapshot.referralUrl}` : '',
+      ].filter(Boolean).join('\n'),
     });
     return 'shared';
   }

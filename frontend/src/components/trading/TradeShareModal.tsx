@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { TradeShareOptions, TradeShareSnapshot } from '../../lib/tradeShare';
 import { downloadTradeShareCard, shareTradeShareCard } from '../../lib/tradeShare';
+import { createQrDataUrl } from '../../lib/qrCode';
 
 const money = (n: unknown) =>
   new Intl.NumberFormat('en-US', {
@@ -53,6 +54,19 @@ export default function TradeShareModal({
   const effectivePriceLabel = snapshot.status === 'LIVE' ? 'Precio actual' : 'Precio de salida';
   const effectivePrice = snapshot.status === 'LIVE' ? snapshot.currentPrice : snapshot.exitPrice;
   const snapshotTime = useMemo(() => snapshot.sharedAt || Date.now(), [snapshot.sharedAt]);
+  const [referralQr, setReferralQr] = useState('');
+  useEffect(() => {
+    const url = String(snapshot.referralUrl || '').trim();
+    if (!url) {
+      setReferralQr('');
+      return;
+    }
+    try {
+      setReferralQr(createQrDataUrl(url, 180));
+    } catch {
+      setReferralQr('');
+    }
+  }, [snapshot.referralUrl]);
 
   async function handleShare() {
     setBusy('share');
@@ -137,6 +151,16 @@ export default function TradeShareModal({
                 <strong>{dateTime(snapshotTime)}</strong>
               </span>
             </div>
+            {snapshot.referralCode && snapshot.referralUrl && (
+              <div className="share-preview-referral">
+                <div>
+                  <small>Únete a KAELEON con mi enlace</small>
+                  <strong>Código: {snapshot.referralCode}</strong>
+                  <span>{snapshot.referralUrl}</span>
+                </div>
+                {referralQr && <img src={referralQr} alt="QR del enlace de referido" />}
+              </div>
+            )}
           </div>
         </div>
 

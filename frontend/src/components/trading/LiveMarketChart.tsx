@@ -42,16 +42,6 @@ type ChartMode = 'candle' | 'area';
 type DrawingTool = 'straightLine' | 'segment' | 'horizontalStraightLine' | 'priceLine' | 'priceChannelLine' | 'parallelStraightLine' | 'fibonacciLine' | 'simpleAnnotation' | 'brush';
 type PriceAlert = { id: string; price: number; direction: 'above' | 'below'; triggered: boolean };
 
-export type LiveMarketSelection = {
-  symbol: string;
-  display: string;
-  price: number | null;
-  bid: number | null;
-  ask: number | null;
-  pricePrecision: number;
-  maxLeverage: number | null;
-};
-
 const EMPTY_ORDER_BOOK: MarketOrderBook = { asks: [], bids: [], timestamp: null };
 const INDICATOR_DEFAULTS: Record<string, number[]> = {
   MA: [5, 10, 30, 60], EMA: [6, 12, 20], BOLL: [20, 2],
@@ -516,7 +506,7 @@ const BASE_STYLES = {
   },
 };
 
-export default function LiveMarketChart({ positions, closedPositions = [], dynamicProtectionEnabled = true, compactTradingMode = false, onMarketChange }: { positions: Position[]; closedPositions?: Position[]; dynamicProtectionEnabled?: boolean; compactTradingMode?: boolean; onMarketChange?: (market: LiveMarketSelection) => void }) {
+export default function LiveMarketChart({ positions, closedPositions = [], dynamicProtectionEnabled = true }: { positions: Position[]; closedPositions?: Position[]; dynamicProtectionEnabled?: boolean }) {
   const firstPositionSymbol = positions.length ? positionSymbol(positions[0]) : 'BTCUSDT';
   const [selected, setSelected] = useState<MarketInstrument>({
     symbol: firstPositionSymbol,
@@ -1278,18 +1268,6 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
   const bestBid = orderBook.bids[0]?.price ?? null;
   const spread = bestAsk != null && bestBid != null ? Math.max(0, bestAsk - bestBid) : null;
 
-  useEffect(() => {
-    onMarketChange?.({
-      symbol: selected.symbol,
-      display: selected.display,
-      price: livePrice ?? null,
-      bid: bestBid,
-      ask: bestAsk,
-      pricePrecision: selected.price_precision,
-      maxLeverage: ticker.max_leverage == null ? null : Number(ticker.max_leverage),
-    });
-  }, [bestAsk, bestBid, livePrice, onMarketChange, selected.display, selected.price_precision, selected.symbol, ticker.max_leverage]);
-
   return (
     <section className={`live-market-chart ${fullscreen ? 'is-fullscreen' : ''}`} ref={rootRef} aria-label="Gráfico de mercado CoinW">
       <div className="market-chart-header">
@@ -1370,7 +1348,7 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
           <button type="button" onClick={clearDrawings} title="Borrar dibujos">⌫</button>
           <button type="button" className={indicatorSettingsOpen ? 'active' : ''} onClick={() => setIndicatorSettingsOpen((value) => !value)} title="Configurar indicadores">⚙</button>
           <button type="button" className={chartMode === 'candle' ? 'active' : ''} onClick={() => setChartMode(chartMode === 'candle' ? 'area' : 'candle')} title="Cambiar entre velas y área">{chartMode === 'candle' ? '▥ Velas' : '⌁ Área'}</button>
-          {compactTradingMode && <button type="button" className={marketDetailsOpen ? 'active' : ''} onClick={() => setMarketDetailsOpen(true)} title="Order Book, trades y fuerza de mercado">Mercado ▾</button>}
+          <button type="button" className={marketDetailsOpen ? 'active' : ''} onClick={() => setMarketDetailsOpen(true)} title="Order Book, trades y fuerza de mercado">Mercado ▾</button>
           <button type="button" onClick={() => chartApiRef.current?.scrollToRealTime(250)} title="Volver al precio actual">LIVE</button>
           <button type="button" onClick={() => void toggleFullscreen()} title="Pantalla completa">{fullscreen ? '✕' : '⛶'}</button>
         </div>
@@ -1394,51 +1372,19 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
         </div>
       )}
 
-      {!compactTradingMode && <div className={`market-pressure-strip ${marketPressure ? 'ready' : 'waiting'}`} aria-label="Fuerza compradora y vendedora">
-        <div className="market-pressure-label buy">
-          <span>Fuerza compradora</span>
-          <strong>{marketPressure ? `${marketPressure.buy.toFixed(1)}%` : '—'}</strong>
-        </div>
-        <div className="market-pressure-track" aria-hidden="true">
-          <i style={{ width: `${marketPressure?.buy ?? 50}%` }} />
-          <b style={{ width: `${marketPressure?.sell ?? 50}%` }} />
-        </div>
-        <div className="market-pressure-label sell">
-          <span>Fuerza vendedora</span>
-          <strong>{marketPressure ? `${marketPressure.sell.toFixed(1)}%` : '—'}</strong>
-        </div>
-        <small>{marketPressure ? 'Liquidez visible · 20 niveles del Order Book de CoinW' : 'Esperando Order Book en tiempo real…'}</small>
-      </div>}
-
       <div className="market-chart-canvas-wrap">
         <div className="market-chart-canvas" ref={chartRef} />
         {chartError && <div className="market-chart-error"><strong>Datos de mercado</strong><span>{chartError}</span></div>}
       </div>
-
-      {!compactTradingMode && <MarketMicrostructure
-        orderBook={orderBook}
-        trades={trades}
-        ticker={ticker}
-        lastPrice={livePrice}
-        markPrice={markPrice}
-        indexPrice={indexPrice}
-        fundingRate={fundingRate}
-        fundingTimestamp={fundingTimestamp}
-        fundingTimestampKind={fundingTimestampKind}
-        precision={selected.price_precision}
-        candles={candleHistory}
-        activePosition={activePosition}
-        marketPressure={marketPressure}
-      />}
 
       <div className="market-chart-footer">
         <span>Velas, Last, Mark, Index, Funding, Order Book y Trades: CoinW</span>
         <span>{activePosition ? 'Niveles ENTRY / TP / SL sincronizados con la operación activa' : 'Selecciona el par de una operación activa para ver ENTRY / TP / SL'}</span>
       </div>
 
-      {compactTradingMode && marketDetailsOpen && <div className="market-details-backdrop" role="presentation" onClick={() => setMarketDetailsOpen(false)}>
+      {marketDetailsOpen && <div className="market-details-backdrop" role="presentation" onClick={() => setMarketDetailsOpen(false)}>
         <div className="market-details-drawer" role="dialog" aria-modal="true" aria-label="Datos de mercado" onClick={(event) => event.stopPropagation()}>
-          <div className="market-details-head"><div><small>CoinW Market Data</small><strong>{selected.display}</strong></div><button type="button" onClick={() => setMarketDetailsOpen(false)}>✕</button></div>
+          <div className="market-details-head"><div><small>CoinW Market Data</small><strong>{selected.display}</strong></div><button type="button" onClick={() => setMarketDetailsOpen(false)} aria-label="Cerrar datos de mercado">✕</button></div>
           <div className={`market-pressure-strip ${marketPressure ? 'ready' : 'waiting'}`} aria-label="Fuerza compradora y vendedora">
             <div className="market-pressure-label buy"><span>Fuerza compradora</span><strong>{marketPressure ? `${marketPressure.buy.toFixed(1)}%` : '—'}</strong></div>
             <div className="market-pressure-track" aria-hidden="true"><i style={{ width: `${marketPressure?.buy ?? 50}%` }} /><b style={{ width: `${marketPressure?.sell ?? 50}%` }} /></div>

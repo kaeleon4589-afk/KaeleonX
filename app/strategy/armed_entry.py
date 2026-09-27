@@ -239,6 +239,21 @@ class ArmedEntryEngine:
             for setup_id, _ in oldest:
                 self._consumed_setups.pop(setup_id, None)
 
+    def restore_consumed(self, setup_id: str, until_ms: int, reason: str = "restored") -> bool:
+        """Restore a durable consumed-setup tombstone after a worker restart."""
+        now_ms = _now_ms()
+        until_ms = int(until_ms or 0)
+        if not setup_id or until_ms <= now_ms:
+            return False
+        self._consumed_setups[str(setup_id)] = (until_ms, str(reason or "restored"))
+        self._prune_consumed(now_ms)
+        return True
+
+    def consumed_record(self, setup_id: str) -> tuple[int, str] | None:
+        """Return the current consumed TTL/reason for durable persistence."""
+        self._prune_consumed()
+        return self._consumed_setups.get(str(setup_id))
+
     def _expiry(self, snapshot) -> tuple[int, int]:
         armed_at = _now_ms()
         return armed_at, armed_at + int(self.ttl_seconds * 1000)

@@ -283,3 +283,165 @@ def test_orchestrator_v6_arms_first_and_executes_only_after_trigger():
     assert manager.positions
     assert "BTC" not in orchestrator.armed_setups
     assert router.trigger_calls == 1
+
+
+def _fast_confirm_setup(direction=Direction.LONG):
+    from app.models.trading import ArmedSetup
+    now = int(time.time() * 1000)
+    if direction == Direction.LONG:
+        return ArmedSetup(
+            setup_id="FAST:BR:1:LONG", symbol="FAST", strategy=Strategy.BREAKOUT_RETEST,
+            direction=direction, armed_at_ms=now, expires_at_ms=now + 300_000,
+            trigger_price=100.0, invalidation_price=99.0, stop_price=99.0,
+            target_price=102.0, entry_zone_low=100.0, entry_zone_high=100.5,
+            quality=85.0, risk_multiplier=1.0, timeframe="5m",
+            metadata={"atr_value": 1.0, "structural_target_price": 102.0,
+                      "target_front_run_ratio": 1.0},
+        )
+    return ArmedSetup(
+        setup_id="FAST:LS:1:SHORT", symbol="FAST", strategy=Strategy.LIQUIDITY_SWEEP,
+        direction=direction, armed_at_ms=now, expires_at_ms=now + 300_000,
+        trigger_price=100.0, invalidation_price=101.0, stop_price=101.0,
+        target_price=98.7, entry_zone_low=99.5, entry_zone_high=100.0,
+        quality=85.0, risk_multiplier=1.0, timeframe="5m",
+        metadata={"atr_value": 1.0, "structural_target_price": 98.7,
+                  "target_front_run_ratio": 1.0},
+    )
+
+
+def _recent_prearm_micro(setup, *, age_ms=10_000, strong=True):
+    close_ms = setup.armed_at_ms - age_ms
+    start = close_ms - 60_000 - 29 * 60_000
+    candles = [
+        Candle(start + i * 60_000, 99.90, 100.00, 99.80, 99.92, 100.0)
+        for i in range(30)
+    ]
+    if setup.direction == Direction.LONG:
+        if strong:
+            candles[-1] = Candle(close_ms - 60_000, 99.74, 100.02, 99.70, 99.98, 180.0)
+        else:
+            candles[-1] = Candle(close_ms - 60_000, 99.95, 100.01, 99.90, 99.97, 80.0)
+    else:
+        if strong:
+            candles[-1] = Candle(close_ms - 60_000, 100.26, 100.30, 99.98, 100.02, 180.0)
+        else:
+            candles[-1] = Candle(close_ms - 60_000, 100.05, 100.10, 99.99, 100.03, 80.0)
+    return candles
+
+
+def test_v63_recent_strong_prearm_closed_1m_can_fast_confirm():
+    engine = ArmedEntryEngine(
+        ttl_seconds=600, chase_tolerance_atr=0.15,
+        trigger_close_tolerance_atr=0.08,
+        fast_confirm_enabled=True, fast_confirm_max_age_seconds=30,
+    )
+    setup = _fast_confirm_setup(Direction.LONG)
+    micro = _recent_prearm_micro(setup, age_ms=8_000, strong=True)
+    snap = SimpleNamespace(
+        symbol="FAST", ask=100.02, bid=100.01, last=100.015,
+        timeframes={"1m": micro}, quote_received_ms=setup.armed_at_ms + 2_000,
+        orderbook_valid=True,
+        bids=[(100.01, 5.0), (100.00, 4.0), (99.99, 3.0)],
+        asks=[(100.02, 5.0), (100.03, 4.0), (100.04, 3.0)],
+    )
+    status, intent, trace = engine.trigger(setup, snap, "decision-fast")
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["reason"] == "micro_confirmation_fast_1m"
+    assert trace["confirmation_mode"] == "recent_prearm_closed_1m"
+    assert trace["prearm_age_ms"] == 8_000
+    assert trace["execution_rr"] >= 1.10
+    assert "micro_confirmation_fast_1m" in intent.reasons
+
+
+def test_v63_fast_confirmation_rejects_stale_or_weak_prearm_evidence():
+    for age_ms, strong in ((45_000, True), (8_000, False)):
+        engine = ArmedEntryEngine(
+            ttl_seconds=600, chase_tolerance_atr=0.15,
+            trigger_close_tolerance_atr=0.08,
+            fast_confirm_enabled=True, fast_confirm_max_age_seconds=30,
+        )
+        setup = _fast_confirm_setup(Direction.LONG)
+        micro = _recent_prearm_micro(setup, age_ms=age_ms, strong=strong)
+        snap = SimpleNamespace(
+            symbol="FAST", ask=100.02, bid=100.01, last=100.015,
+            timeframes={"1m": micro}, quote_received_ms=setup.armed_at_ms + 2_000,
+            orderbook_valid=True,
+            bids=[(100.01, 5.0), (100.00, 4.0)], asks=[(100.02, 5.0), (100.03, 4.0)],
+        )
+        status, intent, trace = engine.trigger(setup, snap, f"decision-wait-{age_ms}-{strong}")
+        assert status == "pending"
+        assert intent is None
+        assert trace["reason"] == "waiting_fresh_1m_confirmation"
+        assert trace["confirmation_mode"] == "waiting_new_closed_1m"
+
+
+def test_v63_fast_confirmation_requires_valid_orderbook():
+    engine = ArmedEntryEngine(fast_confirm_enabled=True, fast_confirm_max_age_seconds=30)
+    setup = _fast_confirm_setup(Direction.LONG)
+    snap = SimpleNamespace(
+        symbol="FAST", ask=100.02, bid=100.01, last=100.015,
+        timeframes={"1m": _recent_prearm_micro(setup, age_ms=5_000, strong=True)},
+        quote_received_ms=setup.armed_at_ms + 2_000,
+        orderbook_valid=False, bids=[], asks=[],
+    )
+    status, intent, trace = engine.trigger(setup, snap, "decision-no-book")
+    assert status == "pending"
+    assert intent is None
+    assert trace["reason"] == "waiting_fresh_1m_confirmation"
+    assert trace["fast_confirm_book_valid"] is False
+
+
+def test_v63_one_tick_chase_edge_is_tolerated_but_real_chase_still_cancels():
+    engine = ArmedEntryEngine(chase_tolerance_atr=0.15)
+    setup = _fast_confirm_setup(Direction.LONG)
+    tiny = SimpleNamespace(
+        symbol="FAST", ask=100.6505, bid=100.6495, last=100.65,
+        timeframes={}, quote_received_ms=setup.armed_at_ms + 2_000,
+        orderbook_valid=True,
+        bids=[(100.6495, 5.0), (100.6485, 4.0)],
+        asks=[(100.6505, 5.0), (100.6515, 4.0)],
+    )
+    status, intent, trace = engine.trigger(setup, tiny, "decision-edge")
+    assert status == "pending"
+    assert intent is None
+    assert trace["reason"] == "waiting_1m_confirmation"
+
+    engine2 = ArmedEntryEngine(chase_tolerance_atr=0.15)
+    setup2 = _fast_confirm_setup(Direction.LONG)
+    chased = SimpleNamespace(
+        symbol="FAST", ask=100.68, bid=100.679, last=100.6795,
+        timeframes={}, quote_received_ms=setup2.armed_at_ms + 2_000,
+        orderbook_valid=True,
+        bids=[(100.679, 5.0), (100.678, 4.0)],
+        asks=[(100.68, 5.0), (100.681, 4.0)],
+    )
+    status, intent, trace = engine2.trigger(setup2, chased, "decision-real-chase")
+    assert status == "cancelled"
+    assert intent is None
+    assert trace["reason"] == "setup_chased"
+    assert trace["price"] > trace["chase_limit"]
+
+
+def test_v63_recent_strong_prearm_closed_1m_fast_confirm_is_directionally_symmetric():
+    engine = ArmedEntryEngine(
+        ttl_seconds=600, chase_tolerance_atr=0.15,
+        trigger_close_tolerance_atr=0.08,
+        fast_confirm_enabled=True, fast_confirm_max_age_seconds=30,
+    )
+    setup = _fast_confirm_setup(Direction.SHORT)
+    micro = _recent_prearm_micro(setup, age_ms=7_000, strong=True)
+    snap = SimpleNamespace(
+        symbol="FAST", ask=99.99, bid=99.98, last=99.985,
+        timeframes={"1m": micro}, quote_received_ms=setup.armed_at_ms + 2_000,
+        orderbook_valid=True,
+        bids=[(99.98, 5.0), (99.97, 4.0), (99.96, 3.0)],
+        asks=[(99.99, 5.0), (100.00, 4.0), (100.01, 3.0)],
+    )
+    status, intent, trace = engine.trigger(setup, snap, "decision-fast-short")
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["reason"] == "micro_confirmation_fast_1m"
+    assert intent.direction == Direction.SHORT
+    assert intent.target_price < intent.entry_price < intent.stop_price
+    assert trace["execution_rr"] >= 1.10

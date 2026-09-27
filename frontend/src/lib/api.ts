@@ -68,7 +68,7 @@ export const api = {
   manualPlaceOrder: (body: ManualOrderInput) => request<Record<string, unknown>>('/user/manual-trading/orders', {method:'POST', body:JSON.stringify(body)}),
   manualCancelOrder: (manualOrderId: string, confirmLive: boolean) => request<Record<string, unknown>>(`/user/manual-trading/orders/${encodeURIComponent(manualOrderId)}/cancel`, {method:'POST', body:JSON.stringify({confirm_live:confirmLive})}),
   manualClosePosition: (positionId: string, confirmLive: boolean) => request<Record<string, unknown>>(`/user/manual-trading/positions/${encodeURIComponent(positionId)}/close`, {method:'POST', body:JSON.stringify({confirm_live:confirmLive})}),
-  manualUpdateProtection: (positionId: string, stopLoss: number, takeProfit: number, confirmLive: boolean) => request<Record<string, unknown>>(`/user/manual-trading/positions/${encodeURIComponent(positionId)}/protection`, {method:'PUT', body:JSON.stringify({stop_loss:stopLoss,take_profit:takeProfit,confirm_live:confirmLive})}),
+  manualUpdateProtection: (positionId: string, stopLoss: number | undefined, takeProfit: number | undefined, confirmLive: boolean) => request<Record<string, unknown>>(`/user/manual-trading/positions/${encodeURIComponent(positionId)}/protection`, {method:'PUT', body:JSON.stringify({...(stopLoss ? {stop_loss:stopLoss} : {}),...(takeProfit ? {take_profit:takeProfit} : {}),confirm_live:confirmLive})}),
   activity: (limit = 120, mode?: string) => request<ActivityResponse>(`/user/activity?limit=${limit}${mode ? `&mode=${encodeURIComponent(mode)}` : ''}`),
   entitlement: () => request<Entitlement>('/billing/entitlement'),
   activateTrial: () => request<Entitlement>('/billing/live/activate-trial', { method: 'POST' }),

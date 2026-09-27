@@ -151,3 +151,17 @@ Los `setup_id` cancelados por chase, expiración, invalidación o RR insuficient
 y también los ya disparados, quedan consumidos durante 3600 s. El mismo evento
 estructural no puede rearmarse; una nueva vela estructural genera un `setup_id`
 distinto y vuelve a ser elegible.
+
+## ARMED priority monitor + durable setup state (v6.2)
+
+The scanner remains responsible for discovery and keeps the existing 5m/15m/1h quality gates. Once a setup passes those gates and enters `ARMED`, it no longer depends on the scanner rotation to reach `TRIGGERED`.
+
+- `MultiMarketCoordinator.monitor_armed()` watches the union of currently armed symbols independently of the ranked scanner.
+- The priority snapshot is intentionally lightweight: executable depth/quote + closed 1m candles only. It does not redownload 5m/15m/1h on every priority poll.
+- `TRADE_ARMED_MONITOR_POLL_SECONDS` defaults to `2.0`. Railway does not need the variable unless an override is desired.
+- Priority polls do not increment `analyzed`/`armed_pending` on every pass, so the rejection funnel remains a strategy-discovery metric rather than being flooded by high-frequency follow-up checks.
+- An ARMED setup is written durably to `armed_setups` before the discovery pass returns. Terminal outcomes are persisted and their setup IDs are written to `armed_consumed_setups` with TTL.
+- Worker startup restores valid ARMED setups and consumed setup IDs. A consumed tombstone always wins over a stale ACTIVE row.
+- Triggered ARMED entries use an idempotent `signal_claims` key based on `armed_setup_id`, so a worker restart cannot submit the same structural setup twice even when the priority snapshot contains no 5m candles.
+
+This change does not relax MTF bias, HTF exhaustion, ATR, structural stop, minimum RR, TP ratios, chase tolerance, or closed-1m confirmation. It changes *how fast an already-approved setup is followed*, not *what qualifies as a setup*.

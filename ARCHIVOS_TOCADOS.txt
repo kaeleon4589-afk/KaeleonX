@@ -522,3 +522,28 @@ VALIDACIÓN:
 - python -m compileall -q app scripts -> sin errores
 - TypeScript syntax/transpile validation de los archivos frontend tocados -> OK
 - typecheck/build integral del frontend no validado en este entorno: npm ci agotó el timeout antes de completar node_modules.
+
+AMPLIACIÓN — Monitor prioritario ARMED + persistencia durable de setups
+BASE COMPARADA: KaeleonX-v6-account-recovery.zip
+
+MODIFICADOS (11):
+.env.example
+ARCHIVOS_TOCADOS.txt
+KAELEON_V6_STRATEGY_ENGINE.md
+app/config/settings.py
+app/main.py
+app/market/coordinator.py
+app/orchestrator.py
+app/storage/database.py
+app/strategy/armed_entry.py
+app/trading/persistence.py
+app/trading/runtime.py
+
+NUEVOS (1):
+tests/test_armed_priority_monitor.py
+
+ELIMINADOS: ninguno
+
+VALIDACIÓN:
+- 210 tests passed
+- python -m compileall -q app scripts: OK

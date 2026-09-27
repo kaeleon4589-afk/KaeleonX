@@ -46,7 +46,13 @@ def _shape(candle) -> tuple[float, float]:
     return body, pos
 
 
-def _micro_confirmation(setup: ArmedSetup, snapshot) -> tuple[bool, str, dict]:
+def _micro_confirmation(
+    setup: ArmedSetup,
+    snapshot,
+    *,
+    chase_tolerance_atr: float,
+    trigger_close_tolerance_atr: float,
+) -> tuple[bool, str, dict]:
     frames = getattr(snapshot, "timeframes", {}) or {}
     candles_1m = list(frames.get("1m", []) or [])
     executable = getattr(snapshot, "ask" if setup.direction == Direction.LONG else "bid", None)
@@ -57,17 +63,47 @@ def _micro_confirmation(setup: ArmedSetup, snapshot) -> tuple[bool, str, dict]:
     if not math.isfinite(executable) or executable <= 0:
         return False, "quote_unavailable", {}
 
+    atr_value = float((setup.metadata or {}).get("atr_value") or 0.0)
+    try:
+        ask = float(getattr(snapshot, "ask", 0.0) or 0.0)
+        bid = float(getattr(snapshot, "bid", 0.0) or 0.0)
+        spread = max(ask - bid, 0.0) if ask > 0 and bid > 0 else 0.0
+    except (TypeError, ValueError):
+        spread = 0.0
+    # A setup should not die because the executable quote moved a few ticks past
+    # the original 5m zone. ATR is the primary tolerance. Spread can widen the
+    # buffer slightly, but is capped so a bad/wide book never authorizes a late entry.
+    atr_buffer = atr_value * max(chase_tolerance_atr, 0.0)
+    if atr_value > 0:
+        spread_buffer = min(spread * 1.5, atr_value * min(max(chase_tolerance_atr * 1.5, 0.0), 0.25))
+    else:
+        spread_buffer = spread * 1.5
+    chase_buffer = max(atr_buffer, spread_buffer)
+    trigger_close_buffer = atr_value * max(trigger_close_tolerance_atr, 0.0)
+
     if setup.direction == Direction.LONG:
+        chase_limit = setup.entry_zone_high + chase_buffer
         if executable <= setup.invalidation_price:
             return False, "setup_invalidated", {"price": executable}
-        if executable > setup.entry_zone_high:
-            return False, "setup_chased", {"price": executable, "entry_zone_high": setup.entry_zone_high}
+        if executable > chase_limit:
+            return False, "setup_chased", {
+                "price": executable,
+                "entry_zone_high": setup.entry_zone_high,
+                "chase_limit": chase_limit,
+                "chase_buffer": chase_buffer,
+            }
         crossed = executable >= setup.trigger_price
     else:
+        chase_limit = setup.entry_zone_low - chase_buffer
         if executable >= setup.invalidation_price:
             return False, "setup_invalidated", {"price": executable}
-        if executable < setup.entry_zone_low:
-            return False, "setup_chased", {"price": executable, "entry_zone_low": setup.entry_zone_low}
+        if executable < chase_limit:
+            return False, "setup_chased", {
+                "price": executable,
+                "entry_zone_low": setup.entry_zone_low,
+                "chase_limit": chase_limit,
+                "chase_buffer": chase_buffer,
+            }
         crossed = executable <= setup.trigger_price
     if not crossed:
         return False, "waiting_trigger", {"price": executable, "trigger_price": setup.trigger_price}
@@ -97,17 +133,25 @@ def _micro_confirmation(setup: ArmedSetup, snapshot) -> tuple[bool, str, dict]:
     close = float(last.close)
     opened = float(last.open)
     if setup.direction == Direction.LONG:
+        close_in_trigger_band = (
+            close >= setup.trigger_price - trigger_close_buffer
+            and close <= chase_limit
+        )
         ok = (
             close > opened
-            and close >= setup.trigger_price
+            and close_in_trigger_band
             and body >= MICRO_TRIGGER_MIN_BODY_RATIO
             and close_pos >= MICRO_TRIGGER_CLOSE_LONG
             and rvol >= MICRO_TRIGGER_MIN_RVOL
         )
     else:
+        close_in_trigger_band = (
+            close <= setup.trigger_price + trigger_close_buffer
+            and close >= chase_limit
+        )
         ok = (
             close < opened
-            and close <= setup.trigger_price
+            and close_in_trigger_band
             and body >= MICRO_TRIGGER_MIN_BODY_RATIO
             and close_pos <= MICRO_TRIGGER_CLOSE_SHORT
             and rvol >= MICRO_TRIGGER_MIN_RVOL
@@ -119,6 +163,8 @@ def _micro_confirmation(setup: ArmedSetup, snapshot) -> tuple[bool, str, dict]:
             "1m_body_ratio": round(body, 4),
             "1m_close_pos": round(close_pos, 4),
             "1m_rvol": round(rvol, 4),
+            "trigger_close_buffer": trigger_close_buffer,
+            "chase_limit": chase_limit,
         }
     return True, "triggered", {
         "price": executable,
@@ -126,6 +172,8 @@ def _micro_confirmation(setup: ArmedSetup, snapshot) -> tuple[bool, str, dict]:
         "1m_body_ratio": round(body, 4),
         "1m_close_pos": round(close_pos, 4),
         "1m_rvol": round(rvol, 4),
+        "trigger_close_buffer": trigger_close_buffer,
+        "chase_limit": chase_limit,
     }
 
 
@@ -154,10 +202,42 @@ def _management_metadata(entry: float, stop: float, target: float, structural_ta
 
 
 class ArmedEntryEngine:
-    def __init__(self, ttl_seconds: float = 600.0):
+    def __init__(
+        self,
+        ttl_seconds: float = 600.0,
+        chase_tolerance_atr: float = 0.15,
+        trigger_close_tolerance_atr: float = 0.08,
+        consumed_ttl_seconds: float = 3600.0,
+    ):
         self.ttl_seconds = max(60.0, float(ttl_seconds))
+        self.chase_tolerance_atr = max(0.0, float(chase_tolerance_atr))
+        self.trigger_close_tolerance_atr = max(0.0, float(trigger_close_tolerance_atr))
+        self.consumed_ttl_seconds = max(self.ttl_seconds, float(consumed_ttl_seconds))
+        self._consumed_setups: dict[str, tuple[int, str]] = {}
         self.last_trace: dict[str, Any] = {}
         self.branch_trace: dict[str, dict[str, Any]] = {}
+
+    def _prune_consumed(self, now_ms: int | None = None) -> None:
+        now_ms = _now_ms() if now_ms is None else int(now_ms)
+        expired = [setup_id for setup_id, (until_ms, _) in self._consumed_setups.items() if until_ms <= now_ms]
+        for setup_id in expired:
+            self._consumed_setups.pop(setup_id, None)
+
+    def _is_consumed(self, setup_id: str, now_ms: int | None = None) -> tuple[bool, str | None]:
+        self._prune_consumed(now_ms)
+        item = self._consumed_setups.get(str(setup_id))
+        return (item is not None, item[1] if item else None)
+
+    def _consume(self, setup: ArmedSetup, reason: str, now_ms: int | None = None) -> None:
+        now_ms = _now_ms() if now_ms is None else int(now_ms)
+        until_ms = now_ms + int(self.consumed_ttl_seconds * 1000)
+        self._consumed_setups[str(setup.setup_id)] = (until_ms, str(reason))
+        # Defensive bound for long-running workers. Oldest entries are safe to drop:
+        # the structural candle will also age out of discovery shortly afterwards.
+        if len(self._consumed_setups) > 4096:
+            oldest = sorted(self._consumed_setups.items(), key=lambda item: item[1][0])[:1024]
+            for setup_id, _ in oldest:
+                self._consumed_setups.pop(setup_id, None)
 
     def _expiry(self, snapshot) -> tuple[int, int]:
         armed_at = _now_ms()
@@ -480,6 +560,31 @@ class ArmedEntryEngine:
             item = self._discover_sweep(regime, snapshot, symbol, timeframe, regime_metadata)
             if item:
                 candidates.append(item)
+        if candidates:
+            available: list[ArmedSetup] = []
+            consumed: list[tuple[ArmedSetup, str | None]] = []
+            for candidate in candidates:
+                was_consumed, consumed_reason = self._is_consumed(candidate.setup_id)
+                if was_consumed:
+                    consumed.append((candidate, consumed_reason))
+                    branch = "breakout" if candidate.strategy == Strategy.BREAKOUT_RETEST else "sweep"
+                    self.branch_trace[branch] = {
+                        "accepted": False,
+                        "reason": "setup_consumed_waiting_new_structure",
+                        "setup_id": candidate.setup_id,
+                        "consumed_reason": consumed_reason,
+                    }
+                else:
+                    available.append(candidate)
+            candidates = available
+            if not candidates and consumed:
+                self.last_trace = {
+                    "accepted": False,
+                    "reason": "setup_consumed_waiting_new_structure",
+                    "consumed_setup_ids": [item.setup_id for item, _ in consumed],
+                    "branches": dict(self.branch_trace),
+                }
+                return None
         if not candidates:
             primary = "no_armable_setup"
             if active == "TREND_CONTINUATION" and self.branch_trace.get("breakout"):
@@ -506,10 +611,17 @@ class ArmedEntryEngine:
     def trigger(self, setup: ArmedSetup, snapshot, decision_id: str) -> tuple[str, TradeIntent | None, dict]:
         now_ms = _now_ms()
         if now_ms >= int(setup.expires_at_ms):
+            self._consume(setup, "setup_expired", now_ms)
             return "cancelled", None, {"reason": "setup_expired"}
-        ok, reason, diag = _micro_confirmation(setup, snapshot)
+        ok, reason, diag = _micro_confirmation(
+            setup,
+            snapshot,
+            chase_tolerance_atr=self.chase_tolerance_atr,
+            trigger_close_tolerance_atr=self.trigger_close_tolerance_atr,
+        )
         if not ok:
             if reason in {"setup_invalidated", "setup_chased"}:
+                self._consume(setup, reason, now_ms)
                 return "cancelled", None, {"reason": reason, **diag}
             return "pending", None, {"reason": reason, **diag}
         executable = float(diag["price"])
@@ -529,9 +641,11 @@ class ArmedEntryEngine:
             setup.direction == Direction.SHORT and target < executable < stop
         )
         if not geometry:
+            self._consume(setup, "trigger_invalid_geometry", now_ms)
             return "cancelled", None, {"reason": "trigger_invalid_geometry", **diag}
         rr = abs(target - executable) / max(abs(executable - stop), 1e-12)
         if rr < ARM_MIN_RR:
+            self._consume(setup, "trigger_rr_too_low", now_ms)
             return "cancelled", None, {"reason": "trigger_rr_too_low", "execution_rr": rr, **diag}
         structural_target = float(setup.metadata.get("structural_target_price") or target)
         target_ratio = float(setup.metadata.get("target_front_run_ratio") or 1.0)
@@ -551,6 +665,7 @@ class ArmedEntryEngine:
             "target_rr_cap": target_rr_cap,
             "target_rr_capped_at_trigger": trigger_target_capped,
         }
+        self._consume(setup, "setup_triggered", now_ms)
         intent = TradeIntent(
             decision_id=decision_id,
             symbol=setup.symbol,

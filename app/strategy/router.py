@@ -39,11 +39,34 @@ class StrategyRouter:
     is kept intact as an explicit rollback/compatibility path.
     """
 
-    def __init__(self, armed_ttl_seconds: float | None = None):
+    def __init__(
+        self,
+        armed_ttl_seconds: float | None = None,
+        armed_chase_tolerance_atr: float | None = None,
+        armed_trigger_close_tolerance_atr: float | None = None,
+        armed_consumed_ttl_seconds: float | None = None,
+    ):
         self.breakout = BreakoutRetestStrategy()
         self.sweep = LiquiditySweepStrategy()
         ttl = _env_float("TRADE_ARMED_SETUP_TTL_SECONDS", 600.0) if armed_ttl_seconds is None else armed_ttl_seconds
-        self.armed = ArmedEntryEngine(ttl_seconds=ttl)
+        chase_tolerance = (
+            _env_float("TRADE_ARMED_CHASE_TOLERANCE_ATR", 0.15)
+            if armed_chase_tolerance_atr is None else armed_chase_tolerance_atr
+        )
+        close_tolerance = (
+            _env_float("TRADE_ARMED_TRIGGER_CLOSE_TOLERANCE_ATR", 0.08)
+            if armed_trigger_close_tolerance_atr is None else armed_trigger_close_tolerance_atr
+        )
+        consumed_ttl = (
+            _env_float("TRADE_ARMED_CONSUMED_TTL_SECONDS", 3600.0)
+            if armed_consumed_ttl_seconds is None else armed_consumed_ttl_seconds
+        )
+        self.armed = ArmedEntryEngine(
+            ttl_seconds=ttl,
+            chase_tolerance_atr=chase_tolerance,
+            trigger_close_tolerance_atr=close_tolerance,
+            consumed_ttl_seconds=consumed_ttl,
+        )
         self.last_trace = {}
 
     @staticmethod

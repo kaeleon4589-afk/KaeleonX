@@ -1,12 +1,23 @@
 from app.models.enums import Direction
+
+
 class ExitEngine:
-    def evaluate(self,p,price):
-        if p.direction==Direction.LONG:
-            if price<=p.stop_price:return 'SL'
-            if p.tp1_price and not p.tp1_hit and price>=p.tp1_price:return 'TP1'
-            if (p.tp1_hit or not p.tp1_price) and (p.tp2_price or p.target_price) and price>=float(p.tp2_price or p.target_price):return 'TP2'
+    def evaluate(self, p, price):
+        stop = float(getattr(p, 'stop_price', 0.0) or 0.0)
+        target = float(getattr(p, 'tp2_price', None) or getattr(p, 'target_price', 0.0) or 0.0)
+        tp1 = float(getattr(p, 'tp1_price', 0.0) or 0.0)
+        if p.direction == Direction.LONG:
+            if stop > 0 and price <= stop:
+                return 'SL'
+            if tp1 > 0 and not p.tp1_hit and price >= tp1:
+                return 'TP1'
+            if (p.tp1_hit or tp1 <= 0) and target > 0 and price >= target:
+                return 'TP2'
         else:
-            if price>=p.stop_price:return 'SL'
-            if p.tp1_price and not p.tp1_hit and price<=p.tp1_price:return 'TP1'
-            if (p.tp1_hit or not p.tp1_price) and (p.tp2_price or p.target_price) and price<=float(p.tp2_price or p.target_price):return 'TP2'
+            if stop > 0 and price >= stop:
+                return 'SL'
+            if tp1 > 0 and not p.tp1_hit and price <= tp1:
+                return 'TP1'
+            if (p.tp1_hit or tp1 <= 0) and target > 0 and price <= target:
+                return 'TP2'
         return None

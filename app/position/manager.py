@@ -120,6 +120,8 @@ class PositionManager:
         if not self.dynamic_protection_enabled:
             return False
 
+        if float(getattr(p, "target_price", 0.0) or 0.0) <= 0:
+            return False
         progress = self._management_progress(p)
         target_distance = abs(float(p.target_price) - float(p.entry_price))
         if target_distance <= 1e-12:

@@ -192,7 +192,12 @@ class UserTradingRuntimeManager:
 
         orchestrator = TradingOrchestrator(
             RegimeEngine(),
-            StrategyRouter(armed_ttl_seconds=self.settings.trade_armed_setup_ttl_seconds),
+            StrategyRouter(
+                armed_ttl_seconds=self.settings.trade_armed_setup_ttl_seconds,
+                armed_chase_tolerance_atr=self.settings.trade_armed_chase_tolerance_atr,
+                armed_trigger_close_tolerance_atr=self.settings.trade_armed_trigger_close_tolerance_atr,
+                armed_consumed_ttl_seconds=self.settings.trade_armed_consumed_ttl_seconds,
+            ),
             RiskManager(
                 max_leverage=self.settings.fixed_leverage,
                 fee_rate=self.settings.paper_taker_fee,

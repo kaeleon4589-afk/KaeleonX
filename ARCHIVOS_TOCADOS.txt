@@ -455,3 +455,16 @@ tests/test_armed_entry_v6.py
 
 NUEVOS: ninguno
 ELIMINADOS: ninguno
+
+=== 2026-09-27 · SHARE CARD CON REFERIDO/QR ===
+MODIFICADOS:
+- ARCHIVOS_TOCADOS.txt
+- frontend/src/components/trading/TradeShareModal.tsx
+- frontend/src/lib/tradeShare.ts
+- frontend/src/pages/DashboardPage.tsx
+- frontend/src/styles.css
+NUEVOS:
+- frontend/src/lib/qrCode.ts
+- tests/test_trade_share_referral_card_contract.py
+ELIMINADOS:
+- ninguno

@@ -6,6 +6,7 @@ import DashboardPage from './pages/DashboardPage';
 import AdminPage from './pages/AdminPage';
 import SubscriptionPage from './pages/SubscriptionPage';
 import ActivityPage from './pages/ActivityPage';
+import RecoveryCodeGate from './components/RecoveryCodeGate';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -20,6 +21,7 @@ export default function App() {
 
   if (loading) return <div className="app-loader"><div className="loader-ring"/><strong>KAELEON</strong><span>Conectando con el motor…</span></div>;
   if (!user) return <AuthPage onAuthenticated={async u => { setUser(u); try { await api.adminMe(); setIsAdmin(true); } catch { setIsAdmin(false); } }} />;
+  if (user.recovery_code_required) return <RecoveryCodeGate onConfigured={() => setUser(current => current ? { ...current, recovery_code_required: false } : current)} />;
   if (page === 'admin' && isAdmin) return <AdminPage user={user} onBack={() => { history.pushState({}, '', '/'); setPage('dashboard'); }} />;
   if (page === 'subscription') return <SubscriptionPage user={user} onBack={() => { history.pushState({}, '', '/'); setPage('dashboard'); }} />;
   if (page === 'activity') return <ActivityPage user={user} onBack={() => { history.pushState({}, '', '/'); setPage('dashboard'); }} />;

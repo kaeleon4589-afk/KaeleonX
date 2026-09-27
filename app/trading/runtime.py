@@ -24,8 +24,8 @@ from app.trading.profile import UserTradingProfileService
 from app.trading.persistence import TradePersistence
 from app.trading.metrics import calculate_performance, position_net_pnl
 from app.trading.statistics import TradingStatistics
-from app.models.trading import Position
-from app.models.enums import Direction
+from app.models.trading import Position, ArmedSetup
+from app.models.enums import Direction, Strategy
 
 
 @dataclass
@@ -238,6 +238,71 @@ class UserTradingRuntimeManager:
         position_manager.on_closed = on_runtime_position_closed
         orchestrator.entry_guard = self.entry_guard
         position_manager.persistence = orchestrator.persistence
+
+        # Restore ARMED state and consumed setup tombstones so a Railway restart
+        # cannot erase a valid setup or re-arm a terminal structure.
+        now_ms = int(time.time() * 1000)
+        persisted_armed = await asyncio.to_thread(
+            self.db.find_many, "armed_setups",
+            {"user_id": user_id, "mode": mode, "active": True}, limit=0,
+        )
+        for armed_row in persisted_armed:
+            raw = armed_row.get("setup") if isinstance(armed_row.get("setup"), dict) else armed_row
+            try:
+                if int(raw.get("expires_at_ms") or 0) <= now_ms:
+                    continue
+                strategy = raw.get("strategy")
+                if not isinstance(strategy, Strategy):
+                    strategy = Strategy(str(strategy))
+                direction = raw.get("direction")
+                if not isinstance(direction, Direction):
+                    direction = Direction(str(direction))
+                restored_setup = ArmedSetup(
+                    setup_id=str(raw["setup_id"]), symbol=str(raw["symbol"]),
+                    strategy=strategy, direction=direction,
+                    armed_at_ms=int(raw["armed_at_ms"]), expires_at_ms=int(raw["expires_at_ms"]),
+                    trigger_price=float(raw["trigger_price"]), invalidation_price=float(raw["invalidation_price"]),
+                    stop_price=float(raw["stop_price"]), target_price=float(raw["target_price"]),
+                    entry_zone_low=float(raw["entry_zone_low"]), entry_zone_high=float(raw["entry_zone_high"]),
+                    quality=float(raw["quality"]), risk_multiplier=float(raw["risk_multiplier"]),
+                    timeframe=str(raw.get("timeframe") or "5m"),
+                    reasons=tuple(raw.get("reasons") or ()), metadata=dict(raw.get("metadata") or {}),
+                )
+                orchestrator.armed_setups[restored_setup.symbol] = restored_setup
+                self.audit.event(
+                    "SETUP_RESTORED", restored_setup.setup_id, user_id=user_id, mode=mode,
+                    symbol=restored_setup.symbol, setup_id=restored_setup.setup_id,
+                    expires_at_ms=restored_setup.expires_at_ms,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                self.audit.event(
+                    "SETUP_RESTORE_ERROR", str(armed_row.get("setup_id") or user_id), level="ERROR",
+                    user_id=user_id, mode=mode, symbol=armed_row.get("symbol"), error=str(exc),
+                )
+
+        consumed_rows = await asyncio.to_thread(
+            self.db.find_many, "armed_consumed_setups", {"user_id": user_id, "mode": mode}, limit=0,
+        )
+        restore_consumed = getattr(getattr(orchestrator.router, "armed", None), "restore_consumed", None)
+        if callable(restore_consumed):
+            for consumed in consumed_rows:
+                try:
+                    restore_consumed(
+                        str(consumed.get("setup_id") or ""),
+                        int(consumed.get("until_ms") or 0),
+                        str(consumed.get("reason") or "restored"),
+                    )
+                except (TypeError, ValueError):
+                    continue
+            # A consumed tombstone always wins over an ACTIVE row. This protects
+            # restart recovery even if Mongo experienced a delayed/out-of-order
+            # write immediately before the old worker stopped.
+            is_consumed = getattr(orchestrator.router.armed, "_is_consumed", None)
+            if callable(is_consumed):
+                for symbol, setup in list(orchestrator.armed_setups.items()):
+                    if is_consumed(setup.setup_id)[0]:
+                        orchestrator.armed_setups.pop(symbol, None)
+
         pending = await asyncio.to_thread(self.db.find_one, "execution_pending", {"user_id": user_id, "active": True})
         if pending and mode == "live":
             if any(p.decision_id == pending.get('decision_id') for p in position_manager.positions.values()):
@@ -317,6 +382,16 @@ class UserTradingRuntimeManager:
                        for runtime in self._runtimes.values() if runtime.orchestrator.pending_execution)
         return symbols
 
+    def armed_symbols(self):
+        """Symbols with an already-approved ARMED setup that need priority monitoring."""
+        now_ms = int(time.time() * 1000)
+        return {
+            symbol
+            for runtime in self._runtimes.values()
+            for symbol, setup in runtime.orchestrator.armed_setups.items()
+            if int(getattr(setup, "expires_at_ms", 0) or 0) > now_ms
+        }
+
     async def run_snapshot(self, snapshot) -> None:
         async with self._processing_lock:
             await self._run_snapshot(snapshot)
@@ -330,13 +405,14 @@ class UserTradingRuntimeManager:
             })
         runtimes = list(self._runtimes.values())
         if getattr(snapshot, 'monitor_only', False):
-            # A risk quote only needs the owners of an open position or an
-            # unresolved order in this symbol. Visiting every other user would
-            # delay stops as the account count grows.
+            # Risk quotes only visit owners of open/pending exposure. ARMED priority
+            # snapshots additionally visit users that own that specific setup.
+            armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
             runtimes = [runtime for runtime in runtimes
                         if any(p.status == 'OPEN' and p.symbol == snapshot.symbol
                                for p in runtime.position_manager.positions.values())
-                        or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol]
+                        or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol
+                        or (armed_monitor and snapshot.symbol in runtime.orchestrator.armed_setups)]
         for runtime in runtimes:
             try:
                 period = periods[runtime.mode] if periods is not None else None
@@ -367,10 +443,11 @@ class UserTradingRuntimeManager:
                 if effective_capital < self.settings.min_operating_capital:
                     self.audit.event('ENTRY_BLOCKED', runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='insufficient_capital', effective_capital=effective_capital, minimum=self.settings.min_operating_capital)
 
+                armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
                 allow_entries = (runtime.trading_enabled and live_allowed
                                  and runtime.coinw_verified
                                  and effective_capital >= self.settings.min_operating_capital
-                                 and not getattr(snapshot, 'monitor_only', False))
+                                 and (not getattr(snapshot, 'monitor_only', False) or armed_monitor))
                 if not allow_entries:
                     self.audit.event('ENTRY_BLOCKED', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='trading_paused' if not runtime.trading_enabled else 'live_not_entitled')
                 result = await runtime.orchestrator.on_snapshot(

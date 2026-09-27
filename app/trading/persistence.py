@@ -56,6 +56,34 @@ class TradePersistence:
                 await asyncio.sleep(0.10 * attempt)
         return False, last_error or "persistence_failed"
 
+
+    def schedule_upsert(self, *, collection: str, key: dict, document: dict,
+                        event_name: str = "STATE_PERSIST_ERROR",
+                        decision_id: str | None = None, user_id: str | None = None,
+                        mode: str | None = None, symbol: str | None = None) -> None:
+        """Best-effort durable state write that never blocks the trading path."""
+        async def runner():
+            last_error = None
+            for delay in (0.0, 0.5, 2.0, 5.0):
+                if delay:
+                    await asyncio.sleep(delay)
+                ok, last_error = await self._upsert(collection, key, document)
+                if ok:
+                    return
+            if self.audit:
+                self.audit.event(
+                    event_name, decision_id or "system", level="ERROR",
+                    user_id=user_id, mode=mode, symbol=symbol,
+                    collection=collection, error=last_error or "retry_exhausted",
+                )
+
+        try:
+            task = asyncio.create_task(runner())
+        except RuntimeError:
+            return
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
     async def save_fill(self, *, decision_id: str, user_id: str | None, mode: str,
                         position, execution_result: dict) -> tuple[bool, str | None]:
         position_doc = self.compact({**position.__dict__, "user_id": user_id, "mode": mode})

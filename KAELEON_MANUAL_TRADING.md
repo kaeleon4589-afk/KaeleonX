@@ -23,7 +23,7 @@ The existing `LiveMarketChart` remains the market/visualization engine. `Trading
 - LONG / SHORT;
 - margin amount;
 - leverage;
-- mandatory TP and SL;
+- optional TP and/or SL, editable after entry;
 - open positions with Entry, Margin, PnL, ROI, liquidation price (when CoinW provides it) and TP/SL;
 - open manual orders;
 - closed manual trade history with Entry/Exit, net PnL and ROI;
@@ -68,7 +68,7 @@ KAELEON uses:
 - isolated margin (`positionModel=0`) in this phase;
 - `execute` for MARKET;
 - `plan` for LIMIT;
-- exchange-side Stop Loss and Take Profit;
+- optional exchange-side Stop Loss and/or Take Profit when the user configures them;
 - CoinW position/order reconciliation before treating an accepted request as filled.
 
 A returned CoinW order ID is stored as accepted/pending; it is not treated as a fill by itself. If a MARKET position is confirmed but TP/SL confirmation fails, the position is persisted as open with `protected=false` and the terminal surfaces a high-visibility warning instead of reporting a fully protected success.
@@ -130,3 +130,30 @@ Not yet implemented in the manual terminal:
 - CoinW maintenance-margin-tier based DEMO liquidation simulation.
 
 Those features can be layered on without changing the source/mode separation introduced here.
+
+## Manual terminal v2 — CoinW-style flow and pending LIMIT fix
+
+This revision simplifies the manual ticket and fixes the server-side lifecycle of DEMO LIMIT orders.
+
+### UX changes
+
+- The execution ticket stays immediately next to the chart on desktop and directly below it on mobile.
+- Last/live price, Bid and Ask remain visible inside the ticket while the user enters the order.
+- Order Book / Trades / Market Data / buyer-seller pressure are moved behind the `Mercado ▾` drawer so they no longer push the ticket far below the chart.
+- TP/SL are optional at entry time. A user can open first and attach Stop Loss and/or Take Profit later from the open position row.
+- When TP/SL are entered before opening, the LONG and SHORT buttons show estimated leveraged ROI for those levels.
+- The ticket follows the CoinW information hierarchy: isolated margin, leverage, Abrir/Cerrar, Market/Limit, live price, amount, balance percentage, available balance, optional TP/SL and large Long/Short actions.
+
+### DEMO LIMIT root-cause fix
+
+The previous worker included pending manual symbols in `tracked_symbols()`, but `monitor_only` snapshots filtered runtimes down to owners of an already-open position or BOT pending execution. A user whose only exposure was a manual LIMIT order was therefore skipped before `_process_demo_manual_limits()` ran.
+
+The worker now tracks manual-order owners by symbol and includes that owner in `monitor_only` processing. Resting DEMO LIMIT orders therefore fill when Bid/Ask reaches the limit even if the browser is closed.
+
+Additionally, a LIMIT that is already marketable at submission time fills immediately at the best executable quote instead of being stored as OPEN first.
+
+### Optional protection semantics
+
+Manual positions use `0` internally as the local no-protection sentinel. Exit evaluation explicitly ignores SL/TP values that are not positive, so a SHORT opened without SL cannot be closed accidentally by the local exit engine. Dynamic protection also does not run without a positive target.
+
+LIVE CoinW payloads omit `stopLossPrice` / `stopProfitPrice` when the user did not request them. They can be added later through the existing position TP/SL endpoint.

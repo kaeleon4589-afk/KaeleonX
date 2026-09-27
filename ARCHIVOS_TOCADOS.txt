@@ -422,3 +422,46 @@ VALIDACIÓN DE ESTA FASE:
 - python -m compileall -q app scripts -> sin errores
 - Transpilación sintáctica TypeScript/TSX de los 5 archivos frontend tocados principales -> sin errores
 - Build frontend completo -> no validado en este entorno: npm ci no terminó dentro del tiempo disponible. No se atribuye ese timeout al código.
+
+============================================================
+CORRECCIÓN — TERMINAL MANUAL V2 / PANEL COINW + LIMIT DEMO
+============================================================
+
+BASE COMPARADA: KaeleonX-v6-manual-trading-terminal.zip
+
+ARCHIVOS MODIFICADOS (15):
+1. ARCHIVOS_TOCADOS.txt
+2. KAELEON_MANUAL_TRADING.md
+3. app/api/user_api.py
+4. app/coinw/executor.py
+5. app/execution/paper.py
+6. app/position/exit_engine.py
+7. app/position/manager.py
+8. app/trading/manual.py
+9. app/trading/runtime.py
+10. frontend/src/components/trading/LiveMarketChart.tsx
+11. frontend/src/components/trading/TradingTerminal.tsx
+12. frontend/src/lib/api.ts
+13. frontend/src/styles.css
+14. frontend/src/types.ts
+15. tests/test_manual_trading_terminal.py
+
+ARCHIVOS NUEVOS: ninguno
+ARCHIVOS ELIMINADOS: ninguno
+
+CAMBIOS CLAVE:
+- Panel de órdenes reorganizado con jerarquía tipo CoinW y precio live visible dentro del ticket.
+- En móvil, panel pegado al gráfico; Order Book/Trades/Market Data/Fuerza pasan al drawer `Mercado ▾`.
+- TP/SL dejan de ser obligatorios al abrir una operación manual.
+- TP y/o SL pueden añadirse después desde la posición abierta.
+- Si se introducen antes de abrir, se muestra ROI estimado según precio de entrada y leverage.
+- LIMIT DEMO marketable se llena inmediatamente al mejor Bid/Ask ejecutable.
+- LIMIT DEMO resting vuelve a evaluarse correctamente en snapshots `monitor_only` aunque no exista una posición previa.
+- SL/TP ausentes usan sentinel local seguro y no disparan cierres falsos, especialmente en SHORT.
+- LIVE omite TP/SL en el payload de CoinW cuando el usuario no los configuró.
+
+VALIDACIÓN:
+- pytest -q -> 199 passed
+- python -m compileall -q app -> sin errores
+- Transpilación sintáctica TypeScript/TSX de TradingTerminal, LiveMarketChart, api.ts y types.ts -> sin errores
+- Build frontend completo -> no validado: npm ci no completó en el entorno de revisión; faltaron type definitions durante tsc.

@@ -37,7 +37,7 @@ type ConfirmAction =
   | { kind: 'OPEN'; side: 'LONG' | 'SHORT' }
   | { kind: 'CLOSE'; position: Position }
   | { kind: 'CANCEL'; order: ManualOrder }
-  | { kind: 'PROTECTION'; position: Position; stopLoss: number; takeProfit: number }
+  | { kind: 'PROTECTION'; position: Position; stopLoss?: number; takeProfit?: number }
   | null;
 
 export default function TradingTerminal({
@@ -51,6 +51,7 @@ export default function TradingTerminal({
   const [limitPrice, setLimitPrice] = useState('');
   const [stopLoss, setStopLoss] = useState('');
   const [takeProfit, setTakeProfit] = useState('');
+  const [tpslEnabled, setTpslEnabled] = useState(false);
   const [busy, setBusy] = useState('');
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [terminalTab, setTerminalTab] = useState<'POSITIONS' | 'ORDERS' | 'HISTORY'>('POSITIONS');
@@ -115,8 +116,37 @@ export default function TradingTerminal({
 
   const orderReady = Boolean(
     state && state.mode === mode && market?.symbol && marginValue >= (state?.min_margin || 1) && leverage >= 1 && leverage <= maxLeverage
-    && referencePrice > 0 && slValue > 0 && tpValue > 0
+    && referencePrice > 0
   );
+
+  const protectionValidFor = (side: 'LONG' | 'SHORT') => {
+    const entry = marketReferenceFor(side);
+    if (entry <= 0) return false;
+    if (!tpslEnabled) return true;
+    if (slValue > 0) {
+      if (side === 'LONG' ? slValue >= entry : slValue <= entry) return false;
+    }
+    if (tpValue > 0) {
+      if (side === 'LONG' ? tpValue <= entry : tpValue >= entry) return false;
+    }
+    return true;
+  };
+
+  const roiAtPrice = (side: 'LONG' | 'SHORT', price: number) => {
+    const entry = marketReferenceFor(side);
+    if (entry <= 0 || price <= 0) return null;
+    const move = side === 'LONG' ? (price - entry) / entry : (entry - price) / entry;
+    return move * leverage * 100;
+  };
+
+  const protectionSummary = (side: 'LONG' | 'SHORT') => {
+    const tpRoi = tpslEnabled && tpValue > 0 ? roiAtPrice(side, tpValue) : null;
+    const slRoi = tpslEnabled && slValue > 0 ? roiAtPrice(side, slValue) : null;
+    const parts = [];
+    if (tpRoi != null) parts.push(`TP ${tpRoi >= 0 ? '+' : ''}${tpRoi.toFixed(2)}%`);
+    if (slRoi != null) parts.push(`SL ${slRoi >= 0 ? '+' : ''}${slRoi.toFixed(2)}%`);
+    return parts.join(' · ');
+  };
 
   async function refreshAll() {
     await Promise.allSettled([Promise.resolve(onRefresh()), load(true)]);
@@ -125,13 +155,13 @@ export default function TradingTerminal({
   async function submit(side: 'LONG' | 'SHORT', confirmed: boolean) {
     if (!market || !state) return;
     if (!orderReady) {
-      onError('Completa margen, leverage, precio de entrada, Stop Loss y Take Profit.');
+      onError('Completa el margen y, si usas LIMIT, el precio de entrada.');
       return;
     }
-    const actualEntry = marketReferenceFor(side);
-    const validGeometry = side === 'LONG' ? slValue < actualEntry && actualEntry < tpValue : tpValue < actualEntry && actualEntry < slValue;
-    if (!validGeometry) {
-      onError(side === 'LONG' ? 'LONG requiere SL < entrada < TP.' : 'SHORT requiere TP < entrada < SL.');
+    if (!protectionValidFor(side)) {
+      onError(side === 'LONG'
+        ? 'Para LONG, el SL debe quedar debajo de la entrada y el TP por encima.'
+        : 'Para SHORT, el TP debe quedar debajo de la entrada y el SL por encima.');
       return;
     }
     if (mode === 'live' && !confirmed) {
@@ -150,8 +180,8 @@ export default function TradingTerminal({
         margin: marginValue,
         leverage,
         ...(orderType === 'LIMIT' ? { limit_price: n(limitPrice) } : {}),
-        stop_loss: slValue,
-        take_profit: tpValue,
+        ...(tpslEnabled && slValue > 0 ? { stop_loss: slValue } : {}),
+        ...(tpslEnabled && tpValue > 0 ? { take_profit: tpValue } : {}),
         confirm_live: mode === 'live',
       });
       const filled = Boolean(result.filled);
@@ -213,9 +243,14 @@ export default function TradingTerminal({
 
   async function saveProtection(position: Position, confirmed = false, stopOverride?: number, targetOverride?: number) {
     const id = String(position.position_id || '');
-    const sl = stopOverride ?? n(editSl);
-    const tp = targetOverride ?? n(editTp);
-    if (!id || sl <= 0 || tp <= 0) return;
+    const slRaw = stopOverride ?? n(editSl);
+    const tpRaw = targetOverride ?? n(editTp);
+    const sl = slRaw > 0 ? slRaw : undefined;
+    const tp = tpRaw > 0 ? tpRaw : undefined;
+    if (!id || (!sl && !tp)) {
+      onError('Introduce al menos un Stop Loss o un Take Profit.');
+      return;
+    }
     if (mode === 'live' && !confirmed) {
       setConfirmAction({ kind: 'PROTECTION', position, stopLoss: sl, takeProfit: tp });
       return;
@@ -241,6 +276,12 @@ export default function TradingTerminal({
   }
 
   const account = state?.account;
+  const availableBalance = n(account?.available);
+  const marginPercent = availableBalance > 0 ? Math.max(0, Math.min(100, marginValue / availableBalance * 100)) : 0;
+  const setMarginPercent = (percent: number) => {
+    const value = availableBalance * Math.max(0, Math.min(100, percent)) / 100;
+    setMargin(value > 0 ? value.toFixed(2) : '');
+  };
   const liveDanger = mode === 'live';
 
   return <div className="trading-terminal">
@@ -262,54 +303,85 @@ export default function TradingTerminal({
           positions={chartPositions}
           closedPositions={allClosedPositions}
           dynamicProtectionEnabled={dynamicProtectionEnabled}
+          compactTradingMode
           onMarketChange={setMarket}
         />
       </div>
 
-      <aside className="manual-order-panel" aria-label="Operativa manual">
-        <div className="manual-panel-title">
-          <div><small>Operativa manual</small><strong>{market?.display || 'Selecciona un mercado'}</strong></div>
+      <aside className="manual-order-panel coinw-order-panel" aria-label="Operativa manual">
+        <div className="manual-panel-title coinw-panel-head">
+          <div><small>Futuros · Operativa manual</small><strong>{market?.display || 'Selecciona un mercado'} <em>Perp.</em></strong></div>
           <b className={mode}>{mode.toUpperCase()}</b>
         </div>
 
-        <div className="manual-order-tabs">
+        <div className="coinw-mode-row">
+          <button type="button" className="margin-mode-pill">Aislado (comb.)</button>
+          <button type="button" className="leverage-pill">{leverage}x</button>
+        </div>
+
+        <div className="coinw-open-close-tabs">
+          <button type="button" className="active">Abrir</button>
+          <button type="button" onClick={() => setTerminalTab('POSITIONS')}>Cerrar</button>
+        </div>
+
+        <div className="manual-order-tabs coinw-order-type">
           <button type="button" className={orderType === 'MARKET' ? 'active' : ''} onClick={() => setOrderType('MARKET')}>Market</button>
           <button type="button" className={orderType === 'LIMIT' ? 'active' : ''} onClick={() => { setOrderType('LIMIT'); if (!limitPrice && market?.price) setLimitPrice(String(market.price)); }}>Limit</button>
         </div>
 
-        <div className="manual-price-strip">
-          <span><small>Last</small><strong>{fmtPrice(market?.price, market?.pricePrecision)}</strong></span>
-          <span><small>Bid</small><strong>{fmtPrice(market?.bid, market?.pricePrecision)}</strong></span>
-          <span><small>Ask</small><strong>{fmtPrice(market?.ask, market?.pricePrecision)}</strong></span>
+        <div className="coinw-live-price">
+          <small>Precio actual</small>
+          <strong>{fmtPrice(market?.price, market?.pricePrecision)}</strong>
+          <span>Bid {fmtPrice(market?.bid, market?.pricePrecision)} · Ask {fmtPrice(market?.ask, market?.pricePrecision)}</span>
         </div>
 
-        {orderType === 'LIMIT' && <label className="manual-field"><span>Precio límite</span><input inputMode="decimal" value={limitPrice} onChange={e => setLimitPrice(e.target.value)} placeholder="0.00" /></label>}
+        {orderType === 'LIMIT' && <div className="coinw-price-input-row">
+          <label className="manual-field"><span>Precio <em>USDT</em></span><input inputMode="decimal" value={limitPrice} onChange={e => setLimitPrice(e.target.value)} placeholder="Precio límite" /></label>
+          <button type="button" className="bbo-button" onClick={() => market?.price && setLimitPrice(String(market.price))}>BBO</button>
+        </div>}
 
-        <label className="manual-field"><span>Margen <em>USDT</em></span><input inputMode="decimal" value={margin} onChange={e => setMargin(e.target.value)} placeholder={`Mín. ${state?.min_margin || 1}`} /></label>
+        <label className="manual-field coinw-amount-field"><span>Monto / Margen <em>USDT</em></span><input inputMode="decimal" value={margin} onChange={e => setMargin(e.target.value)} placeholder={`Mín. ${state?.min_margin || 1}`} /></label>
 
-        <div className="manual-leverage">
+        <div className="coinw-margin-slider">
+          <input type="range" min="0" max="100" step="1" value={marginPercent} onChange={e => setMarginPercent(Number(e.target.value))} aria-label="Porcentaje del saldo disponible" />
+          <div>{[0, 25, 50, 75, 100].map(v => <button type="button" key={v} onClick={() => setMarginPercent(v)}>{v}%</button>)}</div>
+        </div>
+
+        <div className="coinw-available-row"><span>Disponible</span><strong>{money(account?.available)}</strong></div>
+
+        <div className="manual-leverage coinw-leverage-control">
           <div><span>Leverage</span><strong>{leverage}x</strong></div>
-          <input type="range" min="1" max={Math.max(1, maxLeverage)} value={Math.min(leverage, maxLeverage)} onChange={e => setLeverage(Number(e.target.value))} />
           <div className="leverage-presets">{[1, 5, 10, 20, 30, 50].filter(v => v <= maxLeverage).map(v => <button type="button" key={v} className={leverage === v ? 'active' : ''} onClick={() => setLeverage(v)}>{v}x</button>)}</div>
         </div>
 
-        <div className="manual-tpsl-grid">
-          <label className="manual-field"><span>Stop Loss</span><input inputMode="decimal" value={stopLoss} onChange={e => setStopLoss(e.target.value)} placeholder="SL" /></label>
-          <label className="manual-field"><span>Take Profit</span><input inputMode="decimal" value={takeProfit} onChange={e => setTakeProfit(e.target.value)} placeholder="TP" /></label>
-        </div>
+        <label className="coinw-tpsl-toggle">
+          <input type="checkbox" checked={tpslEnabled} onChange={e => setTpslEnabled(e.target.checked)} />
+          <span>TP/SL <small>Opcional · también puedes configurarlo después de abrir</small></span>
+        </label>
 
-        <div className="manual-order-summary">
-          <span>Disponible <b>{money(account?.available)}</b></span>
-          <span>Margen <b>{money(marginValue)}</b></span>
+        {tpslEnabled && <div className="manual-tpsl-grid coinw-tpsl-grid">
+          <label className="manual-field"><span>Stop Loss</span><input inputMode="decimal" value={stopLoss} onChange={e => setStopLoss(e.target.value)} placeholder="SL opcional" /></label>
+          <label className="manual-field"><span>Take Profit</span><input inputMode="decimal" value={takeProfit} onChange={e => setTakeProfit(e.target.value)} placeholder="TP opcional" /></label>
+        </div>}
+
+        <div className="manual-order-summary coinw-order-summary">
           <span>Notional <b>{money(notional)}</b></span>
+          <span>Costo / Margen <b>{money(marginValue)}</b></span>
           <span>Modo margen <b>ISOLATED</b></span>
+          <span>Precio ref. <b>{fmtPrice(referencePrice, market?.pricePrecision)}</b></span>
         </div>
 
-        <div className="manual-side-actions">
-          <button type="button" className="manual-long" disabled={!orderReady || Boolean(busy)} onClick={() => void submit('LONG', false)}>{busy === 'open-LONG' ? 'Enviando…' : 'LONG / Comprar'}</button>
-          <button type="button" className="manual-short" disabled={!orderReady || Boolean(busy)} onClick={() => void submit('SHORT', false)}>{busy === 'open-SHORT' ? 'Enviando…' : 'SHORT / Vender'}</button>
+        <div className="manual-side-actions coinw-side-actions">
+          <button type="button" className="manual-long" disabled={!orderReady || Boolean(busy) || !protectionValidFor('LONG')} onClick={() => void submit('LONG', false)}>
+            <strong>{busy === 'open-LONG' ? 'Enviando…' : 'Abrir long'}</strong>
+            {protectionSummary('LONG') && <small>{protectionSummary('LONG')}</small>}
+          </button>
+          <button type="button" className="manual-short" disabled={!orderReady || Boolean(busy) || !protectionValidFor('SHORT')} onClick={() => void submit('SHORT', false)}>
+            <strong>{busy === 'open-SHORT' ? 'Enviando…' : 'Abrir short'}</strong>
+            {protectionSummary('SHORT') && <small>{protectionSummary('SHORT')}</small>}
+          </button>
         </div>
-        <small className="manual-panel-note">Las operaciones manuales quedan separadas del motor BOT. TP y SL son obligatorios.</small>
+        <small className="manual-panel-note">TP y SL no son obligatorios. Si los introduces, KAELEON muestra el ROI estimado con el leverage actual antes de abrir.</small>
       </aside>
     </div>
 

@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     # noise without reopening the old late-entry/chasing behavior.
     trade_armed_chase_tolerance_atr: float = Field(0.15, ge=0.0, le=0.50)
     trade_armed_trigger_close_tolerance_atr: float = Field(0.08, ge=0.0, le=0.30)
+    # If the most recent CLOSED 1m candle finished immediately before arming and
+    # is unusually strong, it may confirm the setup without waiting another minute.
+    trade_armed_fast_confirm_enabled: bool = True
+    trade_armed_fast_confirm_max_age_seconds: float = Field(30.0, ge=5.0, le=60.0)
     trade_armed_consumed_ttl_seconds: float = Field(3600.0, ge=600.0, le=21600.0)
     # Once a setup is ARMED it leaves the scanner rotation and gets its own
     # lightweight quote + closed-1m monitor. This is deliberately separate from

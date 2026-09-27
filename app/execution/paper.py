@@ -27,8 +27,18 @@ class PaperExecutionEngine:
         fill=raw*(1+self.slippage_bps/10000) if intent.direction==Direction.LONG else raw*(1-self.slippage_bps/10000)
         if not math.isfinite(quantity) or quantity <= 0:
             return {'accepted':False,'filled':False,'reason':'invalid_quantity'}
-        if not ((intent.direction == Direction.LONG and intent.stop_price < fill < intent.target_price)
-                or (intent.direction == Direction.SHORT and intent.target_price < fill < intent.stop_price)):
+        manual_optional_protection = str((intent.metadata or {}).get('source') or '').upper() == 'MANUAL'
+        if manual_optional_protection:
+            stop = float(intent.stop_price or 0.0)
+            target = float(intent.target_price or 0.0)
+            if intent.direction == Direction.LONG:
+                valid_geometry = (stop <= 0 or stop < fill) and (target <= 0 or target > fill)
+            else:
+                valid_geometry = (stop <= 0 or stop > fill) and (target <= 0 or target < fill)
+        else:
+            valid_geometry = ((intent.direction == Direction.LONG and intent.stop_price < fill < intent.target_price)
+                              or (intent.direction == Direction.SHORT and intent.target_price < fill < intent.stop_price))
+        if not valid_geometry:
             return {'accepted':False,'filled':False,'reason':'fill_outside_trade_geometry'}
         if quantity / self.leverage + quantity * self.fee_rate > self.equity:
             return {'accepted':False,'filled':False,'reason':'insufficient_margin'}

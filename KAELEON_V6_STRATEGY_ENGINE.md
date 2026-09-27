@@ -143,8 +143,10 @@ automatically loosened.
 
 A partir del diagnóstico de producción, la entrada armada tolera hasta `0.15 ATR`
 por fuera de la zona original antes de declararse `setup_chased`. La confirmación
-1m sigue siendo obligatoria y debe ser una vela cerrada posterior al armado, pero
-su cierre puede quedar hasta `0.08 ATR` alrededor del trigger. Esto evita cancelar
+1m sigue siendo obligatoria. En v6.1 se exigía que esa vela hubiera cerrado después
+del armado; v6.3 añade una excepción estricta para una vela cerrada inmediatamente
+antes del armado. En ambos casos su cierre puede quedar hasta `0.08 ATR` alrededor
+del trigger. Esto evita cancelar
 setups por unos pocos ticks sin volver al modelo de entrada tardía.
 
 Los `setup_id` cancelados por chase, expiración, invalidación o RR insuficiente,
@@ -165,3 +167,40 @@ The scanner remains responsible for discovery and keeps the existing 5m/15m/1h q
 - Triggered ARMED entries use an idempotent `signal_claims` key based on `armed_setup_id`, so a worker restart cannot submit the same structural setup twice even when the priority snapshot contains no 5m candles.
 
 This change does not relax MTF bias, HTF exhaustion, ATR, structural stop, minimum RR, TP ratios, chase tolerance, or closed-1m confirmation. It changes *how fast an already-approved setup is followed*, not *what qualifies as a setup*.
+
+
+## Fast closed-1m confirmation (v6.3)
+
+Production logs showed that the priority monitor was following ARMED setups quickly,
+but several valid structures still lost their entry while waiting for an entirely new
+1m candle. v6.3 fixes that timing gap without lowering the structural filters.
+
+A setup may reuse the most recent CLOSED 1m candle only when all of these are true:
+
+- the candle closed no more than `30s` before the setup armed and is still no more than `30s` old at execution check;
+- setup quality is at least `78`;
+- candle body ratio is at least `0.45`;
+- relative volume is at least `0.90`;
+- directional close position is strong (`>= 0.72` LONG, `<= 0.28` SHORT);
+- the close remains inside the existing trigger/chase band;
+- the live executable quote has actually crossed the trigger;
+- the order book is valid and contains both bids and asks;
+- the existing anti-chase boundary still passes;
+- final executable RR still passes the unchanged `1.10R` minimum.
+
+If any fast-confirm condition fails, KAELEON does not reject the setup merely for
+that failure: it returns to `waiting_fresh_1m_confirmation` and waits for the normal
+post-arm closed 1m path. The normal 1m thresholds are unchanged.
+
+The anti-chase edge also now has a tiny book-derived tolerance for one-tick/spread
+rounding. It is inferred from visible depth and hard-capped at `0.02 ATR`; material
+chasing still cancels normally. This tolerance is separate from the existing
+`0.15 ATR` chase buffer.
+
+Runtime controls (defaults are already in code, so Railway does not require them):
+
+- `TRADE_ARMED_FAST_CONFIRM_ENABLED=true`
+- `TRADE_ARMED_FAST_CONFIRM_MAX_AGE_SECONDS=30`
+
+This release does **not** relax MTF bias, HTF exhaustion, ATR range, setup quality
+discovery, structural stop, TP caps, consumed setup protection, or executable RR.

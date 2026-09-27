@@ -547,3 +547,30 @@ ELIMINADOS: ninguno
 VALIDACIÓN:
 - 210 tests passed
 - python -m compileall -q app scripts: OK
+
+
+AJUSTE — CONFIRMACIÓN RÁPIDA 1m CERRADA + BORDE ANTI-CHASE v6.3
+BASE COMPARADA: KaeleonX-v6-armed-priority-monitor.zip
+
+OBJETIVO:
+- Evitar perder setups ARMED de calidad cuando una vela 1m fuerte acaba de cerrar segundos antes del armado.
+- Mantener obligatorios el cruce live, order book válido, RR ejecutable mínimo y anti-chase.
+- Absorber únicamente errores microscópicos de tick/spread en el borde de chase.
+
+MODIFICADOS (8):
+.env.example
+ARCHIVOS_TOCADOS.txt
+KAELEON_V6_STRATEGY_ENGINE.md
+app/config/settings.py
+app/strategy/armed_entry.py
+app/strategy/router.py
+app/trading/runtime.py
+tests/test_armed_entry_v6.py
+
+NUEVOS: ninguno
+ELIMINADOS: ninguno
+
+VALIDACIÓN v6.3:
+- pytest -q -> 215 passed
+- python -m compileall -q app scripts -> sin errores
+- Pruebas específicas: fast-confirm LONG/SHORT, vela previa vieja/débil rechazada, order book obligatorio, tolerancia microscópica de chase y chase real cancelado.

@@ -438,3 +438,20 @@ VALIDACIÓN:
 - python -m compileall -q app scripts -> sin errores
 - test específico confirma que SIGNAL_REJECTED queda como texto exportable con reason incluido.
 - test específico confirma handlers separados para stdout y stderr.
+
+
+AMPLIACIÓN — ARMED -> TRIGGERED v6.1 (tolerancia + setup consumido)
+BASE COMPARADA: KaeleonX-v6-automatic-only-logfix.zip
+
+MODIFICADOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+KAELEON_V6_STRATEGY_ENGINE.md
+app/config/settings.py
+app/strategy/armed_entry.py
+app/strategy/router.py
+app/trading/runtime.py
+tests/test_armed_entry_v6.py
+
+NUEVOS: ninguno
+ELIMINADOS: ninguno

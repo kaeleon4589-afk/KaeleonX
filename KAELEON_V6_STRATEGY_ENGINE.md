@@ -64,6 +64,9 @@ TRADE_ENTRY_MIN_STOP_ATR=0.30
 TRADE_ARMED_ENTRY_ENABLED=true
 TRADE_LEGACY_ENTRY_FALLBACK_ENABLED=false
 TRADE_ARMED_SETUP_TTL_SECONDS=600
+TRADE_ARMED_CHASE_TOLERANCE_ATR=0.15
+TRADE_ARMED_TRIGGER_CLOSE_TOLERANCE_ATR=0.08
+TRADE_ARMED_CONSUMED_TTL_SECONDS=3600
 TRADE_FUNNEL_EMIT_SECONDS=300
 TRADE_FUNNEL_EMIT_EVERY=50
 ```
@@ -134,3 +137,17 @@ does not move it to fee-aware break-even and does not activate profit-lock. The
 engine still tracks the best favorable price for analysis. Existing positions
 whose stop had already been tightened before disabling this setting are not
 automatically loosened.
+
+
+## Ajuste ARMED -> TRIGGERED (v6.1)
+
+A partir del diagnóstico de producción, la entrada armada tolera hasta `0.15 ATR`
+por fuera de la zona original antes de declararse `setup_chased`. La confirmación
+1m sigue siendo obligatoria y debe ser una vela cerrada posterior al armado, pero
+su cierre puede quedar hasta `0.08 ATR` alrededor del trigger. Esto evita cancelar
+setups por unos pocos ticks sin volver al modelo de entrada tardía.
+
+Los `setup_id` cancelados por chase, expiración, invalidación o RR insuficiente,
+y también los ya disparados, quedan consumidos durante 3600 s. El mismo evento
+estructural no puede rearmarse; una nueva vela estructural genera un `setup_id`
+distinto y vuelve a ser elegible.

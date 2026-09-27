@@ -468,3 +468,57 @@ NUEVOS:
 - tests/test_trade_share_referral_card_contract.py
 ELIMINADOS:
 - ninguno
+
+=== 2026-09-27 · RECUPERACIÓN SEGURA DE CONTRASEÑA ===
+BASE COMPARADA: KaeleonX-v6-share-referral-qr.zip
+
+OBJETIVO:
+- Añadir recuperación de contraseña mediante Telegram OTP o Recovery Code personal.
+- Generar/forzar Recovery Code para usuarios nuevos y existentes antes de acceder al dashboard.
+- Mantener el Recovery Code original fuera de la base de datos: solo hash scrypt.
+- Rotar el Recovery Code después de cada recuperación y permitir regeneración autenticada desde Mi cuenta.
+- Revocar todas las sesiones anteriores después de un reset de contraseña.
+- Añadir rate limiting, límite de intentos, expiración, auditoría y respuestas anti-enumeración.
+
+MODIFICADOS (11):
+ARCHIVOS_TOCADOS.txt
+app/api/admin_api.py
+app/api/auth_api.py
+app/auth/service.py
+app/storage/database.py
+frontend/src/App.tsx
+frontend/src/lib/api.ts
+frontend/src/pages/AuthPage.tsx
+frontend/src/pages/DashboardPage.tsx
+frontend/src/styles.css
+frontend/src/types.ts
+
+NUEVOS (6):
+KAELEON_ACCOUNT_RECOVERY.md
+frontend/src/components/RecoveryCodeGate.tsx
+frontend/src/components/RecoveryCodeRegenerateModal.tsx
+frontend/src/lib/recoveryCode.ts
+tests/test_password_recovery.py
+tests/test_password_recovery_frontend_contract.py
+
+ELIMINADOS:
+ninguno
+
+SEGURIDAD / COMPORTAMIENTO:
+- OTP Telegram: 6 dígitos, 10 minutos, máximo 5 intentos, un solo uso.
+- Solicitudes Telegram: máximo 3 por teléfono en 15 minutos; límite adicional por IP.
+- Recovery Code: formato KAE-XXXX-XXXX-XXXX-XXXX-XXXX, ~100 bits cuando lo genera el frontend seguro.
+- Recovery Code y OTP se persisten solo como hash scrypt con salt aleatorio.
+- Reset exitoso revoca sesiones previas y rota el Recovery Code.
+- Respuestas públicas de Telegram no confirman si la cuenta existe.
+- Intentos por Recovery Code se limitan por teléfono e IP.
+- Alertas de seguridad por Telegram después de reset o regeneración.
+- Admin nunca recibe recovery_code_hash en serialización.
+- Usuarios existentes sin recovery_code_hash reciben el gate automáticamente en su próxima sesión/recarga autenticada.
+- No se requieren nuevas variables de entorno; reutiliza la configuración Telegram existente.
+
+VALIDACIÓN:
+- pytest -q -> 207 passed
+- python -m compileall -q app scripts -> sin errores
+- TypeScript syntax/transpile validation de los archivos frontend tocados -> OK
+- typecheck/build integral del frontend no validado en este entorno: npm ci agotó el timeout antes de completar node_modules.

@@ -75,7 +75,22 @@ export default function DashboardPage({user,isAdmin,onOpenAdmin,onOpenSubscripti
   async function activateTrial(){setBusy('trial');setError('');try{await api.activateTrial();setNotice('Prueba LIVE activada.');await load(true)}catch(err){setError(humanizeError(err))}finally{setBusy('')}}
   async function switchMode(next:'demo'|'live'){if(next==='live'&&!config?.live_allowed)return;await save({execution_mode:next,trading_enabled:false},'mode')}
   async function logout(){try{await api.logout()}catch{}session.clear();onSignedOut()}
-  function openShare(snapshot:TradeShareSnapshot){setShareSnapshot({...snapshot,sharedAt:Date.now()})}
+  async function openShare(snapshot:TradeShareSnapshot){
+    let code=String(referrals?.referral_code||'').trim();
+    if(!code){
+      try{
+        const fresh=await api.referrals();
+        setReferrals(fresh);
+        code=String(fresh.referral_code||'').trim();
+      }catch(err){
+        setNotice(`No fue posible cargar tu enlace de referido: ${humanizeError(err)}`);
+        return;
+      }
+    }
+    if(!code){setNotice('Tu código de referido todavía no está disponible.');return;}
+    const referralUrl=`${window.location.origin}/?ref=${encodeURIComponent(code)}`;
+    setShareSnapshot({...snapshot,sharedAt:Date.now(),referralCode:code,referralUrl});
+  }
 
   const capitalValue=Number(capital); const capitalValid=Number.isFinite(capitalValue)&&capitalValue>0&&capitalValue<=(available||0); const totalPositionCount=ops.open.length;
   if(loading&&!config)return <div className="app-loader"><div className="loader-ring"/><strong>KAELEON</strong><span>Cargando tu panel…</span></div>;

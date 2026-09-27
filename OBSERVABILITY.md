@@ -37,3 +37,13 @@ Operational logs are **not written to MongoDB**. The database stores only data r
 Rejected/no-trade decisions are no longer appended to the `decisions` collection.
 
 The `/user/activity` endpoint is a lightweight view synthesized from the current engine state plus existing positions. It does not need an events collection.
+
+## Railway export-safe logs
+
+KAELEON audit events are emitted as one physical line using the prefix `KAELEON event=... payload=...`.
+The prefix is intentional: Railway can turn a pure JSON line into structured attributes and its downloaded
+text log may then contain only an empty message. INFO/DEBUG audit events are written to stdout and
+WARNING/ERROR events to stderr, so Railway severity is no longer misleading.
+
+A downloaded log can now be searched directly for `SIGNAL_REJECTED`, `REJECTION_FUNNEL`,
+`SETUP_ARMED`, `SETUP_TRIGGERED`, `SIGNAL_ACCEPTED`, `POSITION_OPENED` and `PIPELINE_ERROR`.

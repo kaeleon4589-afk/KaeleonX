@@ -411,3 +411,30 @@ VALIDACIÓN:
 - python -m compileall -q app scripts -> sin errores
 - búsqueda de referencias de trading manual en app/frontend/tests/.env.example -> sin coincidencias operativas
 - frontend typecheck integral no validado localmente: el ZIP no incluye node_modules y npm ci agotó el tiempo del entorno antes de completar la instalación.
+
+CORRECCIÓN — Railway downloadable audit logs
+BASE COMPARADA: KaeleonX-v6-automatic-only.zip
+
+OBJETIVO:
+- Evitar que Railway convierta el JSON puro del motor en atributos sin mensaje y exporte líneas vacías.
+- Hacer que cada evento del bot sea una sola línea descargable y buscable.
+- Enviar INFO/DEBUG a stdout y WARNING/ERROR a stderr para que Railway no marque toda la telemetría normal como error.
+
+MODIFICADOS (5):
+.env.example
+ARCHIVOS_TOCADOS.txt
+OBSERVABILITY.md
+app/logging/logger.py
+tests/test_lean_observability.py
+
+NUEVOS: ninguno
+ELIMINADOS: ninguno
+
+FORMATO NUEVO:
+KAELEON event=<EVENT_NAME> payload={<compact JSON>}
+
+VALIDACIÓN:
+- pytest -q -> 191 passed
+- python -m compileall -q app scripts -> sin errores
+- test específico confirma que SIGNAL_REJECTED queda como texto exportable con reason incluido.
+- test específico confirma handlers separados para stdout y stderr.

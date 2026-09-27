@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from uuid import uuid4
 
 from app.models.trading import Position
@@ -97,65 +96,17 @@ class CoinWExecutor:
                 if order_rows:
                     latest_order = order_rows[0]
 
-                # CoinW documents the current-order endpoint as an unfulfilled
-                # order source. Once a MARKET order fills it can disappear from
-                # that endpoint. Resolve the executed order through 7-day
-                # history, keyed first by our thirdOrderId and then by order id.
-                history_row = None
-                current_status = str(
-                    (latest_order or {}).get("orderStatus")
-                    or (latest_order or {}).get("finalOrderStatus")
-                    or ""
-                ).lower()
-                if (not order_rows or current_status in {"finish", "part", "filled"}) and hasattr(self.orders, "history"):
-                    try:
-                        history = await self.orders.history(
-                            instrument, "execute", page=1, page_size=50
-                        )
-                        history_rows = self._rows(history)
-                        history_row = next((
-                            row for row in history_rows
-                            if str(row.get("thirdOrderId") or "") == str(intent.decision_id)
-                        ), None)
-                        if history_row is None:
-                            history_row = next((
-                                row for row in history_rows
-                                if str(row.get("id") or row.get("orderId") or "") == str(order_id)
-                            ), None)
-                        if history_row is not None:
-                            latest_order = history_row
-                    except Exception:
-                        history_row = None
-
-                open_id = (latest_order or {}).get("openId")
-                pos_info = await self.positions.current(
-                    instrument, [open_id] if open_id not in (None, "") else None
-                )
+                pos_info = await self.positions.current(instrument)
                 pos_rows = self._rows(pos_info)
-                candidates = [
-                    row for row in pos_rows
-                    if str(row.get("instrument", "")).upper() == instrument
-                    and str(row.get("direction", "")).lower() == intent.direction.value.lower()
-                    and str(row.get("status", "")).lower() == "open"
-                ]
-                if open_id not in (None, ""):
-                    latest_position = next((
-                        row for row in candidates
-                        if str(row.get("id") or row.get("openId") or "") == str(open_id)
-                    ), None)
-                elif len(candidates) == 1:
-                    # Safe fallback only when there is no ambiguity. Never bind
-                    # a new order to an arbitrary same-direction position.
-                    latest_position = candidates[0]
+                for row in pos_rows:
+                    if str(row.get("instrument", "")).upper() == instrument and                        str(row.get("direction", "")).lower() == intent.direction.value.lower() and                        str(row.get("status", "")).lower() == "open":
+                        latest_position = row
+                        break
 
-                order_status = str(
-                    (latest_order or {}).get("orderStatus")
-                    or (latest_order or {}).get("finalOrderStatus")
-                    or ""
-                ).lower()
-                if latest_position and (history_row is not None or order_status in {"finish", "part"}):
+                order_status = str((latest_order or {}).get("orderStatus", "")).lower()
+                if latest_position and order_status in {"finish", "part"}:
                     return latest_order, latest_position
-                if order_status in {"cancel", "cancelled"}:
+                if order_status == "cancel":
                     return latest_order, None
             except Exception as exc:
                 if self.audit:
@@ -304,9 +255,9 @@ class CoinWExecutor:
 
         position = self._position_from_exchange(intent, position_row)
         position.leverage = int(leverage)
-        position.stop_price = float(normalized_stop or 0.0)
-        position.target_price = float(normalized_target or 0.0)
-        position.tp2_price = float(normalized_target or 0.0)
+        position.stop_price = normalized_stop
+        position.target_price = normalized_target
+        position.tp2_price = normalized_target
 
         # Reassert exchange-native protection against an entry/fill race.
         try:
@@ -346,141 +297,6 @@ class CoinWExecutor:
             "exchange_response": response,
             "order_state": order_row,
         }
-
-
-    async def submit_manual(self, *, client_order_id, symbol, direction, margin, leverage,
-                            order_type, stop_loss, take_profit, limit_price=None,
-                            position_model=0, reference_price=None):
-        """Submit a user-initiated futures order without routing through bot risk logic.
-
-        ``margin`` is the amount of quote currency the user allocates. CoinW's
-        ``quantityUnit=0`` expects quote-currency notional, so notional is margin * leverage.
-        This method still enforces instrument status/minimums and confirms MARKET fills.
-        """
-        if not self.enabled:
-            return {"accepted": False, "filled": False, "blocked": True, "reason": "live_execution_disabled"}
-        if not isinstance(direction, Direction):
-            direction = Direction(str(direction).upper())
-        order_type = str(order_type or 'MARKET').upper()
-        if order_type not in {'MARKET', 'LIMIT'}:
-            return {"accepted": False, "filled": False, "blocked": True, "reason": "unsupported_manual_order_type"}
-
-        instrument = self._instrument(symbol)
-        info = await self._instrument_info(instrument)
-        instrument_status = str(info.get('status') or 'online').lower()
-        max_leverage = float(info.get('maxLeverage') or leverage)
-        one_lot_size = float(info.get('oneLotSize') or 0)
-        min_size = float(info.get('minSize') or 0)
-        precision = int(info.get('pricePrecision') or info.get('price_precision') or 8)
-        if instrument_status not in {'online', '1', 'true', ''}:
-            return {"accepted": False, "filled": False, "blocked": True, "reason": "instrument_not_tradable"}
-        if float(leverage) > max_leverage:
-            return {"accepted": False, "filled": False, "blocked": True, "reason": "leverage_exceeds_instrument_max", "max_leverage": max_leverage}
-
-        notional = float(margin) * float(leverage)
-        price_for_min = float(limit_price or reference_price or 0)
-        if notional <= 0 or price_for_min <= 0:
-            return {"accepted": False, "filled": False, "blocked": True, "reason": "invalid_manual_order_size"}
-        base_estimate = notional / price_for_min
-        min_base = one_lot_size * min_size if one_lot_size and min_size else 0.0
-        if min_base and base_estimate < min_base:
-            return {
-                "accepted": False, "filled": False, "blocked": True,
-                "reason": "quantity_below_exchange_minimum",
-                "minimum_base_quantity": min_base, "quantity": notional,
-            }
-
-        normalized_stop = None
-        normalized_target = None
-        if stop_loss is not None and float(stop_loss) > 0:
-            normalized_stop = self._round_price(
-                float(stop_loss), precision, "up" if direction == Direction.LONG else "down"
-            )
-        if take_profit is not None and float(take_profit) > 0:
-            normalized_target = self._round_price(
-                float(take_profit), precision, "down" if direction == Direction.LONG else "up"
-            )
-        payload = {
-            'instrument': instrument,
-            'direction': 'long' if direction == Direction.LONG else 'short',
-            'leverage': int(leverage),
-            'quantityUnit': 0,
-            'quantity': str(notional),
-            'positionModel': int(position_model),
-            'positionType': 'execute' if order_type == 'MARKET' else 'plan',
-            'thirdOrderId': str(client_order_id)[:50],
-        }
-        if normalized_stop is not None:
-            payload['stopLossPrice'] = normalized_stop
-        if normalized_target is not None:
-            payload['stopProfitPrice'] = normalized_target
-        if order_type == 'LIMIT':
-            payload['openPrice'] = self._round_price(float(limit_price), precision, 'nearest')
-
-        response = await self.orders.place(payload)
-        data = self._data(response)
-        order_id = data.get('value') if isinstance(data, dict) else data
-        if order_id is None:
-            return {"accepted": True, "filled": False, "reason": "missing_order_id", "exchange_response": response}
-
-        common = {
-            'accepted': True, 'order_id': str(order_id), 'client_order_id': str(client_order_id),
-            'mode': 'live', 'source': 'MANUAL', 'order_type': order_type,
-            'notional': notional, 'margin': float(margin), 'leverage': int(leverage),
-            'stop_price': normalized_stop, 'target_price': normalized_target,
-            'exchange_response': response,
-        }
-        if order_type == 'LIMIT':
-            return {**common, 'filled': False, 'status': 'OPEN', 'limit_price': payload['openPrice']}
-
-        from app.models.trading import TradeIntent
-        from app.models.enums import Strategy
-        intent = TradeIntent(
-            decision_id=str(client_order_id), symbol=str(symbol), strategy=Strategy.NO_TRADE,
-            direction=direction, entry_price=float(reference_price),
-            stop_price=float(normalized_stop or 0.0), target_price=float(normalized_target or 0.0),
-            quality=100.0, risk_multiplier=1.0, timeframe='manual',
-            reasons=('manual_live_order',), metadata={'source': 'MANUAL'},
-        )
-        order_row, position_row = await self._confirm_order(intent, order_id)
-        if not position_row:
-            return {**common, 'filled': False, 'status': 'ACCEPTED',
-                    'reason': 'order_pending_confirmation', 'order_state': order_row}
-
-        position = self._position_from_exchange(intent, position_row)
-        position.leverage = int(leverage)
-        position.stop_price = float(normalized_stop or 0.0)
-        position.target_price = float(normalized_target or 0.0)
-        position.tp2_price = float(normalized_target or 0.0)
-        position.source = 'MANUAL'
-        position.order_type = 'MARKET'
-        position.margin_mode = 'ISOLATED' if int(position_model) == 0 else 'CROSS'
-        position.position_margin = float(position_row.get('positionMargin') or position_row.get('margin') or margin)
-        liq = position_row.get('liquidationPrice')
-        position.liquidation_price = float(liq) if liq not in (None, '') else None
-        position.exchange_order_id = str(order_id)
-        position.client_order_id = str(client_order_id)
-        position.unrealized_pnl = float(position_row.get('profitUnreal') or 0)
-
-        if normalized_stop is not None or normalized_target is not None:
-            try:
-                await self.orders.set_tpsl(
-                    position.position_id, instrument,
-                    stop_loss=normalized_stop, take_profit=normalized_target,
-                )
-                position.protected = True
-            except Exception as exc:
-                position.protected = False
-                return {**common, 'filled': True, 'status': 'OPEN', 'protected': False,
-                        'position_id': position.position_id, 'position': position,
-                        'error': f'exchange_protection_failed:{type(exc).__name__}'}
-        else:
-            # No TP/SL was requested. This is a valid manual position, not a
-            # failed protection attempt; the user may attach protection later.
-            position.protected = True
-        return {**common, 'filled': True, 'status': 'OPEN', 'protected': True,
-                'position_id': position.position_id, 'position': position,
-                'fill_price': position.entry_price, 'order_state': order_row}
 
     async def ensure_protection(self, position):
         instrument = self._instrument(position.symbol)
@@ -523,8 +339,8 @@ class CoinWExecutor:
         )
         return result
 
-    async def current_position_rows(self, instrument, open_ids=None):
-        response = await self.positions.current(self._instrument(instrument), open_ids)
+    async def current_position_rows(self, instrument):
+        response = await self.positions.current(self._instrument(instrument))
         return self._rows(response)
 
     async def sync_positions(self, instruments):

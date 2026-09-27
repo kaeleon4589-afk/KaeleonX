@@ -24,7 +24,6 @@ from app.trading.profile import UserTradingProfileService
 from app.trading.persistence import TradePersistence
 from app.trading.metrics import calculate_performance, position_net_pnl
 from app.trading.statistics import TradingStatistics
-from app.trading.manual import position_from_document, build_demo_limit_fill
 from app.models.trading import Position
 from app.models.enums import Direction
 
@@ -66,8 +65,6 @@ class UserTradingRuntimeManager:
         self._last_refresh = 0.0
         self._lock = asyncio.Lock()
         self._processing_lock = asyncio.Lock()
-        self._manual_order_symbols: set[str] = set()
-        self._manual_order_users_by_symbol: dict[str, set[str]] = {}
 
     @staticmethod
     def _fingerprint(row: dict) -> str:
@@ -185,15 +182,8 @@ class UserTradingRuntimeManager:
                     exit_trigger_price=row.get('exit_trigger_price'),
                     stop_gap_bps=row.get('stop_gap_bps'),
                     exit_quote_delay_ms=row.get('exit_quote_delay_ms'),
-                    source=str(row.get('source', 'BOT') or 'BOT').upper(),
-                    order_type=str(row.get('order_type', 'MARKET') or 'MARKET').upper(),
-                    margin_mode=str(row.get('margin_mode', 'ISOLATED') or 'ISOLATED').upper(),
-                    position_margin=row.get('position_margin'),
-                    liquidation_price=row.get('liquidation_price'),
-                    exchange_order_id=row.get('exchange_order_id'),
-                    client_order_id=row.get('client_order_id'),
                 )
-                for attr in ("strategy", "quality", "execution_rr", "structural_rr", "close_requested", "close_order_id"):
+                for attr in ("strategy", "quality", "execution_rr", "structural_rr"):
                     if row.get(attr) is not None:
                         setattr(restored, attr, row.get(attr))
                 position_manager.add(restored, persist=False)
@@ -263,113 +253,6 @@ class UserTradingRuntimeManager:
             last_reset_id=(TradingStatistics(self.db).current_period(mode) or {}).get('reset_id'),
         )
 
-    async def _sync_persisted_positions(self, runtime: UserRuntime) -> None:
-        """Merge API-created/manual position state into the long-lived worker runtime.
-
-        The API and trading worker may share a process but not the same service
-        object. MongoDB is therefore the rendezvous point for manual actions.
-        Only newer revisions or terminal CLOSED state can overwrite in-memory data.
-        """
-        rows = await asyncio.to_thread(
-            self.db.find_many, "positions",
-            {"user_id": runtime.user_id, "mode": runtime.mode}, limit=0,
-        )
-        for row in rows:
-            pid = str(row.get("position_id") or "")
-            if not pid:
-                continue
-            local = runtime.position_manager.positions.get(pid)
-            db_revision = int(row.get("revision") or 0)
-            if local is None:
-                if str(row.get("status", "OPEN")).upper() == "OPEN":
-                    try:
-                        runtime.position_manager.add(position_from_document(row), persist=False)
-                    except (KeyError, TypeError, ValueError) as exc:
-                        self.audit.event("POSITION_RESTORE_ERROR", runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, position_id=pid, error=str(exc))
-                continue
-            local_revision = int(getattr(local, "revision", 0) or 0)
-            terminal_external = str(row.get("status", "OPEN")).upper() == "CLOSED" and str(local.status).upper() == "OPEN"
-            if terminal_external or db_revision > local_revision:
-                try:
-                    runtime.position_manager.positions[pid] = position_from_document(row)
-                    runtime.position_manager.state_changed = True
-                except (KeyError, TypeError, ValueError) as exc:
-                    self.audit.event("POSITION_SYNC_ERROR", runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, position_id=pid, error=str(exc))
-        if runtime.mode == TradingEnvironment.DEMO.value and hasattr(runtime.execution, "equity"):
-            runtime.execution.equity = await asyncio.to_thread(
-                self.profiles.demo_account.balance, runtime.user_id
-            )
-
-    async def _process_demo_manual_limits(self, runtime: UserRuntime, snapshot) -> None:
-        if runtime.mode != TradingEnvironment.DEMO.value:
-            return
-        orders = await asyncio.to_thread(
-            self.db.find_many, "manual_orders",
-            {"user_id": runtime.user_id, "mode": "demo", "status": "OPEN", "symbol": snapshot.symbol},
-            limit=0,
-        )
-        if not orders:
-            return
-        last = snapshot.last if isinstance(snapshot.last, (int, float)) else getattr(snapshot.last, "close", None)
-        try:
-            last = float(last)
-        except (TypeError, ValueError):
-            return
-        bid = getattr(snapshot, "bid", None)
-        ask = getattr(snapshot, "ask", None)
-        try:
-            bid = float(bid) if bid is not None else last
-            ask = float(ask) if ask is not None else last
-        except (TypeError, ValueError):
-            bid = ask = last
-
-        for order in orders:
-            direction = str(order.get("direction") or order.get("side") or "LONG").upper()
-            limit_price = float(order.get("limit_price") or 0)
-            if limit_price <= 0:
-                continue
-            touched = (direction == "LONG" and ask <= limit_price) or (direction == "SHORT" and bid >= limit_price)
-            if not touched:
-                continue
-
-            balance = await asyncio.to_thread(self.profiles.demo_account.balance, runtime.user_id)
-            used_margin = sum(
-                max(0.0, float(getattr(p, "position_margin", 0) or
-                    (p.entry_price * (p.remaining_quantity or p.quantity) / max(1, p.leverage))))
-                for p in runtime.position_manager.positions.values() if p.status == "OPEN"
-            )
-            requested_margin = float(order.get("margin") or 0)
-            if requested_margin > max(0.0, balance - used_margin) + 1e-9:
-                await asyncio.to_thread(
-                    self.db.upsert, "manual_orders",
-                    {"manual_order_id": order["manual_order_id"]},
-                    {**order, "status": "CANCELLED", "cancel_reason": "insufficient_margin_at_fill", "cancelled_at": int(time.time() * 1000)},
-                )
-                continue
-
-            # A limit order receives the quoted price when it is better than the
-            # limit, otherwise the limit itself. Never fill worse than requested.
-            fill = min(ask, limit_price) if direction == "LONG" else max(bid, limit_price)
-            position = build_demo_limit_fill(order, fill, self.settings)
-            runtime.position_manager.add(position, persist=False)
-            await runtime.orchestrator.persistence.save_position(
-                position=position, user_id=runtime.user_id, mode=runtime.mode
-            )
-            await asyncio.to_thread(
-                self.db.upsert, "manual_orders",
-                {"manual_order_id": order["manual_order_id"]},
-                {**order, "status": "FILLED", "filled": True, "position_id": position.position_id,
-                 "fill_price": fill, "filled_at": int(time.time() * 1000)},
-            )
-            runtime.execution.equity = await asyncio.to_thread(
-                self.profiles.demo_account.balance, runtime.user_id
-            )
-            self.audit.event(
-                "MANUAL_DEMO_LIMIT_FILLED", position.decision_id,
-                user_id=runtime.user_id, mode="demo", symbol=position.symbol,
-                position_id=position.position_id, fill_price=fill,
-            )
-
     async def refresh(self) -> None:
         now = time.monotonic()
         if now - self._last_refresh < self.settings.user_runtime_refresh_seconds:
@@ -381,20 +264,6 @@ class UserTradingRuntimeManager:
             users = await asyncio.to_thread(
                 self.db.find_many, "users", {}, limit=0
             )
-            manual_rows = []
-            for status in ("OPEN", "ACCEPTED", "PENDING"):
-                manual_rows.extend(await asyncio.to_thread(
-                    self.db.find_many, "manual_orders", {"status": status}, limit=0
-                ))
-            self._manual_order_symbols = {
-                str(row.get("symbol")) for row in manual_rows if row.get("symbol")
-            }
-            self._manual_order_users_by_symbol = {}
-            for row in manual_rows:
-                symbol = str(row.get("symbol") or "")
-                user_id = str(row.get("user_id") or "")
-                if symbol and user_id:
-                    self._manual_order_users_by_symbol.setdefault(symbol, set()).add(user_id)
             live_user_ids = set()
             for user in users:
                 uid = str(user["user_id"])
@@ -422,7 +291,6 @@ class UserTradingRuntimeManager:
                     current.configured_capital = float((await asyncio.to_thread(self.profiles.public, uid)).operating_capital)
                     current.coinw_verified = bool(profile.get("coinw_verified", False))
                     current.live_allowed = live_allowed
-                    await self._sync_persisted_positions(current)
                     continue
                 try:
                     built = await self._build_runtime(uid, profile, fp)
@@ -442,17 +310,7 @@ class UserTradingRuntimeManager:
                    for p in runtime.position_manager.positions.values() if p.status == 'OPEN'}
         symbols.update(runtime.orchestrator.pending_execution['symbol']
                        for runtime in self._runtimes.values() if runtime.orchestrator.pending_execution)
-        symbols.update(self._manual_order_symbols)
         return symbols
-
-    def _runtime_tracks_monitor_symbol(self, runtime: UserRuntime, symbol: str) -> bool:
-        if any(p.status == 'OPEN' and p.symbol == symbol
-               for p in runtime.position_manager.positions.values()):
-            return True
-        if (runtime.orchestrator.pending_execution or {}).get('symbol') == symbol:
-            return True
-        owners = getattr(self, '_manual_order_users_by_symbol', {})
-        return runtime.user_id in owners.get(str(symbol), set())
 
     async def run_snapshot(self, snapshot) -> None:
         async with self._processing_lock:
@@ -471,7 +329,9 @@ class UserTradingRuntimeManager:
             # unresolved order in this symbol. Visiting every other user would
             # delay stops as the account count grows.
             runtimes = [runtime for runtime in runtimes
-                        if self._runtime_tracks_monitor_symbol(runtime, snapshot.symbol)]
+                        if any(p.status == 'OPEN' and p.symbol == snapshot.symbol
+                               for p in runtime.position_manager.positions.values())
+                        or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol]
         for runtime in runtimes:
             try:
                 period = periods[runtime.mode] if periods is not None else None
@@ -485,8 +345,6 @@ class UserTradingRuntimeManager:
                 self.audit.event('USER_MARKET_ANALYSIS_START', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, trading_enabled=runtime.trading_enabled, configured_capital=runtime.configured_capital)
                 live_allowed = runtime.live_allowed
 
-                await self._process_demo_manual_limits(runtime, snapshot)
-
                 if hasattr(runtime.execution, "get_equity"):
                     try:
                         available_equity = await runtime.execution.get_equity()
@@ -499,28 +357,6 @@ class UserTradingRuntimeManager:
                     # DEMO always owns a fixed virtual wallet. The configured
                     # capital is only the portion allocated to KAELEON.
                     available_equity = float(self.settings.paper_initial_equity)
-
-                if runtime.mode == TradingEnvironment.DEMO.value:
-                    manual_used = sum(
-                        max(0.0, float(getattr(p, "position_margin", 0) or 0))
-                        for p in runtime.position_manager.positions.values()
-                        if p.status == "OPEN" and str(getattr(p, "source", "BOT")).upper() == "MANUAL"
-                    )
-                    # Pending manual LIMIT orders already reserve user capital in
-                    # the terminal. Subtract the same reservation here so the BOT
-                    # cannot spend capital that a manual order is waiting to use.
-                    pending_manual_orders = await asyncio.to_thread(
-                        self.db.find_many, "manual_orders",
-                        {"user_id": runtime.user_id, "mode": "demo", "status": "OPEN"},
-                        limit=0,
-                    )
-                    manual_reserved = sum(
-                        max(0.0, float(row.get("margin") or 0))
-                        for row in pending_manual_orders
-                    )
-                    available_equity = max(
-                        0.0, float(available_equity) - manual_used - manual_reserved
-                    )
 
                 effective_capital = min(runtime.configured_capital, float(available_equity))
                 if effective_capital < self.settings.min_operating_capital:

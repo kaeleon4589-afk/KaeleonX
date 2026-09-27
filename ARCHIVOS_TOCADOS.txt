@@ -371,97 +371,43 @@ pytest -q -> 189 passed
 python -m compileall -q app scripts -> sin errores
 Frontend build local -> no validado: npm ci quedó incompleto por timeout del entorno y faltaron type definitions; no se atribuye al cambio de código.
 
-============================================================
-FASE: OPERATIVA MANUAL DEMO + LIVE (sobre v6 winrate validation)
-============================================================
+LIMPIEZA — KAELEON v6 Automatic Trading Only
+BASE COMPARADA: KaeleonX-v6-manual-terminal-v2-coinw.zip
 
-BASE COMPARADA: KaeleonX-v6-winrate-validation.zip
+OBJETIVO:
+- Eliminar por completo la capa de trading manual DEMO/LIVE.
+- Mantener exclusivamente el motor automático en DEMO y LIVE.
+- Conservar del trabajo visual posterior solo el drawer `Mercado ▾` para Order Book, Trades, Market Data, Depth y fuerza compradora/vendedora.
 
-ARCHIVOS MODIFICADOS (16):
-1. .env.example
-2. ARCHIVOS_TOCADOS.txt
-3. app/api/user_api.py
-4. app/coinw/executor.py
-5. app/coinw/orders.py
-6. app/config/settings.py
-7. app/models/trading.py
-8. app/orchestrator.py
-9. app/position/manager.py
-10. app/storage/database.py
-11. app/trading/runtime.py
-12. frontend/src/components/trading/LiveMarketChart.tsx
-13. frontend/src/lib/api.ts
-14. frontend/src/pages/DashboardPage.tsx
-15. frontend/src/styles.css
-16. frontend/src/types.ts
+MODIFICADOS / REVERTIDOS:
+.env.example
+ARCHIVOS_TOCADOS.txt
+app/api/user_api.py
+app/coinw/executor.py
+app/coinw/orders.py
+app/config/settings.py
+app/execution/paper.py
+app/models/trading.py
+app/orchestrator.py
+app/position/exit_engine.py
+app/position/manager.py
+app/storage/database.py
+app/trading/runtime.py
+frontend/src/components/trading/LiveMarketChart.tsx
+frontend/src/lib/api.ts
+frontend/src/pages/DashboardPage.tsx
+frontend/src/styles.css
+frontend/src/types.ts
+tests/test_live_market_chart.py
 
-ARCHIVOS NUEVOS (4):
-1. KAELEON_MANUAL_TRADING.md
-2. app/trading/manual.py
-3. frontend/src/components/trading/TradingTerminal.tsx
-4. tests/test_manual_trading_terminal.py
-
-ARCHIVOS ELIMINADOS: 0
-
-Objetivo de esta fase:
-- Operativa manual DEMO/LIVE desde el mismo gráfico KAELEON.
-- MARKET/LIMIT, LONG/SHORT, margen, leverage, TP/SL.
-- Posiciones, órdenes abiertas, historial, cancelación, cierre y edición TP/SL.
-- DEMO completamente aislado de órdenes privadas CoinW.
-- LIVE con confirmación explícita, API privada CoinW y reconciliación de fill.
-- Idempotencia financiera previa al submit para evitar órdenes duplicadas.
-- source=MANUAL separado de source=BOT.
-- Historial de trades manuales separado de auditoría de órdenes.
-- Las LIMIT DEMO pendientes reservan margen también frente al bot automático.
-- Si CoinW acepta pero se pierde la respuesta HTTP, se recupera por thirdOrderId; nunca se reenvía a ciegas.
-- Los fills LIVE se vinculan al openId exacto de CoinW cuando está disponible.
-- Si CoinW no confirma TP/SL tras un fill LIVE, KAELEON lo muestra como protección no confirmada.
-
-VALIDACIÓN DE ESTA FASE:
-- pytest -q -> 196 passed
-- python -m compileall -q app scripts -> sin errores
-- Transpilación sintáctica TypeScript/TSX de los 5 archivos frontend tocados principales -> sin errores
-- Build frontend completo -> no validado en este entorno: npm ci no terminó dentro del tiempo disponible. No se atribuye ese timeout al código.
-
-============================================================
-CORRECCIÓN — TERMINAL MANUAL V2 / PANEL COINW + LIMIT DEMO
-============================================================
-
-BASE COMPARADA: KaeleonX-v6-manual-trading-terminal.zip
-
-ARCHIVOS MODIFICADOS (15):
-1. ARCHIVOS_TOCADOS.txt
-2. KAELEON_MANUAL_TRADING.md
-3. app/api/user_api.py
-4. app/coinw/executor.py
-5. app/execution/paper.py
-6. app/position/exit_engine.py
-7. app/position/manager.py
-8. app/trading/manual.py
-9. app/trading/runtime.py
-10. frontend/src/components/trading/LiveMarketChart.tsx
-11. frontend/src/components/trading/TradingTerminal.tsx
-12. frontend/src/lib/api.ts
-13. frontend/src/styles.css
-14. frontend/src/types.ts
-15. tests/test_manual_trading_terminal.py
-
-ARCHIVOS NUEVOS: ninguno
-ARCHIVOS ELIMINADOS: ninguno
-
-CAMBIOS CLAVE:
-- Panel de órdenes reorganizado con jerarquía tipo CoinW y precio live visible dentro del ticket.
-- En móvil, panel pegado al gráfico; Order Book/Trades/Market Data/Fuerza pasan al drawer `Mercado ▾`.
-- TP/SL dejan de ser obligatorios al abrir una operación manual.
-- TP y/o SL pueden añadirse después desde la posición abierta.
-- Si se introducen antes de abrir, se muestra ROI estimado según precio de entrada y leverage.
-- LIMIT DEMO marketable se llena inmediatamente al mejor Bid/Ask ejecutable.
-- LIMIT DEMO resting vuelve a evaluarse correctamente en snapshots `monitor_only` aunque no exista una posición previa.
-- SL/TP ausentes usan sentinel local seguro y no disparan cierres falsos, especialmente en SHORT.
-- LIVE omite TP/SL en el payload de CoinW cuando el usuario no los configuró.
+ELIMINADOS:
+KAELEON_MANUAL_TRADING.md
+app/trading/manual.py
+frontend/src/components/trading/TradingTerminal.tsx
+tests/test_manual_trading_terminal.py
 
 VALIDACIÓN:
-- pytest -q -> 199 passed
-- python -m compileall -q app -> sin errores
-- Transpilación sintáctica TypeScript/TSX de TradingTerminal, LiveMarketChart, api.ts y types.ts -> sin errores
-- Build frontend completo -> no validado: npm ci no completó en el entorno de revisión; faltaron type definitions durante tsc.
+- pytest -q -> 189 passed
+- python -m compileall -q app scripts -> sin errores
+- búsqueda de referencias de trading manual en app/frontend/tests/.env.example -> sin coincidencias operativas
+- frontend typecheck integral no validado localmente: el ZIP no incluye node_modules y npm ci agotó el tiempo del entorno antes de completar la instalación.

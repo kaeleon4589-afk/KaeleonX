@@ -120,8 +120,6 @@ class PositionManager:
         if not self.dynamic_protection_enabled:
             return False
 
-        if float(getattr(p, "target_price", 0.0) or 0.0) <= 0:
-            return False
         progress = self._management_progress(p)
         target_distance = abs(float(p.target_price) - float(p.entry_price))
         if target_distance <= 1e-12:
@@ -312,17 +310,6 @@ class PositionManager:
             else:
                 p.stop_price = remote_stop
             p.target_price = self._float(row.get("stopProfitPrice"), p.target_price)
-            p.unrealized_pnl = self._float(row.get("profitUnreal"), p.unrealized_pnl)
-            remote_margin = self._float(row.get("positionMargin") or row.get("margin"), getattr(p, "position_margin", 0.0) or 0.0)
-            if remote_margin > 0:
-                p.position_margin = remote_margin
-            remote_liq = self._float(row.get("liquidationPrice"), 0.0)
-            p.liquidation_price = remote_liq if remote_liq > 0 else getattr(p, "liquidation_price", None)
-            if row.get("leverage") is not None:
-                try:
-                    p.leverage = int(row.get("leverage"))
-                except (TypeError, ValueError):
-                    pass
             qty = base_quantity(row, entry)
             p.settlement_pending = False
             if qty > 0:
@@ -349,10 +336,9 @@ class PositionManager:
             qty = base_quantity(row, entry)
             if qty <= 0:
                 continue
-            third_order_id = str(row.get("thirdOrderId") or row.get("decision_id") or "EXCHANGE_RECOVERED")
             recovered = Position(
                 position_id=pid,
-                decision_id=third_order_id,
+                decision_id=str(row.get("thirdOrderId") or row.get("decision_id") or "EXCHANGE_RECOVERED"),
                 symbol=str(symbol or row.get("instrument") or ""),
                 direction=direction,
                 quantity=qty,
@@ -363,14 +349,6 @@ class PositionManager:
                 opened_at=int(row.get("createdDate") or row.get("updatedDate") or timestamp),
                 entry_fee=self._float(row.get("fee"), 0.0),
                 leverage=int(row.get("leverage") or 10),
-                source="MANUAL" if third_order_id.upper().startswith("MANUAL-") else "BOT",
-                order_type="MARKET",
-                margin_mode="ISOLATED" if int(row.get("positionModel") or 0) == 0 else "CROSS",
-                position_margin=self._float(row.get("positionMargin") or row.get("margin"), 0.0) or None,
-                liquidation_price=self._float(row.get("liquidationPrice"), 0.0) or None,
-                client_order_id=third_order_id if third_order_id.upper().startswith("MANUAL-") else None,
-                current_price=self._float(row.get("currentPrice") or row.get("markPrice"), entry),
-                unrealized_pnl=self._float(row.get("profitUnreal"), 0.0),
             )
             if row.get("strategy") is not None:
                 recovered.strategy = row.get("strategy")

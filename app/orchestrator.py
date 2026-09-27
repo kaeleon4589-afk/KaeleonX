@@ -160,10 +160,7 @@ class TradingOrchestrator:
         # The old expression used ``user_id is not None or p.symbol == symbol``;
         # because user_id is always present in production it was easy to misread
         # and impossible to reason about. Keep the intended invariant explicit.
-        return any(
-            p.status == "OPEN" and str(getattr(p, "source", "BOT")).upper() != "MANUAL"
-            for p in self.position_manager.positions.values()
-        )
+        return any(p.status == "OPEN" for p in self.position_manager.positions.values())
 
     @staticmethod
     def _position_from_result(raw, intent) -> Position:

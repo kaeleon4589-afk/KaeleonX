@@ -56,12 +56,6 @@ class Settings(BaseSettings):
     market_scanner_cache_seconds: float = Field(30.0, gt=0)
     fixed_leverage: int = Field(10, ge=10, le=10)
     min_operating_capital: float = Field(3.0, gt=0)
-    # Manual terminal controls. They are deliberately separate from the bot's
-    # fixed 10x leverage so a user can trade manually without changing strategy risk.
-    manual_trading_enabled: bool = True
-    manual_trading_min_margin: float = Field(1.0, gt=0)
-    manual_trading_max_leverage: int = Field(50, ge=1, le=125)
-    manual_live_confirmation_required: bool = True
     max_active_users: int = Field(1000, ge=1, le=10000)
     user_runtime_refresh_seconds: float = Field(10.0, gt=0)
     engine_state_persist_seconds: float = Field(15.0, ge=2.0, le=300.0)

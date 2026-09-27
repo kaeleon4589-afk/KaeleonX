@@ -103,6 +103,16 @@ class Database:
         self.db.telegram_verifications.create_index([('challenge_hash', ASCENDING)], unique=True)
         self.db.telegram_bot_sessions.create_index([('chat_id', ASCENDING)], unique=True)
         self.db.telegram_bot_sessions.create_index([('expires_at', ASCENDING)])
+        self.db.password_recovery_challenges.create_index([('challenge_hash', ASCENDING)], unique=True)
+        self.db.password_recovery_challenges.create_index([('user_id', ASCENDING)])
+        self.db.password_recovery_challenges.create_index([('expires_at', ASCENDING)], expireAfterSeconds=0)
+        self.db.password_recovery_requests.create_index([('phone_fingerprint', ASCENDING), ('created_at', DESCENDING)])
+        self.db.password_recovery_requests.create_index([('requester_ip', ASCENDING), ('created_at', DESCENDING)])
+        self.db.password_recovery_requests.create_index([('created_at', ASCENDING)], expireAfterSeconds=604800)
+        self.db.password_recovery_attempts.create_index([('phone_fingerprint', ASCENDING), ('created_at', DESCENDING)])
+        self.db.password_recovery_attempts.create_index([('requester_ip', ASCENDING), ('created_at', DESCENDING)])
+        self.db.password_recovery_attempts.create_index([('created_at', ASCENDING)], expireAfterSeconds=604800)
+        self.db.security_events.create_index([('user_id', ASCENDING), ('created_at', DESCENDING)])
 
     def write(self, collection, document):
         document = bson_safe(dict(document))

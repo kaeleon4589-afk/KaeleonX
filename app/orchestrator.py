@@ -118,6 +118,63 @@ class TradingOrchestrator:
                 symbol_seconds=self.post_loss_symbol_cooldown_seconds,
             )
 
+    async def _persist_armed_active(self, user_id, setup) -> None:
+        """Make ARMED durable before returning control to the scanner.
+
+        Unlike diagnostic writes this is recovery-critical state. Awaiting the first
+        bounded Mongo write also prevents an older delayed ACTIVE write from racing
+        a later terminal/cancel write for the same setup.
+        """
+        expires_at = datetime.fromtimestamp(int(setup.expires_at_ms) / 1000.0, tz=timezone.utc)
+        ok, err = await self.persistence._upsert(
+            "armed_setups",
+            {"user_id": user_id, "mode": self.execution_mode, "symbol": setup.symbol},
+            {
+                "user_id": user_id, "mode": self.execution_mode, "symbol": setup.symbol,
+                "setup_id": setup.setup_id, "active": True, "setup": setup,
+                "armed_at_ms": int(setup.armed_at_ms), "expires_at_ms": int(setup.expires_at_ms),
+                "expires_at": expires_at, "terminal_reason": None,
+            },
+        )
+        if not ok:
+            self.audit.event(
+                "ARMED_STATE_PERSIST_ERROR", setup.setup_id, level="ERROR",
+                user_id=user_id, mode=self.execution_mode, symbol=setup.symbol, error=err,
+            )
+
+    def _schedule_armed_terminal(self, user_id, setup, reason: str) -> None:
+        now_ms = int(time.time() * 1000)
+        record = None
+        armed_engine = getattr(self.router, "armed", None)
+        if armed_engine is not None and hasattr(armed_engine, "consumed_record"):
+            record = armed_engine.consumed_record(setup.setup_id)
+        until_ms = int(record[0]) if record else max(int(setup.expires_at_ms), now_ms + 3_600_000)
+        consumed_reason = str(record[1]) if record else str(reason)
+        expires_at = datetime.fromtimestamp(until_ms / 1000.0, tz=timezone.utc)
+        self.persistence.schedule_upsert(
+            collection="armed_setups",
+            key={"user_id": user_id, "mode": self.execution_mode, "symbol": setup.symbol},
+            document={
+                "user_id": user_id, "mode": self.execution_mode, "symbol": setup.symbol,
+                "setup_id": setup.setup_id, "active": False, "setup": setup,
+                "terminal_reason": str(reason), "terminal_at_ms": now_ms,
+                "expires_at_ms": until_ms, "expires_at": expires_at,
+            },
+            event_name="ARMED_STATE_PERSIST_ERROR", decision_id=setup.setup_id,
+            user_id=user_id, mode=self.execution_mode, symbol=setup.symbol,
+        )
+        self.persistence.schedule_upsert(
+            collection="armed_consumed_setups",
+            key={"user_id": user_id, "mode": self.execution_mode, "setup_id": setup.setup_id},
+            document={
+                "user_id": user_id, "mode": self.execution_mode, "setup_id": setup.setup_id,
+                "symbol": setup.symbol, "reason": consumed_reason, "until_ms": until_ms,
+                "expires_at": expires_at,
+            },
+            event_name="ARMED_CONSUMED_PERSIST_ERROR", decision_id=setup.setup_id,
+            user_id=user_id, mode=self.execution_mode, symbol=setup.symbol,
+        )
+
     def _funnel(self, stage, reason=None, *, user_id=None, symbol=None):
         self.rejection_funnel.record(stage, reason)
         if self.rejection_funnel.should_emit():
@@ -435,7 +492,8 @@ class TradingOrchestrator:
                 reason="open_position_exists",
             )
             return None
-        if not allow_entries or getattr(snapshot, 'monitor_only', False):
+        armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
+        if not allow_entries or (getattr(snapshot, 'monitor_only', False) and not armed_monitor):
             self.audit.event(
                 "ENTRY_SKIPPED", user_id, level="DEBUG", persist=False,
                 user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
@@ -497,142 +555,197 @@ class TradingOrchestrator:
 
         try:
             # ------------------------- SIGNAL STAGE -------------------------
-            regime = self.regime_engine.evaluate_snapshot(snapshot)
-            regime_meta = getattr(self.regime_engine, "last_metadata", {}) or {}
-            rf = regime_meta.get("features") or {}
-            rs = regime_meta.get("state") or {}
-            feature_summary = {
-                k: rf.get(k) for k in (
-                    "adx", "choppiness", "efficiency_ratio", "atr_pct",
-                    "wick_instability", "body_quality", "breakout_failure_ratio",
-                    "ema_stack_alignment", "ema_bullish_alignment", "ema_bearish_alignment",
-                    "ema_alignment_edge", "trend_bias", "btc_shock_ratio",
-                ) if k in rf
-            }
-            state_summary = {
-                k: rs.get(k) for k in (
-                    "active", "candidate", "pending", "pending_count",
-                    "bars", "cooldown", "changed",
-                ) if k in rs
-            }
-            self.audit.event(
-                "REGIME_EVALUATED", decision_id, user_id=user_id,
-                mode=self.execution_mode, symbol=snapshot.symbol,
-                state=regime.global_state.value, score=regime.core_score,
-                candidate=regime_meta.get("candidate"), active=regime_meta.get("active"),
-                confidence=regime_meta.get("confidence"), scores=regime_meta.get("scores"),
-                regime_direction=getattr(getattr(regime, "direction", None), "value", str(getattr(regime, "direction", "UNKNOWN"))),
-                features=feature_summary, state_machine=state_summary,
-                breakout_allowed=regime.breakout_allowed, sweep_allowed=regime.sweep_allowed,
-                hard_block=regime.hard_block, risk_multiplier=regime.risk_multiplier,
-            )
-
-            self._funnel("analyzed", user_id=user_id, symbol=snapshot.symbol)
-            router_kwargs = {"snapshot": snapshot}
-            try:
-                router_params = inspect.signature(self.router.evaluate).parameters.values()
-                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in router_params) or any(
-                    p.name == "regime_metadata" for p in router_params
-                ):
-                    router_kwargs["regime_metadata"] = regime_meta
-            except (TypeError, ValueError):
-                pass
-
+            # Discovery and trigger-followup deliberately run on different paths.
+            # Once a setup is ARMED, the priority monitor supplies only live depth
+            # plus CLOSED 1m candles; there is no reason to wait for another full
+            # scanner rotation or to recompute the 5m/15m/1h regime.
+            priority_armed = bool(getattr(snapshot, "armed_monitor", False))
             intent = None
             strategy_trace = {}
-            supports_armed = (
-                self.armed_entry_enabled
-                and hasattr(self.router, "discover_armed")
-                and hasattr(self.router, "trigger_armed")
-                and bool(getattr(snapshot, "timeframes", None))
-            )
-            if supports_armed:
-                armed = self.armed_setups.get(snapshot.symbol)
-                if armed is not None:
-                    status, intent, armed_trace = self.router.trigger_armed(armed, snapshot, decision_id)
-                    strategy_trace = getattr(self.router, "last_trace", {}) or {}
-                    if status == "cancelled":
-                        self.armed_setups.pop(snapshot.symbol, None)
-                        reason = str((armed_trace or {}).get("reason") or "armed_setup_cancelled")
-                        self.last_rejection = reason
-                        self.last_decision[key] = now
-                        self._funnel("armed_cancelled", reason, user_id=user_id, symbol=snapshot.symbol)
-                        self.audit.event(
-                            "SETUP_CANCELLED", decision_id, user_id=user_id,
-                            mode=self.execution_mode, symbol=snapshot.symbol,
-                            setup_id=getattr(armed, "setup_id", None), reason=reason,
-                            trace=armed_trace,
-                        )
-                        return None
-                    if status == "pending":
-                        reason = str((armed_trace or {}).get("reason") or "armed_waiting")
-                        self.last_rejection = reason
-                        self._funnel("armed_pending", reason, user_id=user_id, symbol=snapshot.symbol)
-                        self.audit.event(
-                            "SETUP_PENDING", decision_id, level="DEBUG", persist=False,
-                            user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
-                            setup_id=getattr(armed, "setup_id", None), reason=reason,
-                            trace=armed_trace,
-                        )
-                        return None
-                    self.armed_setups.pop(snapshot.symbol, None)
-                    self._funnel("triggered", user_id=user_id, symbol=snapshot.symbol)
-                    self.audit.event(
-                        "SETUP_TRIGGERED", decision_id, user_id=user_id,
-                        mode=self.execution_mode, symbol=snapshot.symbol,
-                        setup_id=getattr(armed, "setup_id", None),
-                        strategy=getattr(getattr(intent, "strategy", None), "value", None),
-                        direction=getattr(getattr(intent, "direction", None), "value", None),
-                        trace=armed_trace,
-                    )
-                else:
-                    armed = self.router.discover_armed(
-                        regime, snapshot, snapshot.symbol, snapshot.timeframe,
-                        regime_metadata=regime_meta,
-                    )
-                    strategy_trace = getattr(self.router, "last_trace", {}) or {}
-                    if armed is not None:
-                        self.armed_setups[snapshot.symbol] = armed
-                        self.last_rejection = "setup_armed_waiting_trigger"
-                        self._funnel("armed", user_id=user_id, symbol=snapshot.symbol)
-                        self.audit.event(
-                            "SETUP_ARMED", decision_id, user_id=user_id,
-                            mode=self.execution_mode, symbol=snapshot.symbol,
-                            setup_id=armed.setup_id, strategy=armed.strategy.value,
-                            direction=armed.direction.value, quality=armed.quality,
-                            trigger_price=armed.trigger_price, invalidation_price=armed.invalidation_price,
-                            entry_zone_low=armed.entry_zone_low, entry_zone_high=armed.entry_zone_high,
-                            stop_price=armed.stop_price, target_price=armed.target_price,
-                            expires_at_ms=armed.expires_at_ms,
-                        )
-                        return None
-                    if not self.legacy_entry_fallback_enabled:
-                        armed_trace = strategy_trace.get("armed") if isinstance(strategy_trace, dict) else {}
-                        rejection_reason = str((armed_trace or {}).get("reason") or "no_armable_setup")
-                        self.last_rejection = rejection_reason
-                        self.last_decision[key] = now
-                        self._funnel("strategy_rejected", rejection_reason, user_id=user_id, symbol=snapshot.symbol)
-                        self.audit.event(
-                            "STRATEGY_EVALUATED", decision_id, user_id=user_id,
-                            mode=self.execution_mode, symbol=snapshot.symbol,
-                            regime=regime_meta.get("active"),
-                            selected_direction=None, trace=strategy_trace,
-                        )
-                        self.audit.event(
-                            "SIGNAL_REJECTED", decision_id, user_id=user_id,
-                            mode=self.execution_mode, symbol=snapshot.symbol,
-                            regime=regime_meta.get("active"), reason=rejection_reason,
-                        )
-                        return None
+            regime = None
+            regime_meta = {}
+            router_kwargs = {"snapshot": snapshot}
 
-            # Legacy immediate-entry path remains available for tests/custom routers
-            # and can be explicitly enabled in production as a rollback switch.
-            if intent is None:
-                intent = self.router.evaluate(
-                    regime, snapshot.candles, decision_id, snapshot.symbol,
-                    snapshot.timeframe, snapshot.last, **router_kwargs,
-                )
+            if priority_armed:
+                armed = self.armed_setups.get(snapshot.symbol)
+                if armed is None:
+                    return None
+                status, intent, armed_trace = self.router.trigger_armed(armed, snapshot, decision_id)
                 strategy_trace = getattr(self.router, "last_trace", {}) or {}
+                if status == "cancelled":
+                    self.armed_setups.pop(snapshot.symbol, None)
+                    reason = str((armed_trace or {}).get("reason") or "armed_setup_cancelled")
+                    self._schedule_armed_terminal(user_id, armed, reason)
+                    self.last_rejection = reason
+                    self.last_decision[key] = now
+                    self._funnel("armed_cancelled", reason, user_id=user_id, symbol=snapshot.symbol)
+                    self.audit.event(
+                        "SETUP_CANCELLED", decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        setup_id=getattr(armed, "setup_id", None), reason=reason,
+                        source="armed_priority_monitor", trace=armed_trace,
+                    )
+                    return None
+                if status == "pending":
+                    reason = str((armed_trace or {}).get("reason") or "armed_waiting")
+                    self.last_rejection = reason
+                    # High-frequency priority polls must not inflate the rejection
+                    # funnel. The setup is counted once when armed and once when it
+                    # reaches a terminal state.
+                    self.audit.event(
+                        "SETUP_PRIORITY_PENDING", decision_id, level="DEBUG", persist=False,
+                        user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                        setup_id=getattr(armed, "setup_id", None), reason=reason, trace=armed_trace,
+                    )
+                    return None
+                self.armed_setups.pop(snapshot.symbol, None)
+                self._schedule_armed_terminal(user_id, armed, "setup_triggered")
+                self._funnel("triggered", user_id=user_id, symbol=snapshot.symbol)
+                self.audit.event(
+                    "SETUP_TRIGGERED", decision_id, user_id=user_id,
+                    mode=self.execution_mode, symbol=snapshot.symbol,
+                    setup_id=getattr(armed, "setup_id", None),
+                    strategy=getattr(getattr(intent, "strategy", None), "value", None),
+                    direction=getattr(getattr(intent, "direction", None), "value", None),
+                    source="armed_priority_monitor", trace=armed_trace,
+                )
+            else:
+                regime = self.regime_engine.evaluate_snapshot(snapshot)
+                regime_meta = getattr(self.regime_engine, "last_metadata", {}) or {}
+                rf = regime_meta.get("features") or {}
+                rs = regime_meta.get("state") or {}
+                feature_summary = {
+                    k: rf.get(k) for k in (
+                        "adx", "choppiness", "efficiency_ratio", "atr_pct",
+                        "wick_instability", "body_quality", "breakout_failure_ratio",
+                        "ema_stack_alignment", "ema_bullish_alignment", "ema_bearish_alignment",
+                        "ema_alignment_edge", "trend_bias", "btc_shock_ratio",
+                    ) if k in rf
+                }
+                state_summary = {
+                    k: rs.get(k) for k in (
+                        "active", "candidate", "pending", "pending_count",
+                        "bars", "cooldown", "changed",
+                    ) if k in rs
+                }
+                self.audit.event(
+                    "REGIME_EVALUATED", decision_id, user_id=user_id,
+                    mode=self.execution_mode, symbol=snapshot.symbol,
+                    state=regime.global_state.value, score=regime.core_score,
+                    candidate=regime_meta.get("candidate"), active=regime_meta.get("active"),
+                    confidence=regime_meta.get("confidence"), scores=regime_meta.get("scores"),
+                    regime_direction=getattr(getattr(regime, "direction", None), "value", str(getattr(regime, "direction", "UNKNOWN"))),
+                    features=feature_summary, state_machine=state_summary,
+                    breakout_allowed=regime.breakout_allowed, sweep_allowed=regime.sweep_allowed,
+                    hard_block=regime.hard_block, risk_multiplier=regime.risk_multiplier,
+                )
+
+                self._funnel("analyzed", user_id=user_id, symbol=snapshot.symbol)
+                try:
+                    router_params = inspect.signature(self.router.evaluate).parameters.values()
+                    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in router_params) or any(
+                        p.name == "regime_metadata" for p in router_params
+                    ):
+                        router_kwargs["regime_metadata"] = regime_meta
+                except (TypeError, ValueError):
+                    pass
+
+                supports_armed = (
+                    self.armed_entry_enabled
+                    and hasattr(self.router, "discover_armed")
+                    and hasattr(self.router, "trigger_armed")
+                    and bool(getattr(snapshot, "timeframes", None))
+                )
+                if supports_armed:
+                    armed = self.armed_setups.get(snapshot.symbol)
+                    if armed is not None:
+                        status, intent, armed_trace = self.router.trigger_armed(armed, snapshot, decision_id)
+                        strategy_trace = getattr(self.router, "last_trace", {}) or {}
+                        if status == "cancelled":
+                            self.armed_setups.pop(snapshot.symbol, None)
+                            reason = str((armed_trace or {}).get("reason") or "armed_setup_cancelled")
+                            self._schedule_armed_terminal(user_id, armed, reason)
+                            self.last_rejection = reason
+                            self.last_decision[key] = now
+                            self._funnel("armed_cancelled", reason, user_id=user_id, symbol=snapshot.symbol)
+                            self.audit.event(
+                                "SETUP_CANCELLED", decision_id, user_id=user_id,
+                                mode=self.execution_mode, symbol=snapshot.symbol,
+                                setup_id=getattr(armed, "setup_id", None), reason=reason,
+                                source="scanner", trace=armed_trace,
+                            )
+                            return None
+                        if status == "pending":
+                            reason = str((armed_trace or {}).get("reason") or "armed_waiting")
+                            self.last_rejection = reason
+                            self._funnel("armed_pending", reason, user_id=user_id, symbol=snapshot.symbol)
+                            self.audit.event(
+                                "SETUP_PENDING", decision_id, level="DEBUG", persist=False,
+                                user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                                setup_id=getattr(armed, "setup_id", None), reason=reason,
+                                trace=armed_trace,
+                            )
+                            return None
+                        self.armed_setups.pop(snapshot.symbol, None)
+                        self._schedule_armed_terminal(user_id, armed, "setup_triggered")
+                        self._funnel("triggered", user_id=user_id, symbol=snapshot.symbol)
+                        self.audit.event(
+                            "SETUP_TRIGGERED", decision_id, user_id=user_id,
+                            mode=self.execution_mode, symbol=snapshot.symbol,
+                            setup_id=getattr(armed, "setup_id", None),
+                            strategy=getattr(getattr(intent, "strategy", None), "value", None),
+                            direction=getattr(getattr(intent, "direction", None), "value", None),
+                            source="scanner", trace=armed_trace,
+                        )
+                    else:
+                        armed = self.router.discover_armed(
+                            regime, snapshot, snapshot.symbol, snapshot.timeframe,
+                            regime_metadata=regime_meta,
+                        )
+                        strategy_trace = getattr(self.router, "last_trace", {}) or {}
+                        if armed is not None:
+                            self.armed_setups[snapshot.symbol] = armed
+                            await self._persist_armed_active(user_id, armed)
+                            self.last_rejection = "setup_armed_waiting_trigger"
+                            self._funnel("armed", user_id=user_id, symbol=snapshot.symbol)
+                            self.audit.event(
+                                "SETUP_ARMED", decision_id, user_id=user_id,
+                                mode=self.execution_mode, symbol=snapshot.symbol,
+                                setup_id=armed.setup_id, strategy=armed.strategy.value,
+                                direction=armed.direction.value, quality=armed.quality,
+                                trigger_price=armed.trigger_price, invalidation_price=armed.invalidation_price,
+                                entry_zone_low=armed.entry_zone_low, entry_zone_high=armed.entry_zone_high,
+                                stop_price=armed.stop_price, target_price=armed.target_price,
+                                expires_at_ms=armed.expires_at_ms, priority_monitor=True,
+                            )
+                            return None
+                        if not self.legacy_entry_fallback_enabled:
+                            armed_trace = strategy_trace.get("armed") if isinstance(strategy_trace, dict) else {}
+                            rejection_reason = str((armed_trace or {}).get("reason") or "no_armable_setup")
+                            self.last_rejection = rejection_reason
+                            self.last_decision[key] = now
+                            self._funnel("strategy_rejected", rejection_reason, user_id=user_id, symbol=snapshot.symbol)
+                            self.audit.event(
+                                "STRATEGY_EVALUATED", decision_id, user_id=user_id,
+                                mode=self.execution_mode, symbol=snapshot.symbol,
+                                regime=regime_meta.get("active"),
+                                selected_direction=None, trace=strategy_trace,
+                            )
+                            self.audit.event(
+                                "SIGNAL_REJECTED", decision_id, user_id=user_id,
+                                mode=self.execution_mode, symbol=snapshot.symbol,
+                                regime=regime_meta.get("active"), reason=rejection_reason,
+                            )
+                            return None
+
+                # Legacy immediate-entry path remains available for tests/custom routers
+                # and can be explicitly enabled in production as a rollback switch.
+                if intent is None:
+                    intent = self.router.evaluate(
+                        regime, snapshot.candles, decision_id, snapshot.symbol,
+                        snapshot.timeframe, snapshot.last, **router_kwargs,
+                    )
+                    strategy_trace = getattr(self.router, "last_trace", {}) or {}
 
             compact_trace = {
                 "selected": strategy_trace.get("selected"),
@@ -981,9 +1094,16 @@ class TradingOrchestrator:
                 return {'accepted': False, 'filled': False, 'reason': 'execution_pending'}
             if self.entry_guard is not None and not self.entry_guard():
                 raise RuntimeError('trading_worker_lease_expired')
-            if snapshot.candles:
+            armed_setup_id = str((getattr(intent, 'metadata', {}) or {}).get('armed_setup_id') or '')
+            claim_id = None
+            if armed_setup_id:
+                # Durable idempotency for priority-triggered setups. This survives a
+                # worker restart even when the priority snapshot has no 5m candles.
+                claim_id = f'{user_id}:{self.execution_mode}:armed:{armed_setup_id}'
+            elif snapshot.candles:
                 bar_ts = snapshot.candles[-1].timestamp
                 claim_id = f'{user_id}:{self.execution_mode}:{snapshot.symbol}:{bar_ts}'
+            if claim_id:
                 claim = await asyncio.to_thread(self.db.set_once, 'signal_claims', {'claim_id': claim_id}, {
                     'decision_id': decision_id, 'expires_at': datetime.now(timezone.utc) + timedelta(days=7),
                 })

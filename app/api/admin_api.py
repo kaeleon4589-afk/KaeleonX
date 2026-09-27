@@ -72,7 +72,7 @@ def clean(doc):
     if not doc:
         return None
     out = dict(doc)
-    for key in ('_id', 'password_hash'):
+    for key in ('_id', 'password_hash', 'recovery_code_hash'):
         out.pop(key, None)
     return out
 

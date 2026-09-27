@@ -108,21 +108,106 @@ def test_v6_waits_for_closed_1m_confirmation_then_builds_trade_intent():
     assert trace["execution_rr"] >= 1.10
 
 
-def test_v6_cancels_setup_instead_of_chasing_price_outside_entry_zone():
-    engine = ArmedEntryEngine(ttl_seconds=600)
+def test_v61_small_overshoot_does_not_cancel_setup_as_chased():
+    engine = ArmedEntryEngine(ttl_seconds=600, chase_tolerance_atr=0.15)
     setup = engine.discover(
         _range_regime(), _range_sweep_snapshot(), "TEST", "5m",
         {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
     )
     assert setup is not None
+    atr_value = float(setup.metadata["atr_value"])
     snap = _range_sweep_snapshot()
-    snap.timeframes["1m"] = [Candle(i * 60_000, 100, 101, 99.9, 100.8, 100) for i in range(30)]
-    snap.ask = setup.entry_zone_high + 0.01
-    snap.bid = snap.ask - 0.01
+    # This is outside the old hard boundary but well inside the new 0.15 ATR buffer.
+    snap.ask = setup.entry_zone_high + atr_value * 0.05
+    snap.bid = snap.ask - atr_value * 0.01
+    status, intent, trace = engine.trigger(setup, snap, "decision-small-overshoot")
+    assert status == "pending"
+    assert intent is None
+    assert trace["reason"] in {"waiting_1m_confirmation", "waiting_fresh_1m_confirmation"}
+
+
+def test_v61_cancels_setup_only_after_price_exceeds_atr_chase_buffer():
+    engine = ArmedEntryEngine(ttl_seconds=600, chase_tolerance_atr=0.15)
+    setup = engine.discover(
+        _range_regime(), _range_sweep_snapshot(), "TEST", "5m",
+        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+    )
+    assert setup is not None
+    atr_value = float(setup.metadata["atr_value"])
+    snap = _range_sweep_snapshot()
+    snap.ask = setup.entry_zone_high + atr_value * 0.22
+    snap.bid = snap.ask - atr_value * 0.01
     status, intent, trace = engine.trigger(setup, snap, "decision-3")
     assert status == "cancelled"
     assert intent is None
     assert trace["reason"] == "setup_chased"
+    assert trace["chase_limit"] > setup.entry_zone_high
+
+
+def test_v61_fresh_1m_close_can_confirm_inside_trigger_tolerance_band():
+    engine = ArmedEntryEngine(
+        ttl_seconds=600, chase_tolerance_atr=0.15, trigger_close_tolerance_atr=0.08
+    )
+    base = _range_sweep_snapshot()
+    setup = engine.discover(
+        _range_regime(), base, "TEST", "5m",
+        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+    )
+    assert setup is not None
+    atr_value = float(setup.metadata["atr_value"])
+    close = setup.trigger_price - atr_value * 0.04
+    micro_start = setup.armed_at_ms - 29 * 60_000
+    micro = [
+        Candle(micro_start + i * 60_000, close - 0.02, close + 0.03, close - 0.03, close, 100.0)
+        for i in range(30)
+    ]
+    micro[-1] = Candle(
+        setup.armed_at_ms + 1,
+        close - atr_value * 0.04,
+        close + atr_value * 0.02,
+        close - atr_value * 0.05,
+        close,
+        180.0,
+    )
+    snap = SimpleNamespace(**vars(base))
+    snap.timeframes = {"5m": base.candles, "1m": micro}
+    snap.ask = setup.trigger_price + atr_value * 0.01
+    snap.bid = snap.ask - atr_value * 0.01
+
+    status, intent, trace = engine.trigger(setup, snap, "decision-trigger-band")
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["reason"] == "micro_confirmation_1m"
+    assert close < setup.trigger_price
+    assert setup.trigger_price - close <= trace["trigger_close_buffer"]
+
+
+def test_v61_cancelled_structure_is_consumed_and_not_rearmed():
+    engine = ArmedEntryEngine(
+        ttl_seconds=600, chase_tolerance_atr=0.15, consumed_ttl_seconds=3600
+    )
+    base = _range_sweep_snapshot()
+    setup = engine.discover(
+        _range_regime(), base, "TEST", "5m",
+        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+    )
+    assert setup is not None
+    atr_value = float(setup.metadata["atr_value"])
+    chased = SimpleNamespace(**vars(base))
+    chased.ask = setup.entry_zone_high + atr_value * 0.22
+    chased.bid = chased.ask - atr_value * 0.01
+    status, intent, trace = engine.trigger(setup, chased, "decision-consume")
+    assert status == "cancelled"
+    assert intent is None
+    assert trace["reason"] == "setup_chased"
+
+    rediscovered = engine.discover(
+        _range_regime(), base, "TEST", "5m",
+        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+    )
+    assert rediscovered is None
+    assert engine.last_trace["reason"] == "setup_consumed_waiting_new_structure"
+    assert setup.setup_id in engine.last_trace["consumed_setup_ids"]
 
 
 def test_v6_setup_expiry_is_bounded():

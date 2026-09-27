@@ -85,6 +85,50 @@ class MarketCoordinator:
                                last=(bid + ask) / 2, quote_received_ms=int(time.time() * 1000),
                                orderbook_valid=True, data_complete=False, monitor_only=True)
 
+    async def armed_snapshot(self, symbol):
+        """Lightweight high-priority snapshot for an already ARMED setup.
+
+        Discovery still uses the full 5m/15m/1h snapshot. After a setup has passed
+        those filters, triggering only needs an executable order-book quote and a
+        fresh CLOSED 1m candle. Fetching only those two feeds keeps the follow-up
+        fast without multiplying the expensive scanner traffic.
+        """
+        quote_result, micro_result = await asyncio.gather(
+            self.quote(symbol), self.client.klines(symbol, '1m', 61),
+            return_exceptions=True,
+        )
+        if isinstance(quote_result, Exception):
+            raise quote_result
+        quote = quote_result
+        frames = {}
+        if isinstance(micro_result, Exception):
+            if self.audit:
+                self.audit.event(
+                    'MARKET_MICRODATA_ERROR', 'system', level='WARNING',
+                    symbol=symbol, error=f'{type(micro_result).__name__}: {micro_result}',
+                )
+        else:
+            now = int(time.time() * 1000)
+            span = TF_MS['1m']
+            micro = [c for c in self._parse_klines(micro_result) if c.timestamp + span <= now]
+            if len(micro) >= 20:
+                recent = micro[-min(30, len(micro)):]
+                fresh = now - recent[-1].timestamp <= span * 2 + 15_000
+                contiguous = all(b.timestamp - a.timestamp == span for a, b in zip(recent, recent[1:]))
+                if fresh and contiguous:
+                    frames['1m'] = micro
+                elif self.audit:
+                    self.audit.event(
+                        'MARKET_MICRODATA_INVALID', 'system', level='WARNING',
+                        symbol=symbol, bars=len(micro), fresh=fresh, contiguous=contiguous,
+                    )
+        quote.candles = []
+        quote.timeframes = frames
+        quote.data_complete = bool(frames.get('1m'))
+        quote.monitor_only = True
+        quote.armed_monitor = True
+        return quote
+
     async def snapshot(self, symbol=None, btc_candles=None):
         sym = symbol or self.symbol
         k5, k15, k1h = await asyncio.gather(
@@ -146,13 +190,14 @@ class MarketCoordinator:
 
 class MultiMarketCoordinator:
     def __init__(self, client, scanner, poll_seconds=2.0, audit=None, max_parallel=3,
-                 heartbeat_seconds=900.0):
+                 heartbeat_seconds=900.0, armed_poll_seconds=None):
         self.client = client
         self.scanner = scanner
         self.poll_seconds = poll_seconds
         self.audit = audit
         self.max_parallel = max_parallel
         self.heartbeat_seconds = heartbeat_seconds
+        self.armed_poll_seconds = float(armed_poll_seconds if armed_poll_seconds is not None else poll_seconds)
         self._btc = None
         self._cursor = 0
         self._last_heartbeat = 0.0
@@ -177,6 +222,32 @@ class MultiMarketCoordinator:
                 if self.audit:
                     self.audit.event('MARKET_LOOP_ERROR', 'system', error=str(exc), symbol='MONITOR')
             await asyncio.sleep(self.poll_seconds)
+
+    async def monitor_armed(self, on_snapshot, symbols_provider):
+        """Prioritise ARMED symbols independently from the discovery rotation."""
+        base = MarketCoordinator(self.client, 'BTC', audit=self.audit)
+        while True:
+            started = time.monotonic()
+            try:
+                symbols = sorted(set(symbols_provider()))
+                if symbols:
+                    snaps = await asyncio.gather(
+                        *(base.armed_snapshot(symbol) for symbol in symbols),
+                        return_exceptions=True,
+                    )
+                    for symbol, snap in zip(symbols, snaps):
+                        if isinstance(snap, Exception):
+                            if self.audit:
+                                self.audit.event(
+                                    'MARKET_SNAPSHOT_ERROR', 'system', symbol=symbol,
+                                    error=f'armed_monitor:{type(snap).__name__}:{snap}',
+                                )
+                            continue
+                        await on_snapshot(snap)
+            except Exception as exc:
+                if self.audit:
+                    self.audit.event('MARKET_LOOP_ERROR', 'system', error=str(exc), symbol='ARMED_MONITOR')
+            await asyncio.sleep(max(.1, self.armed_poll_seconds - (time.monotonic() - started)))
 
     async def run(self, on_snapshot):
         base = MarketCoordinator(self.client, 'BTC', audit=self.audit)

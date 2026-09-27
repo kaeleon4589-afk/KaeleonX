@@ -6,6 +6,7 @@ export type User = {
   plan?: string;
   telegram_verified?: boolean;
   tutorial_completed?: boolean;
+  recovery_code_required?: boolean;
 };
 
 export type TradingConfig = {

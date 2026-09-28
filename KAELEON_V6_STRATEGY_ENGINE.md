@@ -280,3 +280,45 @@ seguir una estructura prometedora mientras se forma en vez de exigir encontrarla
 terminada en una sola visita del scanner.
 
 Validación de software de esta versión: `228 passed` y `python -m compileall -q app scripts` OK.
+
+## v6.7 — Lifecycle observability end-to-end
+
+Production now exposes one stable `lifecycle_id` for the entire setup journey. The
+identifier is created when the precursor enters WATCHING and is propagated unchanged
+through ARMED, trigger confirmation, risk, order submission and the opened position.
+A complete successful journey is therefore grep-able as:
+
+`SETUP_WATCHING -> SETUP_WATCH_PROGRESS -> SETUP_ARMED -> SETUP_ARMED_PROGRESS -> SETUP_TRIGGERED -> SIGNAL_ACCEPTED -> RISK_APPROVED -> ORDER_SUBMITTED -> POSITION_OPENED`
+
+Key rules:
+
+- `SETUP_WATCHING`, watch progress/cancellation, ARMED progress and restore events are
+  now visible at INFO in production logs instead of silently falling below the default
+  Railway log level.
+- Pending progress is emitted when the reason changes and at most once per 60 seconds
+  when the same reason persists, avoiding a 15s/2s log flood.
+- Every lifecycle milestone contains `lifecycle_id`, `watch_id`, `setup_id` when known,
+  strategy, direction and a numeric `stage_order`.
+- A setup promoted from WATCHING copies the precursor lifecycle metadata into the
+  `ArmedSetup`; the triggered `TradeIntent` already inherits that metadata, so the same
+  identifier reaches risk and execution without creating a second journey.
+- Directly-complete setups that skip WATCHING receive `lifecycle_id=setup_id`, so they
+  are still traceable from ARMED onward.
+- `RISK_APPROVED` and `ORDER_SUBMITTED` are explicit INFO milestones. All post-trigger
+  signal/risk/execution rejections include the same lifecycle identifiers and mark the
+  journey terminal with the exact reason.
+- `POSITION_OPENED` includes `lifecycle_complete=true` and the position stores
+  `lifecycle_id`, `watch_id` and `setup_id` for later correlation.
+- Restored WATCHING/ARMED state keeps or reconstructs the lifecycle ID across Railway
+  restarts.
+
+MongoDB also keeps two diagnostic collections:
+
+- `setup_lifecycles`: compact latest-state summary per user/mode/lifecycle.
+- `setup_lifecycle_events`: append-style milestone ledger keyed by `event_id`; this is
+  the authoritative historical path because asynchronous writes cannot erase an older
+  or newer milestone.
+
+This release is observability-only for the strategy itself: it does not change trend
+alignment, BREAKOUT_RETEST rules, Liquidity Sweep rules, ATR, HTF exhaustion, RR,
+SL/TP geometry, 1m confirmation, chase protection or risk sizing.

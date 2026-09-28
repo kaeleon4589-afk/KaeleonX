@@ -129,6 +129,18 @@ class MarketCoordinator:
         quote.armed_monitor = True
         return quote
 
+    async def watch_snapshot(self, symbol):
+        """Full closed-structure snapshot for a precursor already under WATCHING.
+
+        WATCHING is intentionally slower than ARMED monitoring because it only
+        needs new closed 5m/15m/1h structure, not tick-level confirmation.
+        """
+        snap = await self.snapshot(symbol)
+        snap.monitor_only = True
+        snap.watch_monitor = True
+        snap.armed_monitor = False
+        return snap
+
     async def snapshot(self, symbol=None, btc_candles=None):
         sym = symbol or self.symbol
         k5, k15, k1h = await asyncio.gather(
@@ -190,7 +202,7 @@ class MarketCoordinator:
 
 class MultiMarketCoordinator:
     def __init__(self, client, scanner, poll_seconds=2.0, audit=None, max_parallel=3,
-                 heartbeat_seconds=900.0, armed_poll_seconds=None):
+                 heartbeat_seconds=900.0, armed_poll_seconds=None, watching_poll_seconds=15.0):
         self.client = client
         self.scanner = scanner
         self.poll_seconds = poll_seconds
@@ -198,6 +210,7 @@ class MultiMarketCoordinator:
         self.max_parallel = max_parallel
         self.heartbeat_seconds = heartbeat_seconds
         self.armed_poll_seconds = float(armed_poll_seconds if armed_poll_seconds is not None else poll_seconds)
+        self.watching_poll_seconds = float(watching_poll_seconds)
         self._btc = None
         self._cursor = 0
         self._last_heartbeat = 0.0
@@ -248,6 +261,32 @@ class MultiMarketCoordinator:
                 if self.audit:
                     self.audit.event('MARKET_LOOP_ERROR', 'system', error=str(exc), symbol='ARMED_MONITOR')
             await asyncio.sleep(max(.1, self.armed_poll_seconds - (time.monotonic() - started)))
+
+    async def monitor_watching(self, on_snapshot, symbols_provider):
+        """Follow BREAKOUT/LIQUIDITY precursors independently from scanner rotation."""
+        base = MarketCoordinator(self.client, 'BTC', audit=self.audit)
+        while True:
+            started = time.monotonic()
+            try:
+                symbols = sorted(set(symbols_provider()))
+                if symbols:
+                    snaps = await asyncio.gather(
+                        *(base.watch_snapshot(symbol) for symbol in symbols),
+                        return_exceptions=True,
+                    )
+                    for symbol, snap in zip(symbols, snaps):
+                        if isinstance(snap, Exception):
+                            if self.audit:
+                                self.audit.event(
+                                    'MARKET_SNAPSHOT_ERROR', 'system', symbol=symbol,
+                                    error=f'watch_monitor:{type(snap).__name__}:{snap}',
+                                )
+                            continue
+                        await on_snapshot(snap)
+            except Exception as exc:
+                if self.audit:
+                    self.audit.event('MARKET_LOOP_ERROR', 'system', error=str(exc), symbol='WATCH_MONITOR')
+            await asyncio.sleep(max(.1, self.watching_poll_seconds - (time.monotonic() - started)))
 
     async def run(self, on_snapshot):
         base = MarketCoordinator(self.client, 'BTC', audit=self.audit)

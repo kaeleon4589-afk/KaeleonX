@@ -9,6 +9,13 @@ class TradeIntent:
 
 
 @dataclass(frozen=True)
+class SetupWatch:
+    watch_id:str; symbol:str; strategy:Strategy; direction:Direction
+    created_at_ms:int; expires_at_ms:int; timeframe:str='5m'
+    reasons:tuple[str,...]=(); metadata:dict=field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ArmedSetup:
     setup_id:str; symbol:str; strategy:Strategy; direction:Direction
     armed_at_ms:int; expires_at_ms:int; trigger_price:float; invalidation_price:float

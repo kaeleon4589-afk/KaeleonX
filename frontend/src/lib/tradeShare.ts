@@ -23,7 +23,8 @@ export type TradeShareOptions = {
 
 const CARD_WIDTH = 1080;
 const CARD_HEIGHT = 1280;
-const BASE_IMAGE_SRC = '/images/kaeleon-trading-art.jpg';
+const POSITIVE_IMAGE_SRC = '/images/kaeleon-share-positive.png';
+const NEGATIVE_IMAGE_SRC = '/images/kaeleon-share-negative.png';
 
 const money = (n: unknown) =>
   new Intl.NumberFormat('en-US', {
@@ -129,9 +130,10 @@ export async function renderTradeShareCard(snapshot: TradeShareSnapshot, options
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('No fue posible crear la tarjeta para compartir.');
 
-  const accent = (snapshot.pnlValue ?? 0) >= 0 ? '#00e88b' : '#ff365f';
-  const softAccent = (snapshot.pnlValue ?? 0) >= 0 ? 'rgba(0,232,139,0.22)' : 'rgba(255,54,95,0.22)';
-  const bg = await loadImage(BASE_IMAGE_SRC);
+  const isPositive = (snapshot.pnlValue ?? 0) >= 0;
+  const accent = isPositive ? '#00e88b' : '#ff365f';
+  const softAccent = isPositive ? 'rgba(0,232,139,0.22)' : 'rgba(255,54,95,0.22)';
+  const bg = await loadImage(isPositive ? POSITIVE_IMAGE_SRC : NEGATIVE_IMAGE_SRC);
 
   ctx.fillStyle = '#020910';
   ctx.fillRect(0, 0, CARD_WIDTH, CARD_HEIGHT);

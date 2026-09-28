@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -779,12 +780,15 @@ class ArmedEntryEngine:
                 continue
             created, expires = self._watch_expiry()
             candle_ts = int(getattr(c5[idx], "timestamp", created))
+            watch_id = f"{symbol}:BRW:{candle_ts}:{required_direction.value}"
             watch = SetupWatch(
-                watch_id=f"{symbol}:BRW:{candle_ts}:{required_direction.value}",
+                watch_id=watch_id,
                 symbol=symbol, strategy=Strategy.BREAKOUT_RETEST, direction=required_direction,
                 created_at_ms=created, expires_at_ms=expires, timeframe=timeframe,
                 reasons=("breakout_detected", "waiting_retest"),
                 metadata={
+                    "lifecycle_id": watch_id,
+                    "lifecycle_origin": "breakout_precursor",
                     "watch_model": "breakout_retest_watch_v1",
                     "breakout_candle_ts": candle_ts,
                     "structural_level": float(structural_level),
@@ -853,12 +857,15 @@ class ArmedEntryEngine:
             }
             return None
         created, expires = self._watch_expiry()
+        watch_id = f"{symbol}:LSW:{int(getattr(c5[i], 'timestamp', created))}:{required_direction.value}"
         watch = SetupWatch(
-            watch_id=f"{symbol}:LSW:{int(getattr(c5[i], 'timestamp', created))}:{required_direction.value}",
+            watch_id=watch_id,
             symbol=symbol, strategy=Strategy.LIQUIDITY_SWEEP, direction=required_direction,
             created_at_ms=created, expires_at_ms=expires, timeframe=timeframe,
             reasons=("trend_aligned_liquidity_pool_near", "waiting_sweep_reclaim"),
             metadata={
+                "lifecycle_id": watch_id,
+                "lifecycle_origin": "liquidity_precursor",
                 "watch_model": "liquidity_sweep_watch_v1",
                 "liquidity_level": float(level), "atr_value_at_watch": float(atr5),
                 "proximity_atr": float(proximity), "trend_direction": required_direction.value,
@@ -922,7 +929,19 @@ class ArmedEntryEngine:
             setup = self._discover_breakout(regime, snapshot, watch.symbol, watch.timeframe, meta)
             trace = dict(self.branch_trace.get("breakout") or {})
             if setup is not None and setup.direction == watch.direction:
-                return "armed", setup, {"reason": "retest_completed", "watch_id": watch.watch_id, **trace}
+                lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
+                setup = replace(
+                    setup,
+                    metadata={
+                        **dict(setup.metadata or {}),
+                        "lifecycle_id": lifecycle_id,
+                        "lifecycle_origin": str((watch.metadata or {}).get("lifecycle_origin") or "breakout_precursor"),
+                        "origin_watch_id": watch.watch_id,
+                        "watch_created_at_ms": int(watch.created_at_ms),
+                        "watch_promoted_at_ms": now_ms,
+                    },
+                )
+                return "armed", setup, {"reason": "retest_completed", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id, **trace}
             reason = str(trace.get("reason") or "waiting_retest")
             fatal = reason in {"mtf_bias_conflict_with_trend", "breakout_no_directional_trend", "higher_timeframe_move_exhausted"}
             if fatal:
@@ -939,7 +958,19 @@ class ArmedEntryEngine:
         setup = self._discover_sweep(regime, snapshot, watch.symbol, watch.timeframe, meta)
         trace = dict(self.branch_trace.get("sweep") or {})
         if setup is not None and setup.direction == watch.direction:
-            return "armed", setup, {"reason": "sweep_reclaimed", "watch_id": watch.watch_id, **trace}
+            lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
+            setup = replace(
+                setup,
+                metadata={
+                    **dict(setup.metadata or {}),
+                    "lifecycle_id": lifecycle_id,
+                    "lifecycle_origin": str((watch.metadata or {}).get("lifecycle_origin") or "liquidity_precursor"),
+                    "origin_watch_id": watch.watch_id,
+                    "watch_created_at_ms": int(watch.created_at_ms),
+                    "watch_promoted_at_ms": now_ms,
+                },
+            )
+            return "armed", setup, {"reason": "sweep_reclaimed", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id, **trace}
         reason = str(trace.get("reason") or "waiting_sweep_reclaim")
         if reason in {"liquidity_sweep_trend_conflict", "liquidity_sweep_no_directional_trend"}:
             return "cancelled", None, {"reason": reason, "watch_id": watch.watch_id, **trace}

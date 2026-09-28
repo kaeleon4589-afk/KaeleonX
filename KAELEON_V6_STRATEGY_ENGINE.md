@@ -6,7 +6,7 @@ Base de implementación: `KaeleonX-breakout-retest-v5-exhaustion-stop.zip`.
 
 La v6 corrige el conflicto de la v5 entre "entrar temprano" y exigir confirmaciones/stop que obligaban a esperar demasiado. El cambio principal es separar la detección del setup de la ejecución:
 
-`5m estructura -> SETUP_ARMED -> 1m confirmación -> precio ejecutable -> orden`
+`5m precursor -> SETUP_WATCHING -> SETUP_ARMED -> 1m confirmación -> precio ejecutable -> orden`
 
 Ya no se necesita esperar una vela 5m desarrollada para crear la orden.
 
@@ -14,7 +14,7 @@ Ya no se necesita esperar una vela 5m desarrollada para crear la orden.
 
 1. El régimen sigue aportando contexto, pero no bloquea por duplicado todos los setups.
 2. `BREAKOUT_RETEST` puede armarse después de breakout + retest válido, antes de una confirmación 5m tardía.
-3. `LIQUIDITY_SWEEP` puede armarse en `VOLATILE_SWEEP` y también en `RANGE` cuando la estructura del sweep es válida.
+3. `LIQUIDITY_SWEEP` solo puede progresar con dirección de tendencia clara; `RANGE` es shadow-only y no genera órdenes.
 4. El setup guarda trigger, invalidación, zona máxima de entrada, SL, TP, calidad y expiración.
 5. La entrada necesita una vela 1m cerrada con dirección, cuerpo, posición de cierre y volumen relativo compatibles.
 6. Si el precio invalida la estructura, excede la zona de entrada o expira el setup, se cancela sin ordenar.
@@ -25,7 +25,7 @@ Ya no se necesita esperar una vela 5m desarrollada para crear la orden.
 - `TRADE_ENTRY_MIN_STOP_ATR` baja de `0.90` a `0.30` en producción. Es un filtro final de ruido, no un segundo sistema de stop.
 - La v6 usa el stop estructural propio del setup y no exige el antiguo piso de `0.95 ATR` del modelo v5 para poder armar una entrada.
 - El anti-chase continúa activo, pero la v6 además tiene `entry_zone_low` / `entry_zone_high`; si el precio se escapa de esa zona el setup se cancela.
-- `UNKNOWN` continúa bloqueado. `RANGE` deja de significar "ninguna estrategia posible" para sweeps de alta calidad.
+- `UNKNOWN` continúa bloqueado y `RANGE` es shadow-only: no origina órdenes de Liquidity Sweep.
 - El modelo de capital no cambia: `RiskManager` sigue usando el capital configurado como margen y no dimensiona por porcentaje de riesgo del stop.
 
 ## Micro-confirmación 1m
@@ -82,7 +82,7 @@ El router v5 se conserva. Routers de tests o integraciones que no implementen `d
 - `pytest -q`: **187 passed**
 - `python -m compileall -q app`: sin errores
 - pruebas v6 añadidas para:
-  - sweep armable en `RANGE`
+  - bloqueo de sweep en `RANGE`
   - espera obligatoria de confirmación 1m
   - creación de `TradeIntent` después del trigger
   - cancelación por chase fuera de zona
@@ -227,3 +227,56 @@ Para evitar que un deploy permita ejecutar setups antiguos creados antes de esta
 - If no fresh BREAKOUT_RETEST is armable, the engine now evaluates the aligned LIQUIDITY_SWEEP directly; it no longer requires an extra `VOLATILE_SWEEP >= 2` score before even checking the sweep structure.
 - This does not loosen sweep quality: real liquidity sweep/reclaim geometry, ATR, structural stop, target/RR and 1m execution confirmation remain mandatory.
 - The ARMED breakout/retest discovery window is widened from 4 to 5 closed 5m bars. Retest penetration, last-close proximity, extension, MTF alignment, HTF exhaustion, structural stop and minimum RR remain unchanged.
+
+
+## v6.6 — WATCHING de precursores y BREAKOUT_RETEST de primera clase
+
+El diagnóstico de producción mostró el fallo arquitectónico principal: el scanner
+solo podía crear `ARMED` cuando encontraba la figura completa en una visita aislada.
+Con rotación de símbolos, un breakout podía ocurrir en una visita y completar el
+retest antes de que el scanner regresara; lo mismo ocurría con un precio que se
+acercaba a una piscina de liquidez y barría/reclamaba entre dos visitas.
+
+La v6.6 introduce un estado anterior a ARMED:
+
+`scanner -> precursor -> SETUP_WATCHING -> estructura completa -> SETUP_ARMED -> 1m -> TRIGGERED`
+
+### BREAKOUT_RETEST
+
+- Un breakout estructural válido crea `SETUP_WATCHING` inmediatamente, aunque el
+  retest todavía no exista.
+- El símbolo deja de depender de la rotación normal y entra en un monitor estructural
+  propio.
+- El monitor sigue 5m/15m/1h cerrados hasta que el retest cumple touch, penetración,
+  cierres, distancia, stop estructural, target y RR.
+- Si completa esas reglas, pasa a `SETUP_ARMED`; si envejece fuera de la ventana,
+  cambia la estructura o aparece conflicto/agotamiento, el watch termina sin orden.
+- La autoridad de dirección es única: `regime_direction + trend_bias`. 1H/15M ya no
+  necesitan producir un bias no-neutro para que la estrategia exista, pero un bias
+  explícitamente opuesto sí bloquea con `mtf_bias_conflict_with_trend`.
+
+### LIQUIDITY_SWEEP
+
+- En tendencia alcista solo se crea WATCHING/ARMED LONG; en tendencia bajista solo SHORT.
+- Cuando el precio queda a <= `0.45 ATR` de la piscina de liquidez relevante, el símbolo
+  entra en WATCHING antes de que el barrido haya terminado.
+- El monitor exige después el mismo sweep/reclaim real, wick, volumen, ATR, stop y RR
+  del motor ARMED. WATCHING no constituye una señal ni una orden.
+- `RANGE`, tendencia neutral y conflicto direccional continúan bloqueados.
+
+### Monitor y persistencia
+
+- `MultiMarketCoordinator.monitor_watching()` sigue los símbolos WATCHING fuera del scanner.
+- Cadencia por defecto: `TRADE_SETUP_WATCH_POLL_SECONDS=15`.
+- TTL por defecto: `TRADE_SETUP_WATCH_TTL_SECONDS=1800`.
+- WATCHING se persiste en MongoDB (`setup_watches`) con TTL y se restaura después de restart.
+- `SETUP_WATCHING`, `SETUP_WATCH_PENDING`, `SETUP_WATCH_CANCELLED` y el `SETUP_ARMED`
+  promovido desde watch dejan trazabilidad explícita.
+- ARMED conserva su monitor ligero de ~2 s con quote/orderbook + 1m cerrado.
+
+Este cambio no baja RR, no elimina HTF exhaustion, no permite Liquidity Sweep contra
+la tendencia y no convierte un precursor en operación. Corrige el problema temporal:
+seguir una estructura prometedora mientras se forma en vez de exigir encontrarla ya
+terminada en una sola visita del scanner.
+
+Validación de software de esta versión: `228 passed` y `python -m compileall -q app scripts` OK.

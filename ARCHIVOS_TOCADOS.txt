@@ -1,11 +1,20 @@
 MODIFICADOS
-app/strategy/armed_entry.py
-tests/test_armed_entry_v6.py
-KAELEON_V6_STRATEGY_ENGINE.md
+.env.example
 ARCHIVOS_TOCADOS.txt
+KAELEON_V6_STRATEGY_ENGINE.md
+app/config/settings.py
+app/main.py
+app/market/coordinator.py
+app/models/trading.py
+app/orchestrator.py
+app/storage/database.py
+app/strategy/armed_entry.py
+app/strategy/router.py
+app/trading/runtime.py
+tests/test_armed_entry_v6.py
 
 NUEVOS
 ninguno
 
 ELIMINADOS
-frontend/public/images/kaeleon-trading-art.jpg
+ninguno

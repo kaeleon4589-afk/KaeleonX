@@ -204,3 +204,17 @@ Runtime controls (defaults are already in code, so Railway does not require them
 
 This release does **not** relax MTF bias, HTF exhaustion, ATR range, setup quality
 discovery, structural stop, TP caps, consumed setup protection, or executable RR.
+
+## v6.4 — Liquidity Sweep alineado con tendencia
+
+Regla obligatoria de ejecución:
+
+- Tendencia BULLISH / trend_bias=long -> LIQUIDITY_SWEEP solo puede armar LONG.
+- Tendencia BEARISH / trend_bias=short -> LIQUIDITY_SWEEP solo puede armar SHORT.
+- Tendencia NEUTRAL/UNKNOWN -> LIQUIDITY_SWEEP no puede armarse.
+- Si `regime.direction` y `features.trend_bias` entran en conflicto -> no se arma el sweep.
+- `RANGE` vuelve a ser shadow-only y no es fuente de órdenes Liquidity Sweep.
+
+En `TREND_CONTINUATION`, `BREAKOUT_RETEST` tiene prioridad. Solo cuando no existe un breakout/retest armable puede probarse un Liquidity Sweep secundario, y siempre en la misma dirección de la tendencia. La ventana de frescura de breakout/retest del motor ARMED se amplía moderadamente de 3 a 4 velas de 5m, manteniendo MTF, HTF exhaustion, estructura de retest, RR, SL y confirmación 1m.
+
+Para evitar que un deploy permita ejecutar setups antiguos creados antes de esta regla, todo nuevo setup Liquidity Sweep guarda `trend_aligned=true`, `trend_direction_at_arm` y `trend_alignment_guard_version=1`. Un setup persistido sin ese sello se cancela antes del trigger.

@@ -1,13 +1,11 @@
 MODIFICADOS
-ARCHIVOS_TOCADOS.txt
-KAELEON_V6_STRATEGY_ENGINE.md
 app/strategy/armed_entry.py
-app/strategy/liquidity_sweep.py
 tests/test_armed_entry_v6.py
-tests/test_entry_geometry_risk.py
+KAELEON_V6_STRATEGY_ENGINE.md
+ARCHIVOS_TOCADOS.txt
 
 NUEVOS
 ninguno
 
 ELIMINADOS
-ninguno
+frontend/public/images/kaeleon-trading-art.jpg

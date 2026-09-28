@@ -218,3 +218,12 @@ Regla obligatoria de ejecución:
 En `TREND_CONTINUATION`, `BREAKOUT_RETEST` tiene prioridad. Solo cuando no existe un breakout/retest armable puede probarse un Liquidity Sweep secundario, y siempre en la misma dirección de la tendencia. La ventana de frescura de breakout/retest del motor ARMED se amplía moderadamente de 3 a 4 velas de 5m, manteniendo MTF, HTF exhaustion, estructura de retest, RR, SL y confirmación 1m.
 
 Para evitar que un deploy permita ejecutar setups antiguos creados antes de esta regla, todo nuevo setup Liquidity Sweep guarda `trend_aligned=true`, `trend_direction_at_arm` y `trend_alignment_guard_version=1`. Un setup persistido sin ese sello se cancela antes del trigger.
+
+
+## v6.5 — Trend-continuation opportunity balance
+
+- LIQUIDITY_SWEEP remains hard-aligned with the detected trend: BULLISH -> LONG only, BEARISH -> SHORT only, neutral/conflict -> blocked.
+- In TREND_CONTINUATION, a valid BREAKOUT_RETEST keeps first priority.
+- If no fresh BREAKOUT_RETEST is armable, the engine now evaluates the aligned LIQUIDITY_SWEEP directly; it no longer requires an extra `VOLATILE_SWEEP >= 2` score before even checking the sweep structure.
+- This does not loosen sweep quality: real liquidity sweep/reclaim geometry, ATR, structural stop, target/RR and 1m execution confirmation remain mandatory.
+- The ARMED breakout/retest discovery window is widened from 4 to 5 closed 5m bars. Retest penetration, last-close proximity, extension, MTF alignment, HTF exhaustion, structural stop and minimum RR remain unchanged.

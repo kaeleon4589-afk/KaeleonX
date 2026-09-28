@@ -1,10 +1,15 @@
 MODIFICADOS
+frontend/src/components/Brand.tsx
+frontend/src/pages/AuthPage.tsx
+frontend/src/pages/DashboardPage.tsx
 frontend/src/components/trading/TradeShareModal.tsx
 frontend/src/lib/tradeShare.ts
 frontend/src/styles.css
 tests/test_trade_share_referral_card_contract.py
+ARCHIVOS_TOCADOS.txt
 
 NUEVOS
+frontend/public/images/kaeleon-brand-primary.png
 frontend/public/images/kaeleon-share-positive.png
 frontend/public/images/kaeleon-share-negative.png
 

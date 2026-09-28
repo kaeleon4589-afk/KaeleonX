@@ -24,7 +24,7 @@ from app.trading.profile import UserTradingProfileService
 from app.trading.persistence import TradePersistence
 from app.trading.metrics import calculate_performance, position_net_pnl
 from app.trading.statistics import TradingStatistics
-from app.models.trading import Position, ArmedSetup
+from app.models.trading import Position, ArmedSetup, SetupWatch
 from app.models.enums import Direction, Strategy
 
 
@@ -199,6 +199,7 @@ class UserTradingRuntimeManager:
                 armed_consumed_ttl_seconds=self.settings.trade_armed_consumed_ttl_seconds,
                 armed_fast_confirm_enabled=self.settings.trade_armed_fast_confirm_enabled,
                 armed_fast_confirm_max_age_seconds=self.settings.trade_armed_fast_confirm_max_age_seconds,
+                setup_watch_ttl_seconds=self.settings.trade_setup_watch_ttl_seconds,
             ),
             RiskManager(
                 max_leverage=self.settings.fixed_leverage,
@@ -280,6 +281,42 @@ class UserTradingRuntimeManager:
                 self.audit.event(
                     "SETUP_RESTORE_ERROR", str(armed_row.get("setup_id") or user_id), level="ERROR",
                     user_id=user_id, mode=mode, symbol=armed_row.get("symbol"), error=str(exc),
+                )
+
+        persisted_watches = await asyncio.to_thread(
+            self.db.find_many, "setup_watches",
+            {"user_id": user_id, "mode": mode, "active": True}, limit=0,
+        )
+        for watch_row in persisted_watches:
+            raw = watch_row.get("watch") if isinstance(watch_row.get("watch"), dict) else watch_row
+            try:
+                if int(raw.get("expires_at_ms") or 0) <= now_ms:
+                    continue
+                strategy = raw.get("strategy")
+                if not isinstance(strategy, Strategy):
+                    strategy = Strategy(str(strategy))
+                direction = raw.get("direction")
+                if not isinstance(direction, Direction):
+                    direction = Direction(str(direction))
+                restored_watch = SetupWatch(
+                    watch_id=str(raw["watch_id"]), symbol=str(raw["symbol"]),
+                    strategy=strategy, direction=direction,
+                    created_at_ms=int(raw["created_at_ms"]), expires_at_ms=int(raw["expires_at_ms"]),
+                    timeframe=str(raw.get("timeframe") or "5m"),
+                    reasons=tuple(raw.get("reasons") or ()), metadata=dict(raw.get("metadata") or {}),
+                )
+                if restored_watch.symbol not in orchestrator.armed_setups:
+                    orchestrator.watching_setups[restored_watch.symbol] = restored_watch
+                    self.audit.event(
+                        "SETUP_WATCH_RESTORED", restored_watch.watch_id, user_id=user_id, mode=mode,
+                        symbol=restored_watch.symbol, watch_id=restored_watch.watch_id,
+                        strategy=restored_watch.strategy.value, direction=restored_watch.direction.value,
+                        expires_at_ms=restored_watch.expires_at_ms,
+                    )
+            except (KeyError, TypeError, ValueError) as exc:
+                self.audit.event(
+                    "SETUP_WATCH_RESTORE_ERROR", str(watch_row.get("watch_id") or user_id), level="ERROR",
+                    user_id=user_id, mode=mode, symbol=watch_row.get("symbol"), error=str(exc),
                 )
 
         consumed_rows = await asyncio.to_thread(
@@ -394,6 +431,16 @@ class UserTradingRuntimeManager:
             if int(getattr(setup, "expires_at_ms", 0) or 0) > now_ms
         }
 
+    def watching_symbols(self):
+        """Precursors that need closed-structure follow-up outside scanner rotation."""
+        now_ms = int(time.time() * 1000)
+        return {
+            symbol
+            for runtime in self._runtimes.values()
+            for symbol, watch in runtime.orchestrator.watching_setups.items()
+            if int(getattr(watch, "expires_at_ms", 0) or 0) > now_ms
+        }
+
     async def run_snapshot(self, snapshot) -> None:
         async with self._processing_lock:
             await self._run_snapshot(snapshot)
@@ -410,11 +457,13 @@ class UserTradingRuntimeManager:
             # Risk quotes only visit owners of open/pending exposure. ARMED priority
             # snapshots additionally visit users that own that specific setup.
             armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
+            watch_monitor = bool(getattr(snapshot, 'watch_monitor', False))
             runtimes = [runtime for runtime in runtimes
                         if any(p.status == 'OPEN' and p.symbol == snapshot.symbol
                                for p in runtime.position_manager.positions.values())
                         or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol
-                        or (armed_monitor and snapshot.symbol in runtime.orchestrator.armed_setups)]
+                        or (armed_monitor and snapshot.symbol in runtime.orchestrator.armed_setups)
+                        or (watch_monitor and snapshot.symbol in runtime.orchestrator.watching_setups)]
         for runtime in runtimes:
             try:
                 period = periods[runtime.mode] if periods is not None else None
@@ -446,10 +495,11 @@ class UserTradingRuntimeManager:
                     self.audit.event('ENTRY_BLOCKED', runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='insufficient_capital', effective_capital=effective_capital, minimum=self.settings.min_operating_capital)
 
                 armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
+                watch_monitor = bool(getattr(snapshot, 'watch_monitor', False))
                 allow_entries = (runtime.trading_enabled and live_allowed
                                  and runtime.coinw_verified
                                  and effective_capital >= self.settings.min_operating_capital
-                                 and (not getattr(snapshot, 'monitor_only', False) or armed_monitor))
+                                 and (not getattr(snapshot, 'monitor_only', False) or armed_monitor or watch_monitor))
                 if not allow_entries:
                     self.audit.event('ENTRY_BLOCKED', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='trading_paused' if not runtime.trading_enabled else 'live_not_entitled')
                 result = await runtime.orchestrator.on_snapshot(

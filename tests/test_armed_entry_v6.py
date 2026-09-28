@@ -788,3 +788,87 @@ def test_orchestrator_v66_precursor_moves_watching_to_armed_without_scanner_rota
     assert promoted_setup.metadata["lifecycle_id"] == "BTC:BRW:1:LONG"
     assert promoted_setup.metadata["origin_watch_id"] == "BTC:BRW:1:LONG"
     assert not manager.positions
+
+
+def _v68_near_like_postarm_snapshot(setup, *, orderbook_valid=True):
+    """Reproduce the 2026-09-28 NEAR shape: strong bearish close, ~0.52 RVOL."""
+    close_ms = setup.armed_at_ms + 60_000
+    start = close_ms - 20 * 60_000
+    candles = [
+        Candle(start + i * 60_000, 100.00, 100.05, 99.95, 100.00, 100.0)
+        for i in range(20)
+    ]
+    # Bearish body=0.50, close position=0.20, RVOL=0.52: strong directional
+    # rejection but below the legacy 0.70 RVOL floor.
+    candles[-1] = Candle(
+        close_ms - 60_000,
+        100.04,
+        100.10,
+        99.90,
+        99.94,
+        52.0,
+    )
+    return SimpleNamespace(
+        symbol="FAST",
+        ask=99.99,
+        bid=99.98,
+        last=99.985,
+        timeframes={"1m": candles},
+        quote_received_ms=close_ms + 2_000,
+        orderbook_valid=orderbook_valid,
+        bids=[(99.98, 5.0), (99.97, 4.0), (99.96, 3.0)] if orderbook_valid else [],
+        asks=[(99.99, 5.0), (100.00, 4.0), (100.01, 3.0)] if orderbook_valid else [],
+    )
+
+
+def test_v68_strong_postarm_shape_with_moderate_volume_can_confirm_with_valid_book():
+    setup = _fast_confirm_setup(Direction.SHORT)
+    setup = setup.__class__(**{
+        **setup.__dict__,
+        "quality": 73.21,
+    })
+    engine = ArmedEntryEngine(
+        ttl_seconds=600,
+        chase_tolerance_atr=0.15,
+        trigger_close_tolerance_atr=0.08,
+        fast_confirm_enabled=True,
+        fast_confirm_max_age_seconds=30,
+    )
+    snap = _v68_near_like_postarm_snapshot(setup, orderbook_valid=True)
+
+    status, intent, trace = engine.trigger(setup, snap, "decision-v68-adaptive")
+
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["confirmation_mode"] == "postarm_closed_1m_strong_shape"
+    assert trace["postarm_adaptive_used"] is True
+    assert trace["1m_rvol"] == 0.52
+    assert trace["1m_adaptive_shape_ok"] is True
+    assert trace["execution_rr"] >= 1.10
+    assert "micro_confirmation_1m_adaptive" in intent.reasons
+
+
+def test_v68_adaptive_postarm_confirmation_keeps_quality_and_orderbook_guards():
+    for quality, book_valid in ((71.99, True), (73.21, False)):
+        setup = _fast_confirm_setup(Direction.SHORT)
+        setup = setup.__class__(**{
+            **setup.__dict__,
+            "quality": quality,
+        })
+        engine = ArmedEntryEngine(
+            ttl_seconds=600,
+            chase_tolerance_atr=0.15,
+            trigger_close_tolerance_atr=0.08,
+        )
+        snap = _v68_near_like_postarm_snapshot(setup, orderbook_valid=book_valid)
+
+        status, intent, trace = engine.trigger(
+            setup, snap, f"decision-v68-guard-{quality}-{book_valid}"
+        )
+
+        assert status == "pending"
+        assert intent is None
+        assert trace["reason"] == "waiting_1m_confirmation"
+        assert trace["postarm_adaptive_candidate"] is True
+        assert trace["postarm_adaptive_book_valid"] is book_valid
+        assert trace["postarm_adaptive_setup_quality_ok"] is (quality >= 72.0)

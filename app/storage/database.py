@@ -85,6 +85,15 @@ class Database:
         self.db.armed_setups.create_index('expires_at', expireAfterSeconds=0)
         self.db.setup_watches.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('symbol', ASCENDING)], unique=True)
         self.db.setup_watches.create_index('expires_at', expireAfterSeconds=0)
+        self.db.setup_lifecycles.create_index(
+            [('user_id', ASCENDING), ('mode', ASCENDING), ('lifecycle_id', ASCENDING)],
+            unique=True,
+        )
+        self.db.setup_lifecycles.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('updated_at', DESCENDING)])
+        self.db.setup_lifecycle_events.create_index([('event_id', ASCENDING)], unique=True)
+        self.db.setup_lifecycle_events.create_index(
+            [('user_id', ASCENDING), ('mode', ASCENDING), ('lifecycle_id', ASCENDING), ('stage_at_ms', ASCENDING)]
+        )
         self.db.armed_consumed_setups.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('setup_id', ASCENDING)], unique=True)
         self.db.armed_consumed_setups.create_index('expires_at', expireAfterSeconds=0)
         self.db.users.create_index([('phone', ASCENDING)], unique=True)

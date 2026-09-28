@@ -55,6 +55,7 @@ export default function TradeShareModal({
   const effectivePrice = snapshot.status === 'LIVE' ? snapshot.currentPrice : snapshot.exitPrice;
   const snapshotTime = useMemo(() => snapshot.sharedAt || Date.now(), [snapshot.sharedAt]);
   const [referralQr, setReferralQr] = useState('');
+  const previewBackground = `url('${(snapshot.pnlValue ?? 0) >= 0 ? '/images/kaeleon-share-positive.png' : '/images/kaeleon-share-negative.png'}')`;
   useEffect(() => {
     const url = String(snapshot.referralUrl || '').trim();
     if (!url) {
@@ -107,7 +108,7 @@ export default function TradeShareModal({
           </button>
         </div>
 
-        <div className="share-preview-card">
+        <div className="share-preview-card" style={{ backgroundImage: previewBackground }}>
           <div className={`share-preview-overlay ${accentClass}`}>
             <div className="share-preview-topline">
               <span className={`share-pill mode ${snapshot.mode}`}>{snapshot.mode.toUpperCase()}</span>

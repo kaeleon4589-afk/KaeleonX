@@ -27,3 +27,13 @@ def test_share_card_referral_identity_is_loaded_from_current_user_summary():
     assert "referrals?.referral_code" in dashboard
     assert 'const fresh=await api.referrals()' in dashboard
     assert "if(!code){setNotice('Tu código de referido todavía no está disponible.')" in dashboard
+
+
+def test_trade_share_card_uses_positive_and_negative_brand_images():
+    share = (ROOT / 'frontend/src/lib/tradeShare.ts').read_text(encoding='utf-8')
+    modal = (ROOT / 'frontend/src/components/trading/TradeShareModal.tsx').read_text(encoding='utf-8')
+    assert "kaeleon-share-positive.png" in share
+    assert "kaeleon-share-negative.png" in share
+    assert "pnlValue ?? 0" in share
+    assert "kaeleon-share-positive.png" in modal
+    assert "kaeleon-share-negative.png" in modal

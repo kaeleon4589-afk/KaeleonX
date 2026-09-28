@@ -30,7 +30,7 @@ ARM_MAX_STOP_ATR = 1.80
 BREAKOUT_ENTRY_MAX_EXTENSION_ATR = 0.62
 # Slightly wider freshness window for breakout/retest discovery. The structural,
 # MTF, exhaustion, retest, RR and 1m confirmation gates remain unchanged.
-BREAKOUT_ARM_MAX_RETEST_BARS = max(breakout.RETEST_MAX_BARS_AFTER_BREAKOUT, 4)
+BREAKOUT_ARM_MAX_RETEST_BARS = max(breakout.RETEST_MAX_BARS_AFTER_BREAKOUT, 5)
 SWEEP_ENTRY_MAX_EXTENSION_ATR = 0.90
 MICRO_TRIGGER_MIN_BODY_RATIO = 0.22
 MICRO_TRIGGER_MIN_RVOL = 0.70
@@ -693,7 +693,6 @@ class ArmedEntryEngine:
             self.last_trace = {"accepted": False, "reason": "regime_unknown_hard_block"}
             return None
         active = self._active_regime(regime_metadata)
-        scores = (regime_metadata or {}).get("scores") or {}
         candidates: list[ArmedSetup] = []
         # Strategy hierarchy: in TREND_CONTINUATION a valid BREAKOUT_RETEST has
         # first priority. LIQUIDITY_SWEEP is a secondary trend-following entry
@@ -704,7 +703,6 @@ class ArmedEntryEngine:
             if breakout_item:
                 candidates.append(breakout_item)
 
-        volatile_score = float(scores.get("VOLATILE_SWEEP") or 0.0)
         sweep_permitted = False
         if active == "RANGE":
             self.branch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
@@ -713,13 +711,14 @@ class ArmedEntryEngine:
             if not sweep_permitted:
                 self.branch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
         elif active == "TREND_CONTINUATION":
-            # Never let a sweep compete with a valid trend breakout. When breakout
-            # is absent, volatility evidence may enable an aligned sweep fallback.
-            sweep_permitted = breakout_item is None and volatile_score >= 2.0
+            # Never let a sweep compete with a valid trend breakout. When no fresh
+            # breakout/retest is armable, always *evaluate* the trend-aligned
+            # liquidity branch. The sweep still has to pass its own structural
+            # liquidity, reclaim, ATR, stop and RR gates, and _discover_sweep()
+            # hard-blocks any direction that conflicts with the trend.
+            sweep_permitted = breakout_item is None
             if breakout_item is not None:
                 self.branch_trace["sweep"] = {"accepted": False, "reason": "primary_breakout_selected"}
-            elif not sweep_permitted:
-                self.branch_trace["sweep"] = {"accepted": False, "reason": "trend_liquidity_probe_not_met"}
         elif getattr(regime, "sweep_allowed", False):
             sweep_permitted = True
 

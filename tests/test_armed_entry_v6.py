@@ -649,6 +649,7 @@ def test_v66_breakout_precursor_enters_watching_before_retest_and_then_arms():
     assert watch.strategy == Strategy.BREAKOUT_RETEST
     assert watch.direction == Direction.LONG
     assert "waiting_retest" in watch.reasons
+    assert watch.metadata["lifecycle_id"] == watch.watch_id
     assert engine.watch_trace["breakout"]["reason"] == "breakout_detected_waiting_retest"
 
     status, armed, trace = engine.advance_watch(watch, _breakout_retest_snapshot())
@@ -656,6 +657,9 @@ def test_v66_breakout_precursor_enters_watching_before_retest_and_then_arms():
     assert armed is not None
     assert armed.strategy == Strategy.BREAKOUT_RETEST
     assert armed.direction == Direction.LONG
+    assert armed.metadata["lifecycle_id"] == watch.watch_id
+    assert armed.metadata["origin_watch_id"] == watch.watch_id
+    assert trace["lifecycle_id"] == watch.watch_id
     assert trace["reason"] == "setup_armable"
 
 
@@ -687,6 +691,7 @@ def test_v66_liquidity_precursor_watches_then_arms_only_with_trend_aligned_recla
     assert watch.strategy == Strategy.LIQUIDITY_SWEEP
     assert watch.direction == Direction.LONG
     assert watch.metadata["trend_direction"] == "LONG"
+    assert watch.metadata["lifecycle_id"] == watch.watch_id
 
     status, armed, trace = engine.advance_watch(watch, _sweep_reclaim_snapshot())
     assert status == "armed"
@@ -695,6 +700,8 @@ def test_v66_liquidity_precursor_watches_then_arms_only_with_trend_aligned_recla
     assert armed.direction == Direction.LONG
     assert armed.metadata["trend_aligned"] is True
     assert armed.metadata["trend_direction_at_arm"] == "LONG"
+    assert armed.metadata["lifecycle_id"] == watch.watch_id
+    assert armed.metadata["origin_watch_id"] == watch.watch_id
 
 
 def test_v66_watch_expiry_is_terminal_and_does_not_arm_stale_precursor():
@@ -777,4 +784,7 @@ def test_orchestrator_v66_precursor_moves_watching_to_armed_without_scanner_rota
     assert promoted is None
     assert "BTC" not in orchestrator.watching_setups
     assert "BTC" in orchestrator.armed_setups
+    promoted_setup = orchestrator.armed_setups["BTC"]
+    assert promoted_setup.metadata["lifecycle_id"] == "BTC:BRW:1:LONG"
+    assert promoted_setup.metadata["origin_watch_id"] == "BTC:BRW:1:LONG"
     assert not manager.positions

@@ -83,6 +83,8 @@ class Database:
         self.db.signal_claims.create_index('expires_at', expireAfterSeconds=0)
         self.db.armed_setups.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('symbol', ASCENDING)], unique=True)
         self.db.armed_setups.create_index('expires_at', expireAfterSeconds=0)
+        self.db.setup_watches.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('symbol', ASCENDING)], unique=True)
+        self.db.setup_watches.create_index('expires_at', expireAfterSeconds=0)
         self.db.armed_consumed_setups.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('setup_id', ASCENDING)], unique=True)
         self.db.armed_consumed_setups.create_index('expires_at', expireAfterSeconds=0)
         self.db.users.create_index([('phone', ASCENDING)], unique=True)

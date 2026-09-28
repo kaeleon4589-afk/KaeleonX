@@ -37,3 +37,15 @@ def test_trade_share_card_uses_positive_and_negative_brand_images():
     assert "pnlValue ?? 0" in share
     assert "kaeleon-share-positive.png" in modal
     assert "kaeleon-share-negative.png" in modal
+
+
+def test_platform_brand_uses_primary_logo_and_removes_chameleon_art():
+    brand = (ROOT / 'frontend/src/components/Brand.tsx').read_text(encoding='utf-8')
+    dashboard = (ROOT / 'frontend/src/pages/DashboardPage.tsx').read_text(encoding='utf-8')
+    auth = (ROOT / 'frontend/src/pages/AuthPage.tsx').read_text(encoding='utf-8')
+    assert '/images/kaeleon-brand-primary.png' in brand
+    assert 'Logo principal de KAELEON' in brand
+    assert '/images/kaeleon-brand-primary.png' in dashboard
+    assert '/images/kaeleon-brand-primary.png' in auth
+    assert '/images/kaeleon-trading-art.jpg' not in dashboard
+    assert '/images/kaeleon-trading-art.jpg' not in auth

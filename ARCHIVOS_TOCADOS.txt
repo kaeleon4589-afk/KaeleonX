@@ -1,15 +1,11 @@
 MODIFICADOS
 ARCHIVOS_TOCADOS.txt
 KAELEON_V6_STRATEGY_ENGINE.md
-app/logging/logger.py
-app/orchestrator.py
-app/storage/database.py
 app/strategy/armed_entry.py
-app/trading/runtime.py
 tests/test_armed_entry_v6.py
 
 NUEVOS
-tests/test_setup_lifecycle_observability.py
+ninguno
 
 ELIMINADOS
 ninguno

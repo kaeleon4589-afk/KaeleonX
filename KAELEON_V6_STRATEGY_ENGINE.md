@@ -322,3 +322,32 @@ MongoDB also keeps two diagnostic collections:
 This release is observability-only for the strategy itself: it does not change trend
 alignment, BREAKOUT_RETEST rules, Liquidity Sweep rules, ATR, HTF exhaustion, RR,
 SL/TP geometry, 1m confirmation, chase protection or risk sizing.
+
+## v6.8 — Adaptive post-arm 1m confirmation (evidence-driven)
+
+The lifecycle data from production showed that discovery was no longer the terminal
+bottleneck: setups reached `WATCHING` and `ARMED`, but none reached `TRIGGERED`.
+The representative NEAR short armed at quality `73.21` and preserved execution RR
+above `1.10R` while a closed 1m candle printed a strong bearish shape (body `0.50`,
+close position `0.20`) with moderate relative volume (`0.5229`). The legacy normal
+1m rule rejected it only because RVOL was below `0.70`; subsequent candles delayed
+confirmation until the price had already left the valid RR window.
+
+v6.8 keeps the original normal 1m rule unchanged and adds one narrow fallback only
+for post-arm candles:
+
+- setup quality must be at least `72`;
+- the live order book must be valid and populated;
+- the live executable quote must already have crossed the trigger and remain inside
+  the existing anti-chase boundary;
+- the closed 1m candle must be strongly directional: body >= `0.45`, close position
+  >= `0.72` for LONG or <= `0.28` for SHORT;
+- RVOL must still be >= `0.50`;
+- final execution geometry and `ARM_MIN_RR >= 1.10` are still enforced after the
+  confirmation, exactly as before.
+
+The fast pre-arm path remains unchanged and strict. The ATR chase protection,
+invalidation, target RR caps, structural stop, trend alignment and all discovery
+filters are unchanged. Adaptive confirmations are logged as
+`confirmation_mode=postarm_closed_1m_strong_shape` and the resulting intent includes
+`micro_confirmation_1m_adaptive` so the behavior is fully auditable.

@@ -19,6 +19,23 @@ from app.trading.rejection_funnel import RejectionFunnel
 # the same limit after executable bid/ask and DEMO slippage alter the entry.
 MIN_EXECUTION_RR = 1.05
 
+# Stable lifecycle stages make one setup traceable from the first precursor to
+# the position that was ultimately opened (or the exact terminal rejection).
+LIFECYCLE_STAGE_ORDER = {
+    "WATCHING": 10,
+    "ARMED": 20,
+    "TRIGGERED": 30,
+    "SIGNAL_ACCEPTED": 40,
+    "RISK_APPROVED": 50,
+    "ORDER_SUBMITTED": 60,
+    "EXECUTION_PENDING": 65,
+    "POSITION_OPENED": 70,
+    "CANCELLED": 90,
+    "REJECTED": 91,
+    "ERROR": 99,
+}
+LIFECYCLE_PROGRESS_REPEAT_SECONDS = 60.0
+
 
 class TradingOrchestrator:
     """Deterministic signal -> risk -> execution -> position pipeline.
@@ -73,6 +90,176 @@ class TradingOrchestrator:
         )
         self.last_loss_at = 0.0
         self.last_symbol_loss_at = {}
+        self._lifecycle_progress = {}
+
+    @staticmethod
+    def _enum_value(value):
+        return getattr(value, "value", str(value) if value is not None else None)
+
+    @staticmethod
+    def _metadata_of(item) -> dict:
+        raw = getattr(item, "metadata", {}) if item is not None else {}
+        return dict(raw or {}) if isinstance(raw, dict) else {}
+
+    def _lifecycle_context(self, *, watch=None, setup=None, intent=None, decision_id=None) -> dict:
+        item = intent or setup or watch
+        meta = self._metadata_of(item)
+        watch_id = str(
+            meta.get("origin_watch_id")
+            or (getattr(watch, "watch_id", None) if watch is not None else "")
+            or ""
+        ) or None
+        setup_id = str(
+            meta.get("armed_setup_id")
+            or (getattr(setup, "setup_id", None) if setup is not None else "")
+            or ""
+        ) or None
+        lifecycle_id = str(
+            meta.get("lifecycle_id")
+            or watch_id
+            or setup_id
+            or decision_id
+            or ""
+        ) or None
+        return {
+            "lifecycle_id": lifecycle_id,
+            "watch_id": watch_id,
+            "setup_id": setup_id,
+        }
+
+    def _ensure_armed_lifecycle(self, setup, *, watch=None):
+        if setup is None:
+            return None
+        meta = self._metadata_of(setup)
+        if watch is not None:
+            watch_meta = self._metadata_of(watch)
+            lifecycle_id = str(watch_meta.get("lifecycle_id") or getattr(watch, "watch_id", None) or setup.setup_id)
+            meta.setdefault("origin_watch_id", getattr(watch, "watch_id", None))
+            meta.setdefault("watch_created_at_ms", getattr(watch, "created_at_ms", None))
+            meta.setdefault("lifecycle_origin", watch_meta.get("lifecycle_origin") or "watched_precursor")
+        else:
+            lifecycle_id = str(meta.get("lifecycle_id") or setup.setup_id)
+            meta.setdefault("lifecycle_origin", "direct_complete_setup")
+        meta["lifecycle_id"] = lifecycle_id
+        if meta == self._metadata_of(setup):
+            return setup
+        return replace(setup, metadata=meta)
+
+    @staticmethod
+    def _lifecycle_stage_field(stage: str) -> str:
+        return f"{str(stage).strip().lower()}_at_ms"
+
+    def _schedule_lifecycle_stage(
+        self, user_id, *, lifecycle_id, stage, symbol, strategy=None, direction=None,
+        decision_id=None, watch_id=None, setup_id=None, position_id=None, reason=None,
+        terminal=False, details=None,
+    ) -> None:
+        if not lifecycle_id:
+            return
+        now_ms = int(time.time() * 1000)
+        stage = str(stage or "UNKNOWN").upper()
+        document = {
+            "user_id": user_id,
+            "mode": self.execution_mode,
+            "lifecycle_id": str(lifecycle_id),
+            "symbol": symbol,
+            "current_stage": stage,
+            "stage_order": int(LIFECYCLE_STAGE_ORDER.get(stage, 0)),
+            "last_event_at_ms": now_ms,
+            "terminal": bool(terminal),
+        }
+        document[self._lifecycle_stage_field(stage)] = now_ms
+        if strategy is not None:
+            document["strategy"] = self._enum_value(strategy)
+        if direction is not None:
+            document["direction"] = self._enum_value(direction)
+        if decision_id:
+            document["last_decision_id"] = str(decision_id)
+        if watch_id:
+            document["watch_id"] = str(watch_id)
+        if setup_id:
+            document["setup_id"] = str(setup_id)
+        if position_id:
+            document["position_id"] = str(position_id)
+        if reason:
+            document["last_reason"] = str(reason)
+        if terminal:
+            document["terminal_reason"] = str(reason or stage.lower())
+            document["terminal_at_ms"] = now_ms
+        if isinstance(details, dict) and details:
+            document["last_details"] = dict(details)
+        self.persistence.schedule_upsert(
+            collection="setup_lifecycles",
+            key={"user_id": user_id, "mode": self.execution_mode, "lifecycle_id": str(lifecycle_id)},
+            document=document,
+            event_name="LIFECYCLE_STATE_PERSIST_ERROR",
+            decision_id=decision_id or str(lifecycle_id),
+            user_id=user_id, mode=self.execution_mode, symbol=symbol,
+        )
+        # Keep an immutable-ish event ledger as the authoritative journey history.
+        # Summary upserts above are convenient for "where is it now?", while these
+        # stage rows remain correct even if asynchronous Mongo writes complete out of order.
+        event_id = f"{user_id}:{self.execution_mode}:{lifecycle_id}:{stage}:{decision_id or now_ms}"
+        event_document = {
+            **document,
+            "event_id": event_id,
+            "stage_at_ms": now_ms,
+        }
+        self.persistence.schedule_upsert(
+            collection="setup_lifecycle_events",
+            key={"event_id": event_id},
+            document=event_document,
+            event_name="LIFECYCLE_STATE_PERSIST_ERROR",
+            decision_id=decision_id or str(lifecycle_id),
+            user_id=user_id, mode=self.execution_mode, symbol=symbol,
+        )
+
+    def _emit_lifecycle_progress(
+        self, event_name, *, phase, decision_id, user_id, symbol, lifecycle_ctx,
+        strategy=None, direction=None, reason=None, trace=None, force=False,
+    ) -> bool:
+        lifecycle_id = (lifecycle_ctx or {}).get("lifecycle_id")
+        if not lifecycle_id:
+            return False
+        phase = str(phase).upper()
+        reason = str(reason or "pending")
+        key = (str(lifecycle_id), phase)
+        now = time.monotonic()
+        previous = self._lifecycle_progress.get(key)
+        if (not force and previous and previous[0] == reason
+                and now - previous[1] < LIFECYCLE_PROGRESS_REPEAT_SECONDS):
+            return False
+        self._lifecycle_progress[key] = (reason, now)
+        self.audit.event(
+            event_name, decision_id, user_id=user_id, mode=self.execution_mode, symbol=symbol,
+            lifecycle_id=lifecycle_id, watch_id=(lifecycle_ctx or {}).get("watch_id"),
+            setup_id=(lifecycle_ctx or {}).get("setup_id"), stage=phase,
+            stage_order=LIFECYCLE_STAGE_ORDER.get(phase), strategy=self._enum_value(strategy),
+            direction=self._enum_value(direction), reason=reason, trace=trace or {},
+        )
+        self._schedule_lifecycle_stage(
+            user_id, lifecycle_id=lifecycle_id, stage=phase, symbol=symbol,
+            strategy=strategy, direction=direction, decision_id=decision_id,
+            watch_id=(lifecycle_ctx or {}).get("watch_id"),
+            setup_id=(lifecycle_ctx or {}).get("setup_id"),
+            reason=reason, details={"progress_reason": reason},
+        )
+        return True
+
+    def _terminal_lifecycle(
+        self, user_id, *, lifecycle_ctx, symbol, decision_id, reason,
+        strategy=None, direction=None, stage="REJECTED", details=None,
+    ) -> None:
+        lifecycle_id = (lifecycle_ctx or {}).get("lifecycle_id")
+        if not lifecycle_id:
+            return
+        self._schedule_lifecycle_stage(
+            user_id, lifecycle_id=lifecycle_id, stage=stage, symbol=symbol,
+            strategy=strategy, direction=direction, decision_id=decision_id,
+            watch_id=(lifecycle_ctx or {}).get("watch_id"),
+            setup_id=(lifecycle_ctx or {}).get("setup_id"),
+            reason=reason, terminal=True, details=details,
+        )
 
     @staticmethod
     def _epoch_seconds(value):
@@ -303,9 +490,13 @@ class TradingOrchestrator:
 
     def _decision_doc(self, snapshot, intent, risk, *, status, execution_rr,
                       structural_rr, execution=None):
+        lifecycle_ctx = self._lifecycle_context(intent=intent, decision_id=getattr(intent, "decision_id", None))
         doc = {
             "symbol": str(snapshot.symbol),
             "timeframe": str(snapshot.timeframe),
+            "lifecycle_id": lifecycle_ctx.get("lifecycle_id"),
+            "watch_id": lifecycle_ctx.get("watch_id"),
+            "setup_id": lifecycle_ctx.get("setup_id"),
             "strategy": getattr(intent.strategy, "value", str(intent.strategy)),
             "direction": getattr(intent.direction, "value", str(intent.direction)),
             "quality": float(intent.quality),
@@ -581,6 +772,7 @@ class TradingOrchestrator:
         decision_id = uuid4().hex
         accepted_signal = False
         terminal_event_emitted = False
+        lifecycle_ctx = {}
 
         self.audit.event(
             "DECISION_START", decision_id, level="DEBUG", persist=False,
@@ -608,6 +800,7 @@ class TradingOrchestrator:
                 watch = self.watching_setups.get(snapshot.symbol)
                 if watch is None:
                     return None
+                lifecycle_ctx = self._lifecycle_context(watch=watch, decision_id=decision_id)
                 status, armed, watch_trace = self.router.advance_watch(watch, snapshot)
                 strategy_trace = getattr(self.router, "last_trace", {}) or {}
                 if status == "cancelled":
@@ -618,8 +811,16 @@ class TradingOrchestrator:
                     self.audit.event(
                         "SETUP_WATCH_CANCELLED", decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
-                        watch_id=getattr(watch, "watch_id", None), reason=reason,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                        watch_id=getattr(watch, "watch_id", None),
+                        stage="CANCELLED", stage_order=LIFECYCLE_STAGE_ORDER["CANCELLED"],
+                        strategy=watch.strategy.value, direction=watch.direction.value, reason=reason,
                         source="watch_priority_monitor", trace=watch_trace,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol,
+                        decision_id=decision_id, reason=reason, strategy=watch.strategy,
+                        direction=watch.direction, stage="CANCELLED", details={"source": "watch_priority_monitor"},
                     )
                     return None
                 if status == "pending":
@@ -628,27 +829,44 @@ class TradingOrchestrator:
                     self.audit.event(
                         "SETUP_WATCH_PENDING", decision_id, level="DEBUG", persist=False,
                         user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
                         watch_id=getattr(watch, "watch_id", None), reason=reason, trace=watch_trace,
+                    )
+                    self._emit_lifecycle_progress(
+                        "SETUP_WATCH_PROGRESS", phase="WATCHING", decision_id=decision_id,
+                        user_id=user_id, symbol=snapshot.symbol, lifecycle_ctx=lifecycle_ctx,
+                        strategy=watch.strategy, direction=watch.direction, reason=reason, trace=watch_trace,
                     )
                     return None
                 if armed is None:
                     return None
                 self.watching_setups.pop(snapshot.symbol, None)
                 self._schedule_watch_terminal(user_id, watch, "setup_armed")
+                armed = self._ensure_armed_lifecycle(armed, watch=watch)
+                lifecycle_ctx = self._lifecycle_context(watch=watch, setup=armed, decision_id=decision_id)
                 self.armed_setups[snapshot.symbol] = armed
                 await self._persist_armed_active(user_id, armed)
                 self.last_rejection = "setup_armed_waiting_trigger"
                 self._funnel("armed", user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event(
                     "SETUP_ARMED", decision_id, user_id=user_id, mode=self.execution_mode,
-                    symbol=snapshot.symbol, setup_id=armed.setup_id, strategy=armed.strategy.value,
+                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=armed.setup_id,
+                    stage="ARMED", stage_order=LIFECYCLE_STAGE_ORDER["ARMED"],
+                    previous_stage="WATCHING", strategy=armed.strategy.value,
                     direction=armed.direction.value, quality=armed.quality,
                     trigger_price=armed.trigger_price, invalidation_price=armed.invalidation_price,
                     entry_zone_low=armed.entry_zone_low, entry_zone_high=armed.entry_zone_high,
                     stop_price=armed.stop_price, target_price=armed.target_price,
                     expires_at_ms=armed.expires_at_ms, priority_monitor=True,
-                    source="watch_priority_monitor", watch_id=getattr(watch, "watch_id", None),
-                    watch_trace=watch_trace,
+                    source="watch_priority_monitor", watch_trace=watch_trace,
+                )
+                self._schedule_lifecycle_stage(
+                    user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="ARMED",
+                    symbol=snapshot.symbol, strategy=armed.strategy, direction=armed.direction,
+                    decision_id=decision_id, watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=armed.setup_id, reason=str((watch_trace or {}).get("reason") or "setup_armed"),
+                    details={"source": "watch_priority_monitor", "quality": armed.quality},
                 )
                 return None
 
@@ -656,6 +874,9 @@ class TradingOrchestrator:
                 armed = self.armed_setups.get(snapshot.symbol)
                 if armed is None:
                     return None
+                armed = self._ensure_armed_lifecycle(armed)
+                self.armed_setups[snapshot.symbol] = armed
+                lifecycle_ctx = self._lifecycle_context(setup=armed, decision_id=decision_id)
                 status, intent, armed_trace = self.router.trigger_armed(armed, snapshot, decision_id)
                 strategy_trace = getattr(self.router, "last_trace", {}) or {}
                 if status == "cancelled":
@@ -668,8 +889,16 @@ class TradingOrchestrator:
                     self.audit.event(
                         "SETUP_CANCELLED", decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
-                        setup_id=getattr(armed, "setup_id", None), reason=reason,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                        watch_id=lifecycle_ctx.get("watch_id"), setup_id=getattr(armed, "setup_id", None),
+                        stage="CANCELLED", stage_order=LIFECYCLE_STAGE_ORDER["CANCELLED"],
+                        strategy=armed.strategy.value, direction=armed.direction.value, reason=reason,
                         source="armed_priority_monitor", trace=armed_trace,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol,
+                        decision_id=decision_id, reason=reason, strategy=armed.strategy,
+                        direction=armed.direction, stage="CANCELLED", details={"source": "armed_priority_monitor"},
                     )
                     return None
                 if status == "pending":
@@ -681,19 +910,37 @@ class TradingOrchestrator:
                     self.audit.event(
                         "SETUP_PRIORITY_PENDING", decision_id, level="DEBUG", persist=False,
                         user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                        watch_id=lifecycle_ctx.get("watch_id"),
                         setup_id=getattr(armed, "setup_id", None), reason=reason, trace=armed_trace,
+                    )
+                    self._emit_lifecycle_progress(
+                        "SETUP_ARMED_PROGRESS", phase="ARMED", decision_id=decision_id,
+                        user_id=user_id, symbol=snapshot.symbol, lifecycle_ctx=lifecycle_ctx,
+                        strategy=armed.strategy, direction=armed.direction, reason=reason, trace=armed_trace,
                     )
                     return None
                 self.armed_setups.pop(snapshot.symbol, None)
                 self._schedule_armed_terminal(user_id, armed, "setup_triggered")
                 self._funnel("triggered", user_id=user_id, symbol=snapshot.symbol)
+                lifecycle_ctx = self._lifecycle_context(setup=armed, intent=intent, decision_id=decision_id)
                 self.audit.event(
                     "SETUP_TRIGGERED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
-                    setup_id=getattr(armed, "setup_id", None),
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=getattr(armed, "setup_id", None), stage="TRIGGERED",
+                    stage_order=LIFECYCLE_STAGE_ORDER["TRIGGERED"],
                     strategy=getattr(getattr(intent, "strategy", None), "value", None),
                     direction=getattr(getattr(intent, "direction", None), "value", None),
                     source="armed_priority_monitor", trace=armed_trace,
+                )
+                self._schedule_lifecycle_stage(
+                    user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="TRIGGERED",
+                    symbol=snapshot.symbol, strategy=getattr(intent, "strategy", None),
+                    direction=getattr(intent, "direction", None), decision_id=decision_id,
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                    reason=str((armed_trace or {}).get("reason") or "setup_triggered"),
+                    details={"source": "armed_priority_monitor"},
                 )
             else:
                 regime = self.regime_engine.evaluate_snapshot(snapshot)
@@ -745,6 +992,9 @@ class TradingOrchestrator:
                 if supports_armed:
                     armed = self.armed_setups.get(snapshot.symbol)
                     if armed is not None:
+                        armed = self._ensure_armed_lifecycle(armed)
+                        self.armed_setups[snapshot.symbol] = armed
+                        lifecycle_ctx = self._lifecycle_context(setup=armed, decision_id=decision_id)
                         status, intent, armed_trace = self.router.trigger_armed(armed, snapshot, decision_id)
                         strategy_trace = getattr(self.router, "last_trace", {}) or {}
                         if status == "cancelled":
@@ -757,8 +1007,16 @@ class TradingOrchestrator:
                             self.audit.event(
                                 "SETUP_CANCELLED", decision_id, user_id=user_id,
                                 mode=self.execution_mode, symbol=snapshot.symbol,
-                                setup_id=getattr(armed, "setup_id", None), reason=reason,
+                                lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                                watch_id=lifecycle_ctx.get("watch_id"), setup_id=getattr(armed, "setup_id", None),
+                                stage="CANCELLED", stage_order=LIFECYCLE_STAGE_ORDER["CANCELLED"],
+                                strategy=armed.strategy.value, direction=armed.direction.value, reason=reason,
                                 source="scanner", trace=armed_trace,
+                            )
+                            self._terminal_lifecycle(
+                                user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol,
+                                decision_id=decision_id, reason=reason, strategy=armed.strategy,
+                                direction=armed.direction, stage="CANCELLED", details={"source": "scanner"},
                             )
                             return None
                         if status == "pending":
@@ -768,20 +1026,36 @@ class TradingOrchestrator:
                             self.audit.event(
                                 "SETUP_PENDING", decision_id, level="DEBUG", persist=False,
                                 user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
-                                setup_id=getattr(armed, "setup_id", None), reason=reason,
-                                trace=armed_trace,
+                                lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                                setup_id=getattr(armed, "setup_id", None), reason=reason, trace=armed_trace,
+                            )
+                            self._emit_lifecycle_progress(
+                                "SETUP_ARMED_PROGRESS", phase="ARMED", decision_id=decision_id,
+                                user_id=user_id, symbol=snapshot.symbol, lifecycle_ctx=lifecycle_ctx,
+                                strategy=armed.strategy, direction=armed.direction, reason=reason, trace=armed_trace,
                             )
                             return None
                         self.armed_setups.pop(snapshot.symbol, None)
                         self._schedule_armed_terminal(user_id, armed, "setup_triggered")
                         self._funnel("triggered", user_id=user_id, symbol=snapshot.symbol)
+                        lifecycle_ctx = self._lifecycle_context(setup=armed, intent=intent, decision_id=decision_id)
                         self.audit.event(
                             "SETUP_TRIGGERED", decision_id, user_id=user_id,
                             mode=self.execution_mode, symbol=snapshot.symbol,
-                            setup_id=getattr(armed, "setup_id", None),
+                            lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                            setup_id=getattr(armed, "setup_id", None), stage="TRIGGERED",
+                            stage_order=LIFECYCLE_STAGE_ORDER["TRIGGERED"],
                             strategy=getattr(getattr(intent, "strategy", None), "value", None),
                             direction=getattr(getattr(intent, "direction", None), "value", None),
                             source="scanner", trace=armed_trace,
+                        )
+                        self._schedule_lifecycle_stage(
+                            user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="TRIGGERED",
+                            symbol=snapshot.symbol, strategy=getattr(intent, "strategy", None),
+                            direction=getattr(intent, "direction", None), decision_id=decision_id,
+                            watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                            reason=str((armed_trace or {}).get("reason") or "setup_triggered"),
+                            details={"source": "scanner"},
                         )
                     else:
                         existing_watch = self.watching_setups.get(snapshot.symbol)
@@ -800,6 +1074,8 @@ class TradingOrchestrator:
                         )
                         strategy_trace = getattr(self.router, "last_trace", {}) or {}
                         if armed is not None:
+                            armed = self._ensure_armed_lifecycle(armed)
+                            lifecycle_ctx = self._lifecycle_context(setup=armed, decision_id=decision_id)
                             self.armed_setups[snapshot.symbol] = armed
                             await self._persist_armed_active(user_id, armed)
                             self.last_rejection = "setup_armed_waiting_trigger"
@@ -807,12 +1083,21 @@ class TradingOrchestrator:
                             self.audit.event(
                                 "SETUP_ARMED", decision_id, user_id=user_id,
                                 mode=self.execution_mode, symbol=snapshot.symbol,
-                                setup_id=armed.setup_id, strategy=armed.strategy.value,
+                                lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                                setup_id=armed.setup_id, stage="ARMED", stage_order=LIFECYCLE_STAGE_ORDER["ARMED"],
+                                previous_stage="DISCOVERY", strategy=armed.strategy.value,
                                 direction=armed.direction.value, quality=armed.quality,
                                 trigger_price=armed.trigger_price, invalidation_price=armed.invalidation_price,
                                 entry_zone_low=armed.entry_zone_low, entry_zone_high=armed.entry_zone_high,
                                 stop_price=armed.stop_price, target_price=armed.target_price,
                                 expires_at_ms=armed.expires_at_ms, priority_monitor=True, source="scanner_complete_setup",
+                            )
+                            self._schedule_lifecycle_stage(
+                                user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="ARMED",
+                                symbol=snapshot.symbol, strategy=armed.strategy, direction=armed.direction,
+                                decision_id=decision_id, watch_id=lifecycle_ctx.get("watch_id"),
+                                setup_id=armed.setup_id, reason="scanner_complete_setup",
+                                details={"source": "scanner_complete_setup", "quality": armed.quality},
                             )
                             return None
                         watch = None
@@ -823,15 +1108,25 @@ class TradingOrchestrator:
                             )
                             strategy_trace = getattr(self.router, "last_trace", {}) or strategy_trace
                         if watch is not None:
+                            lifecycle_ctx = self._lifecycle_context(watch=watch, decision_id=decision_id)
                             self.watching_setups[snapshot.symbol] = watch
                             await self._persist_watch_active(user_id, watch)
                             self.last_rejection = "setup_watching"
                             self._funnel("watching", user_id=user_id, symbol=snapshot.symbol)
+                            watch_trace_payload = strategy_trace.get("watch") if isinstance(strategy_trace, dict) else {}
                             self.audit.event(
                                 "SETUP_WATCHING", decision_id, user_id=user_id, mode=self.execution_mode,
-                                symbol=snapshot.symbol, watch_id=watch.watch_id, strategy=watch.strategy.value,
-                                direction=watch.direction.value, expires_at_ms=watch.expires_at_ms,
-                                reasons=list(watch.reasons), trace=(strategy_trace.get("watch") if isinstance(strategy_trace, dict) else {}),
+                                symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                                watch_id=watch.watch_id, stage="WATCHING", stage_order=LIFECYCLE_STAGE_ORDER["WATCHING"],
+                                strategy=watch.strategy.value, direction=watch.direction.value,
+                                created_at_ms=watch.created_at_ms, expires_at_ms=watch.expires_at_ms,
+                                reasons=list(watch.reasons), trace=watch_trace_payload,
+                            )
+                            self._schedule_lifecycle_stage(
+                                user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="WATCHING",
+                                symbol=snapshot.symbol, strategy=watch.strategy, direction=watch.direction,
+                                decision_id=decision_id, watch_id=watch.watch_id, reason="setup_watching",
+                                details={"reasons": list(watch.reasons)},
                             )
                             return None
                         if not self.legacy_entry_fallback_enabled:
@@ -907,6 +1202,7 @@ class TradingOrchestrator:
                 )
                 return None
 
+            lifecycle_ctx = self._lifecycle_context(intent=intent, decision_id=decision_id)
             signal_entry = float(intent.entry_price)
             try:
                 executable = float(snapshot.ask if intent.direction == Direction.LONG else snapshot.bid)
@@ -937,9 +1233,17 @@ class TradingOrchestrator:
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                     strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)),
                     reason="invalid_trade_geometry", entry_price=entry,
                     stop_price=stop, target_price=target, execution_rr=execution_rr,
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason="invalid_trade_geometry", strategy=intent.strategy, direction=intent.direction,
+                    details={"execution_rr": execution_rr},
                 )
                 return None
 
@@ -970,10 +1274,18 @@ class TradingOrchestrator:
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                         strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        direction=getattr(intent.direction, 'value', str(intent.direction)),
                         reason='entry_chased_after_signal', entry_price=entry,
                         signal_entry_price=signal_entry, atr_value=atr_value,
                         move_atr=round(chase_atr, 4), maximum_atr=self.entry_max_chase_atr,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason='entry_chased_after_signal', strategy=intent.strategy, direction=intent.direction,
+                        details={"move_atr": round(chase_atr, 4)},
                     )
                     return None
                 if adverse_atr > self.entry_max_adverse_reversal_atr:
@@ -982,10 +1294,18 @@ class TradingOrchestrator:
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                         strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        direction=getattr(intent.direction, 'value', str(intent.direction)),
                         reason='entry_confirmation_lost_before_fill', entry_price=entry,
                         signal_entry_price=signal_entry, atr_value=atr_value,
                         move_atr=round(adverse_atr, 4), maximum_atr=self.entry_max_adverse_reversal_atr,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason='entry_confirmation_lost_before_fill', strategy=intent.strategy, direction=intent.direction,
+                        details={"move_atr": round(adverse_atr, 4)},
                     )
                     return None
 
@@ -1004,11 +1324,19 @@ class TradingOrchestrator:
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                         strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        direction=getattr(intent.direction, 'value', str(intent.direction)),
                         reason='stop_inside_market_noise', entry_price=entry, stop_price=stop,
                         stop_distance=risk_distance, minimum_stop_distance=minimum_stop_distance,
                         stop_atr=round(risk_distance / atr_value, 4),
                         minimum_stop_atr=self.entry_min_stop_atr, spread_abs=spread_abs,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason='stop_inside_market_noise', strategy=intent.strategy, direction=intent.direction,
+                        details={"stop_atr": round(risk_distance / atr_value, 4)},
                     )
                     return None
 
@@ -1035,10 +1363,17 @@ class TradingOrchestrator:
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                         strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
                         reason='orderbook_conflict', direction=getattr(intent.direction, 'value', str(intent.direction)),
                         orderbook_imbalance=round(imbalance, 4),
                         threshold=self.entry_orderbook_conflict_threshold, levels=20,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason='orderbook_conflict', strategy=intent.strategy, direction=intent.direction,
+                        details={"orderbook_imbalance": round(imbalance, 4)},
                     )
                     return None
 
@@ -1060,11 +1395,19 @@ class TradingOrchestrator:
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                         strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        direction=getattr(intent.direction, 'value', str(intent.direction)),
                         reason='entry_too_close_to_stop', entry_price=entry,
                         signal_entry_price=signal_entry, stop_price=stop,
                         target_price=target, actual_stop_pct=actual_stop_pct,
                         minimum_stop_pct=minimum_stop_pct,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason='entry_too_close_to_stop', strategy=intent.strategy, direction=intent.direction,
+                        details={"actual_stop_pct": actual_stop_pct},
                     )
                     return None
                 if actual_stop_pct > 1.25 * float(planned_stop_pct):
@@ -1073,11 +1416,19 @@ class TradingOrchestrator:
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                         strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        direction=getattr(intent.direction, 'value', str(intent.direction)),
                         reason='entry_far_from_signal', entry_price=entry,
                         signal_entry_price=signal_entry, stop_price=stop,
                         target_price=target, actual_stop_pct=actual_stop_pct,
                         planned_stop_pct=float(planned_stop_pct),
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason='entry_far_from_signal', strategy=intent.strategy, direction=intent.direction,
+                        details={"actual_stop_pct": actual_stop_pct},
                     )
                     return None
 
@@ -1087,10 +1438,18 @@ class TradingOrchestrator:
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
                     strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)),
                     reason='execution_rr_too_low', entry_price=entry,
                     stop_price=stop, target_price=target,
                     execution_rr=round(execution_rr, 4), minimum_rr=MIN_EXECUTION_RR,
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason='execution_rr_too_low', strategy=intent.strategy, direction=intent.direction,
+                    details={"execution_rr": round(execution_rr, 4)},
                 )
                 return None
 
@@ -1100,12 +1459,22 @@ class TradingOrchestrator:
             self.audit.event(
                 "SIGNAL_ACCEPTED", decision_id, user_id=user_id,
                 mode=self.execution_mode, symbol=snapshot.symbol,
+                lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), stage="SIGNAL_ACCEPTED",
+                stage_order=LIFECYCLE_STAGE_ORDER["SIGNAL_ACCEPTED"],
                 strategy=getattr(intent.strategy, "value", str(intent.strategy)),
                 direction=getattr(intent.direction, "value", str(intent.direction)),
                 quality=round(float(intent.quality), 2), entry_price=entry,
                 stop_price=stop, target_price=target,
                 execution_rr=round(execution_rr, 4), structural_rr=structural_rr,
                 risk_multiplier=intent.risk_multiplier,
+            )
+            self._schedule_lifecycle_stage(
+                user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="SIGNAL_ACCEPTED",
+                symbol=snapshot.symbol, strategy=intent.strategy, direction=intent.direction,
+                decision_id=decision_id, watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), reason="signal_accepted",
+                details={"execution_rr": round(execution_rr, 4), "quality": round(float(intent.quality), 2)},
             )
             accepted_signal = True
             self._funnel("signal_accepted", user_id=user_id, symbol=snapshot.symbol)
@@ -1122,14 +1491,21 @@ class TradingOrchestrator:
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
-                    stage="risk_evaluate", error=f"{type(exc).__name__}: {exc}",
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="risk_evaluate",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason="risk_evaluation_error", strategy=intent.strategy, direction=intent.direction, stage="ERROR",
                 )
                 return {"accepted": False, "filled": False, "reason": "risk_evaluation_error"}
 
             self.audit.event(
                 "RISK_EVALUATED", decision_id, user_id=user_id,
                 mode=self.execution_mode, symbol=snapshot.symbol,
-                approved=bool(risk.approved), reason=str(risk.reason),
+                lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), approved=bool(risk.approved), reason=str(risk.reason),
                 equity=float(equity), quote_notional=float(risk.quantity),
                 base_quantity=float(risk.base_quantity),
                 margin_required=float(risk.margin_required), leverage=int(risk.leverage),
@@ -1142,7 +1518,15 @@ class TradingOrchestrator:
                 self.audit.event(
                     "RISK_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
+                    strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)),
                     reason=str(risk.reason),
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason=f"risk:{risk.reason}", strategy=intent.strategy, direction=intent.direction,
                 )
                 self.persistence.schedule_decision(
                     decision_id=decision_id, user_id=user_id, mode=self.execution_mode,
@@ -1155,6 +1539,23 @@ class TradingOrchestrator:
                 return {"accepted": False, "filled": False, "reason": str(risk.reason)}
 
             self._funnel("risk_approved", user_id=user_id, symbol=snapshot.symbol)
+            self.audit.event(
+                "RISK_APPROVED", decision_id, user_id=user_id, mode=self.execution_mode,
+                symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                stage="RISK_APPROVED", stage_order=LIFECYCLE_STAGE_ORDER["RISK_APPROVED"],
+                strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                direction=getattr(intent.direction, "value", str(intent.direction)),
+                quote_notional=float(risk.quantity), base_quantity=float(risk.base_quantity),
+                margin_required=float(risk.margin_required), leverage=int(risk.leverage),
+            )
+            self._schedule_lifecycle_stage(
+                user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="RISK_APPROVED",
+                symbol=snapshot.symbol, strategy=intent.strategy, direction=intent.direction,
+                decision_id=decision_id, watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), reason="risk_approved",
+                details={"leverage": int(risk.leverage), "margin_required": float(risk.margin_required)},
+            )
             # ----------------------- EXECUTION STAGE ------------------------
             # No Mongo/Telegram work has run between SIGNAL_ACCEPTED and here.
             try:
@@ -1175,8 +1576,16 @@ class TradingOrchestrator:
                 self.audit.event(
                     "EXECUTION_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
+                    strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)),
                     reason="market_unavailable",
                     orderbook_valid=getattr(snapshot, "orderbook_valid", False),
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason="market_unavailable", strategy=intent.strategy, direction=intent.direction,
                 )
                 self.persistence.schedule_decision(
                     decision_id=decision_id, user_id=user_id, mode=self.execution_mode,
@@ -1196,17 +1605,49 @@ class TradingOrchestrator:
                 self.last_rejection = 'fill_outside_trade_geometry'
                 self.audit.event('EXECUTION_REJECTED', decision_id, user_id=user_id,
                                  mode=self.execution_mode, symbol=snapshot.symbol,
+                                 lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                                 setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
+                                 strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                                 direction=getattr(intent.direction, "value", str(intent.direction)),
                                  reason='fill_outside_trade_geometry')
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason='fill_outside_trade_geometry', strategy=intent.strategy, direction=intent.direction,
+                )
                 return {'accepted': False, 'filled': False, 'reason': 'fill_outside_trade_geometry'}
             # A worker restart or delayed persistence must not bypass the
             # one-position-per-user rule before placing a second order.
             if user_id and (await asyncio.to_thread(
                     self.db.find_one, 'positions', {'user_id': user_id, 'status': 'OPEN'})):
                 self.last_rejection = 'open_position_exists'
+                terminal_event_emitted = True
+                self.audit.event(
+                    'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                    stage="REJECTED", strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)), reason='open_position_exists',
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason='open_position_exists', strategy=intent.strategy, direction=intent.direction,
+                )
                 return {'accepted': False, 'filled': False, 'reason': 'open_position_exists'}
             if user_id and (await asyncio.to_thread(
                     self.db.find_one, 'execution_pending', {'user_id': user_id, 'active': True})):
                 self.last_rejection = 'execution_pending'
+                terminal_event_emitted = True
+                self.audit.event(
+                    'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                    stage="REJECTED", strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)), reason='execution_pending',
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason='execution_pending', strategy=intent.strategy, direction=intent.direction,
+                )
                 return {'accepted': False, 'filled': False, 'reason': 'execution_pending'}
             if self.entry_guard is not None and not self.entry_guard():
                 raise RuntimeError('trading_worker_lease_expired')
@@ -1227,7 +1668,16 @@ class TradingOrchestrator:
                     terminal_event_emitted = True
                     self.last_rejection = 'setup_already_executed'
                     self.audit.event('EXECUTION_REJECTED', decision_id, user_id=user_id,
-                                     mode=self.execution_mode, symbol=snapshot.symbol, reason='setup_already_executed')
+                                     mode=self.execution_mode, symbol=snapshot.symbol,
+                                     lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                                     setup_id=lifecycle_ctx.get("setup_id"), stage="REJECTED",
+                                     strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                                     direction=getattr(intent.direction, "value", str(intent.direction)),
+                                     reason='setup_already_executed')
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason='setup_already_executed', strategy=intent.strategy, direction=intent.direction,
+                    )
                     return {'accepted': False, 'filled': False, 'reason': 'setup_already_executed'}
             if self.execution_mode == 'live':
                 reservation = {'user_id': user_id, 'active': True, 'symbol': snapshot.symbol,
@@ -1235,6 +1685,22 @@ class TradingOrchestrator:
                 await asyncio.to_thread(self.db.upsert, 'execution_pending', {'user_id': user_id}, reservation)
                 self.pending_execution = {**reservation, 'created_monotonic': time.monotonic()}
             self._funnel("submitted", user_id=user_id, symbol=snapshot.symbol)
+            self.audit.event(
+                "ORDER_SUBMITTED", decision_id, user_id=user_id, mode=self.execution_mode,
+                symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                stage="ORDER_SUBMITTED", stage_order=LIFECYCLE_STAGE_ORDER["ORDER_SUBMITTED"],
+                strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                direction=getattr(intent.direction, "value", str(intent.direction)),
+                quantity=float(risk.quantity), executable_price=executable_price,
+            )
+            self._schedule_lifecycle_stage(
+                user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="ORDER_SUBMITTED",
+                symbol=snapshot.symbol, strategy=intent.strategy, direction=intent.direction,
+                decision_id=decision_id, watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), reason="order_submitted",
+                details={"quantity": float(risk.quantity), "executable_price": executable_price},
+            )
             try:
                 result = self.execution.submit(
                     intent,
@@ -1249,7 +1715,13 @@ class TradingOrchestrator:
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
-                    stage="execution_submit", error=f"{type(exc).__name__}: {exc}",
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="execution_submit",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason="execution_error", strategy=intent.strategy, direction=intent.direction, stage="ERROR",
                 )
                 return {"accepted": False, "filled": False, "reason": "execution_error"}
 
@@ -1272,7 +1744,8 @@ class TradingOrchestrator:
             self.audit.event(
                 "EXECUTION_RESULT", decision_id, user_id=user_id,
                 mode=self.execution_mode, symbol=snapshot.symbol,
-                **execution_log,
+                lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), **execution_log,
             )
 
             if not result.get("filled"):
@@ -1282,12 +1755,29 @@ class TradingOrchestrator:
                 event = "EXECUTION_PENDING" if pending else "EXECUTION_REJECTED"
                 terminal_event_emitted = True
                 self.last_decision[key] = now
+                lifecycle_stage = "EXECUTION_PENDING" if pending else "REJECTED"
                 self.audit.event(
                     event, decision_id, user_id=user_id, mode=self.execution_mode,
-                    symbol=snapshot.symbol, reason=reason,
-                    accepted=bool(result.get("accepted", False)),
-                    order_id=result.get("order_id"),
+                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                    stage=lifecycle_stage, stage_order=LIFECYCLE_STAGE_ORDER.get(lifecycle_stage),
+                    strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)), reason=reason,
+                    accepted=bool(result.get("accepted", False)), order_id=result.get("order_id"),
                 )
+                if pending:
+                    self._schedule_lifecycle_stage(
+                        user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="EXECUTION_PENDING",
+                        symbol=snapshot.symbol, strategy=intent.strategy, direction=intent.direction,
+                        decision_id=decision_id, watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"), reason=reason,
+                        details={"order_id": result.get("order_id")},
+                    )
+                else:
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason=reason, strategy=intent.strategy, direction=intent.direction,
+                    )
                 if not pending and self.execution_mode == 'live':
                     await self._clear_pending(user_id)
                 if pending:
@@ -1334,7 +1824,13 @@ class TradingOrchestrator:
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
-                    stage="execution_result", error="filled_result_missing_position",
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="execution_result",
+                    error="filled_result_missing_position",
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason="filled_result_missing_position", strategy=intent.strategy, direction=intent.direction, stage="ERROR",
                 )
                 return {**result, "filled": False, "reason": "filled_result_missing_position"}
 
@@ -1345,6 +1841,9 @@ class TradingOrchestrator:
             position.strategy = strategy_name
             position.quality = round(float(intent.quality), 2)
             position.execution_rr = round(execution_rr, 4)
+            position.lifecycle_id = lifecycle_ctx.get("lifecycle_id")
+            position.watch_id = lifecycle_ctx.get("watch_id")
+            position.setup_id = lifecycle_ctx.get("setup_id")
             if structural_rr is not None:
                 position.structural_rr = structural_rr
 
@@ -1386,13 +1885,24 @@ class TradingOrchestrator:
             self.audit.event(
                 "POSITION_OPENED", decision_id, user_id=user_id,
                 mode=self.execution_mode, symbol=position.symbol,
-                position_id=position.position_id,
+                lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), position_id=position.position_id,
+                stage="POSITION_OPENED", stage_order=LIFECYCLE_STAGE_ORDER["POSITION_OPENED"],
+                lifecycle_complete=True,
                 direction=getattr(position.direction, "value", str(position.direction)),
                 quantity=position.quantity, entry_price=position.entry_price,
                 stop_price=position.stop_price, target_price=position.target_price,
                 strategy=strategy_name, execution_rr=round(execution_rr, 4),
                 persisted=bool(persisted), protected=result.get("protected"),
                 source="execution",
+            )
+            self._schedule_lifecycle_stage(
+                user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="POSITION_OPENED",
+                symbol=position.symbol, strategy=intent.strategy, direction=intent.direction,
+                decision_id=decision_id, watch_id=lifecycle_ctx.get("watch_id"),
+                setup_id=lifecycle_ctx.get("setup_id"), position_id=position.position_id,
+                reason="position_opened", terminal=True,
+                details={"entry_price": position.entry_price, "execution_rr": round(execution_rr, 4)},
             )
             await self._notify_opened(position, decision_id, user_id)
 
@@ -1413,7 +1923,13 @@ class TradingOrchestrator:
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=getattr(snapshot, "symbol", None),
-                    stage="cancelled", error="pipeline_cancelled_after_signal_accept",
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="cancelled",
+                    error="pipeline_cancelled_after_signal_accept",
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=getattr(snapshot, "symbol", None),
+                    decision_id=decision_id, reason="pipeline_cancelled_after_signal_accept", stage="ERROR",
                 )
             raise
         except Exception as exc:
@@ -1422,8 +1938,13 @@ class TradingOrchestrator:
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=getattr(snapshot, "symbol", None),
-                    stage="orchestrator_unhandled",
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="orchestrator_unhandled",
                     error=f"{type(exc).__name__}: {exc}",
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=getattr(snapshot, "symbol", None),
+                    decision_id=decision_id, reason="orchestrator_unhandled", stage="ERROR",
                 )
             else:
                 self.audit.event(
@@ -1438,8 +1959,13 @@ class TradingOrchestrator:
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=getattr(snapshot, "symbol", None),
-                    stage="terminal_guard",
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
+                    setup_id=lifecycle_ctx.get("setup_id"), stage="terminal_guard",
                     error="accepted_signal_without_terminal_event",
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=getattr(snapshot, "symbol", None),
+                    decision_id=decision_id, reason="accepted_signal_without_terminal_event", stage="ERROR",
                 )
             self.inflight.discard(key)
 

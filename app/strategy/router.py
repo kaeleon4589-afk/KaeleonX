@@ -47,6 +47,7 @@ class StrategyRouter:
         armed_consumed_ttl_seconds: float | None = None,
         armed_fast_confirm_enabled: bool | None = None,
         armed_fast_confirm_max_age_seconds: float | None = None,
+        setup_watch_ttl_seconds: float | None = None,
     ):
         self.breakout = BreakoutRetestStrategy()
         self.sweep = LiquiditySweepStrategy()
@@ -71,6 +72,10 @@ class StrategyRouter:
             _env_float("TRADE_ARMED_FAST_CONFIRM_MAX_AGE_SECONDS", 30.0)
             if armed_fast_confirm_max_age_seconds is None else armed_fast_confirm_max_age_seconds
         )
+        watch_ttl = (
+            _env_float("TRADE_SETUP_WATCH_TTL_SECONDS", 1800.0)
+            if setup_watch_ttl_seconds is None else setup_watch_ttl_seconds
+        )
         self.armed = ArmedEntryEngine(
             ttl_seconds=ttl,
             chase_tolerance_atr=chase_tolerance,
@@ -78,6 +83,7 @@ class StrategyRouter:
             consumed_ttl_seconds=consumed_ttl,
             fast_confirm_enabled=fast_confirm_enabled,
             fast_confirm_max_age_seconds=fast_confirm_max_age,
+            watch_ttl_seconds=watch_ttl,
         )
         self.last_trace = {}
 
@@ -124,6 +130,39 @@ class StrategyRouter:
             "armed": dict(self.armed.last_trace or {}),
         }
         return setup
+
+
+    def discover_watch(self, regime, snapshot, symbol, timeframe, regime_metadata=None):
+        watch = self.armed.discover_watch(
+            regime, snapshot, symbol, timeframe, regime_metadata=regime_metadata
+        )
+        branches = dict(self.armed.watch_trace or {})
+        primary = "setup_watching" if watch is not None else "no_watchable_precursor"
+        if watch is None:
+            sweep_reason = str((branches.get("sweep") or {}).get("reason") or "")
+            breakout_reason = str((branches.get("breakout") or {}).get("reason") or "")
+            primary = sweep_reason or breakout_reason or primary
+        self.last_trace = {
+            "selected": None,
+            "reason": "setup_watching" if watch is not None else primary,
+            "watch": {
+                "accepted": watch is not None,
+                "reason": primary,
+                "branches": branches,
+                "strategy": getattr(getattr(watch, "strategy", None), "value", None) if watch else None,
+                "direction": getattr(getattr(watch, "direction", None), "value", None) if watch else None,
+            },
+        }
+        return watch
+
+    def advance_watch(self, watch, snapshot):
+        status, setup, trace = self.armed.advance_watch(watch, snapshot)
+        self.last_trace = {
+            "selected": getattr(getattr(setup, "strategy", None), "value", None) if setup else None,
+            "reason": f"watch_{status}",
+            "watch": {"status": status, **dict(trace or {})},
+        }
+        return status, setup, trace
 
     def trigger_armed(self, setup, snapshot, decision_id):
         status, intent, trace = self.armed.trigger(setup, snapshot, decision_id)

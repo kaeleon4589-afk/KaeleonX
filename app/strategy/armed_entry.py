@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import math
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from app.models.enums import Direction, Strategy
-from app.models.trading import ArmedSetup, TradeIntent
+from app.models.trading import ArmedSetup, SetupWatch, TradeIntent
 from app.position.protection import (
     break_even_activation_ratio,
     breakout_retest_target_rr,
@@ -45,6 +46,8 @@ FAST_CONFIRM_MIN_RVOL = 0.90
 FAST_CONFIRM_CLOSE_LONG = 0.72
 FAST_CONFIRM_CLOSE_SHORT = 0.28
 CHASE_EDGE_MAX_ATR = 0.02
+WATCH_BREAKOUT_MAX_AGE_BARS = 2
+WATCH_SWEEP_PROXIMITY_ATR = 0.45
 
 
 def _now_ms() -> int:
@@ -305,6 +308,7 @@ class ArmedEntryEngine:
         consumed_ttl_seconds: float = 3600.0,
         fast_confirm_enabled: bool = True,
         fast_confirm_max_age_seconds: float = 30.0,
+        watch_ttl_seconds: float = 1800.0,
     ):
         self.ttl_seconds = max(60.0, float(ttl_seconds))
         self.chase_tolerance_atr = max(0.0, float(chase_tolerance_atr))
@@ -312,7 +316,9 @@ class ArmedEntryEngine:
         self.consumed_ttl_seconds = max(self.ttl_seconds, float(consumed_ttl_seconds))
         self.fast_confirm_enabled = bool(fast_confirm_enabled)
         self.fast_confirm_max_age_seconds = max(0.0, float(fast_confirm_max_age_seconds))
+        self.watch_ttl_seconds = max(300.0, float(watch_ttl_seconds))
         self._consumed_setups: dict[str, tuple[int, str]] = {}
+        self.watch_trace: dict[str, Any] = {}
         self.last_trace: dict[str, Any] = {}
         self.branch_trace: dict[str, dict[str, Any]] = {}
 
@@ -409,14 +415,24 @@ class ArmedEntryEngine:
 
         bias1h, diag1h = breakout._bias(tf1h, adx_min=breakout.H1_ADX_MIN)
         bias15, diag15 = breakout._bias(tf15, adx_min=breakout.M15_ADX_MIN)
-        biases = [x for x in (bias1h, bias15) if x != "none"]
-        if not biases or (len(biases) == 2 and biases[0] != biases[1]):
+        # One directional authority for the whole engine: regime direction +
+        # trend_bias select LONG/SHORT. 1H/15M remain quality confirmations.
+        required_direction, trend_reason = self._liquidity_trend_direction(regime, regime_metadata)
+        if required_direction is None:
             self.branch_trace["breakout"] = {
-                "accepted": False, "reason": "mtf_bias_missing_or_conflict",
+                "accepted": False, "reason": "breakout_no_directional_trend",
+                "trend_reason": trend_reason, "bias_1h": bias1h, "bias_15m": bias15,
+            }
+            return None
+        direction_name = "long" if required_direction == Direction.LONG else "short"
+        explicit_biases = [x for x in (bias1h, bias15) if x != "none"]
+        if any(x != direction_name for x in explicit_biases):
+            self.branch_trace["breakout"] = {
+                "accepted": False, "reason": "mtf_bias_conflict_with_trend",
+                "trend_direction": required_direction.value,
                 "bias_1h": bias1h, "bias_15m": bias15,
             }
             return None
-        direction_name = biases[0]
         exhausted, exhaustion_diag = breakout._htf_exhaustion(direction_name, tf1h, tf15)
         if exhausted:
             self.branch_trace["breakout"] = {"accepted": False, "reason": "higher_timeframe_move_exhausted", **exhaustion_diag}
@@ -684,6 +700,250 @@ class ArmedEntryEngine:
             {"accepted": False, "reason": "no_liquidity_sweep_to_arm"}
         )
         return best
+
+
+    def _watch_expiry(self) -> tuple[int, int]:
+        created = _now_ms()
+        return created, created + int(self.watch_ttl_seconds * 1000)
+
+    def _discover_breakout_watch(self, regime, snapshot, symbol: str, timeframe: str,
+                                 regime_metadata: dict | None) -> SetupWatch | None:
+        frames = getattr(snapshot, "timeframes", {}) or {}
+        c5 = list(frames.get("5m", getattr(snapshot, "candles", [])) or [])
+        c15 = list(frames.get("15m", []) or [])
+        c1h = list(frames.get("1h", []) or [])
+        ok, _ = candle_quality(c5, breakout.MIN_CANDLES_REQUIRED, breakout.MIN_NONZERO_VOLUME_RATIO)
+        if not ok or len(c15) < 200 or len(c1h) < 200:
+            self.watch_trace["breakout"] = {"accepted": False, "reason": "insufficient_or_bad_mtf_data"}
+            return None
+        tf5, tf15, tf1h = breakout._tf_values(c5), breakout._tf_values(c15), breakout._tf_values(c1h)
+        atr5 = float(tf5["atr"])
+        close5 = float(tf5["c"][-1])
+        if atr5 <= 0:
+            self.watch_trace["breakout"] = {"accepted": False, "reason": "invalid_atr"}
+            return None
+        atr_pct = atr5 / max(close5, 1e-12)
+        if not breakout.ATR_PCT_MIN <= atr_pct <= breakout.ATR_PCT_MAX:
+            self.watch_trace["breakout"] = {"accepted": False, "reason": "atr_out_of_range", "atr_pct": atr_pct}
+            return None
+
+        required_direction, trend_reason = self._liquidity_trend_direction(regime, regime_metadata)
+        if required_direction is None:
+            self.watch_trace["breakout"] = {"accepted": False, "reason": "breakout_no_directional_trend", "trend_reason": trend_reason}
+            return None
+        direction_name = "long" if required_direction == Direction.LONG else "short"
+        bias1h, diag1h = breakout._bias(tf1h, adx_min=breakout.H1_ADX_MIN)
+        bias15, diag15 = breakout._bias(tf15, adx_min=breakout.M15_ADX_MIN)
+        explicit = [x for x in (bias1h, bias15) if x != "none"]
+        if any(x != direction_name for x in explicit):
+            self.watch_trace["breakout"] = {
+                "accepted": False, "reason": "mtf_bias_conflict_with_trend",
+                "trend_direction": required_direction.value, "bias_1h": bias1h, "bias_15m": bias15,
+            }
+            return None
+        exhausted, exhaustion_diag = breakout._htf_exhaustion(direction_name, tf1h, tf15)
+        if exhausted:
+            self.watch_trace["breakout"] = {"accepted": False, "reason": "higher_timeframe_move_exhausted", **exhaustion_diag}
+            return None
+
+        o, h, l, c, v = tf5["o"], tf5["h"], tf5["l"], tf5["c"], tf5["v"]
+        i = len(c) - 1
+        for age in range(0, WATCH_BREAKOUT_MAX_AGE_BARS + 1):
+            idx = i - age
+            if idx <= breakout.STRUCTURE_LOOKBACK_BARS:
+                continue
+            start = idx - breakout.STRUCTURE_LOOKBACK_BARS
+            structural_level = max(h[start:idx]) if direction_name == "long" else min(l[start:idx])
+            body, close_pos = breakout._candle_shape(o, h, l, c, idx)
+            rvol = relative_volume(v, idx)
+            extension = abs(float(c[idx]) - float(structural_level)) / atr5
+            if direction_name == "long":
+                breakout_ok = (
+                    float(c[idx]) > float(o[idx])
+                    and float(c[idx]) >= float(structural_level) + atr5 * breakout.BREAKOUT_CLOSE_BUFFER_ATR
+                    and body >= breakout.BREAKOUT_MIN_BODY_RATIO
+                    and close_pos >= breakout.BREAKOUT_CLOSE_POS_LONG_MIN
+                    and rvol >= breakout.BREAKOUT_MIN_RVOL
+                    and extension <= breakout.BREAKOUT_MAX_EXTENSION_ATR
+                )
+            else:
+                breakout_ok = (
+                    float(c[idx]) < float(o[idx])
+                    and float(c[idx]) <= float(structural_level) - atr5 * breakout.BREAKOUT_CLOSE_BUFFER_ATR
+                    and body >= breakout.BREAKOUT_MIN_BODY_RATIO
+                    and close_pos <= breakout.BREAKOUT_CLOSE_POS_SHORT_MAX
+                    and rvol >= breakout.BREAKOUT_MIN_RVOL
+                    and extension <= breakout.BREAKOUT_MAX_EXTENSION_ATR
+                )
+            if not breakout_ok:
+                continue
+            created, expires = self._watch_expiry()
+            candle_ts = int(getattr(c5[idx], "timestamp", created))
+            watch = SetupWatch(
+                watch_id=f"{symbol}:BRW:{candle_ts}:{required_direction.value}",
+                symbol=symbol, strategy=Strategy.BREAKOUT_RETEST, direction=required_direction,
+                created_at_ms=created, expires_at_ms=expires, timeframe=timeframe,
+                reasons=("breakout_detected", "waiting_retest"),
+                metadata={
+                    "watch_model": "breakout_retest_watch_v1",
+                    "breakout_candle_ts": candle_ts,
+                    "structural_level": float(structural_level),
+                    "atr_value_at_watch": atr5,
+                    "breakout_rvol": float(rvol),
+                    "breakout_body_ratio": float(body),
+                    "breakout_close_pos": float(close_pos),
+                    "trend_direction": required_direction.value,
+                    "trend_reason": trend_reason,
+                    "bias_1h": bias1h, "bias_15m": bias15,
+                    "risk_multiplier": max(float(getattr(regime, "risk_multiplier", 1.0) or 1.0), 0.65),
+                    "active_regime": self._active_regime(regime_metadata),
+                    **exhaustion_diag,
+                },
+            )
+            self.watch_trace["breakout"] = {
+                "accepted": True, "reason": "breakout_detected_waiting_retest",
+                "watch_id": watch.watch_id, "direction": required_direction.value,
+                "structural_level": float(structural_level), "breakout_age_bars": age,
+            }
+            return watch
+        self.watch_trace["breakout"] = {"accepted": False, "reason": "breakout_not_detected"}
+        return None
+
+    def _discover_sweep_watch(self, regime, snapshot, symbol: str, timeframe: str,
+                              regime_metadata: dict | None) -> SetupWatch | None:
+        required_direction, trend_reason = self._liquidity_trend_direction(regime, regime_metadata)
+        if required_direction is None:
+            self.watch_trace["sweep"] = {"accepted": False, "reason": trend_reason}
+            return None
+        frames = getattr(snapshot, "timeframes", {}) or {}
+        c5 = list(frames.get("5m", getattr(snapshot, "candles", [])) or [])
+        ok, _ = candle_quality(c5, sweep.MIN_CANDLES_REQUIRED, sweep.MIN_NONZERO_VOLUME_RATIO)
+        if not ok:
+            self.watch_trace["sweep"] = {"accepted": False, "reason": "bad_5m_candle_quality"}
+            return None
+        o, h, l, c, v = extract(c5)
+        i = len(c) - 1
+        atr5 = atr(h, l, c, 14)
+        if atr5 <= 0:
+            self.watch_trace["sweep"] = {"accepted": False, "reason": "invalid_atr"}
+            return None
+        atr_pct = float(atr5) / max(float(c[-1]), 1e-12)
+        if not sweep.ATR_PCT_MIN <= atr_pct <= sweep.ATR_PCT_MAX:
+            self.watch_trace["sweep"] = {"accepted": False, "reason": "atr_out_of_range", "atr_pct": atr_pct}
+            return None
+        left = max(0, i - sweep.SWEEP_LOOKBACK)
+        if i - left < 12:
+            self.watch_trace["sweep"] = {"accepted": False, "reason": "insufficient_liquidity_history"}
+            return None
+        if required_direction == Direction.LONG:
+            level = min(l[left:i])
+            proximity = (float(l[i]) - float(level)) / atr5
+            directional_close_distance = (float(c[i]) - float(level)) / atr5
+        else:
+            level = max(h[left:i])
+            proximity = (float(level) - float(h[i])) / atr5
+            directional_close_distance = (float(level) - float(c[i])) / atr5
+        # Start following before the sweep completes. A low/high within 0.45 ATR
+        # of the liquidity pool is close enough to justify priority monitoring,
+        # but prices already far through the level are left to normal discovery.
+        if proximity > WATCH_SWEEP_PROXIMITY_ATR or directional_close_distance < -0.70:
+            self.watch_trace["sweep"] = {
+                "accepted": False, "reason": "sweep_level_not_reached",
+                "proximity_atr": float(proximity), "liquidity_level": float(level),
+            }
+            return None
+        created, expires = self._watch_expiry()
+        watch = SetupWatch(
+            watch_id=f"{symbol}:LSW:{int(getattr(c5[i], 'timestamp', created))}:{required_direction.value}",
+            symbol=symbol, strategy=Strategy.LIQUIDITY_SWEEP, direction=required_direction,
+            created_at_ms=created, expires_at_ms=expires, timeframe=timeframe,
+            reasons=("trend_aligned_liquidity_pool_near", "waiting_sweep_reclaim"),
+            metadata={
+                "watch_model": "liquidity_sweep_watch_v1",
+                "liquidity_level": float(level), "atr_value_at_watch": float(atr5),
+                "proximity_atr": float(proximity), "trend_direction": required_direction.value,
+                "trend_reason": trend_reason,
+                "risk_multiplier": max(float(getattr(regime, "risk_multiplier", 1.0) or 1.0), 0.65),
+                "active_regime": self._active_regime(regime_metadata),
+            },
+        )
+        self.watch_trace["sweep"] = {
+            "accepted": True, "reason": "liquidity_level_near_waiting_sweep",
+            "watch_id": watch.watch_id, "direction": required_direction.value,
+            "liquidity_level": float(level), "proximity_atr": float(proximity),
+        }
+        return watch
+
+    def discover_watch(self, regime, snapshot, symbol: str, timeframe: str,
+                       regime_metadata: dict | None = None) -> SetupWatch | None:
+        self.watch_trace = {}
+        active = self._active_regime(regime_metadata)
+        if getattr(regime, "hard_block", False) and active == "UNKNOWN":
+            self.watch_trace = {"accepted": False, "reason": "regime_unknown_hard_block"}
+            return None
+        # BREAKOUT_RETEST gets first-class priority in trend continuation: follow
+        # the breakout immediately, rather than hoping the rotating scanner lands
+        # on the symbol again after the retest has already completed.
+        if active == "TREND_CONTINUATION" or bool(getattr(regime, "breakout_allowed", False)):
+            item = self._discover_breakout_watch(regime, snapshot, symbol, timeframe, regime_metadata)
+            if item is not None:
+                return item
+        if active == "RANGE":
+            self.watch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
+            return None
+        if active == "VOLATILE_SWEEP" and not bool(getattr(regime, "sweep_allowed", False)):
+            self.watch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
+            return None
+        if active in {"TREND_CONTINUATION", "VOLATILE_SWEEP"} or bool(getattr(regime, "sweep_allowed", False)):
+            return self._discover_sweep_watch(regime, snapshot, symbol, timeframe, regime_metadata)
+        return None
+
+    def advance_watch(self, watch: SetupWatch, snapshot) -> tuple[str, ArmedSetup | None, dict]:
+        now_ms = _now_ms()
+        if now_ms >= int(watch.expires_at_ms):
+            return "cancelled", None, {"reason": "watch_expired"}
+        frames = getattr(snapshot, "timeframes", {}) or {}
+        if not frames.get("5m"):
+            return "pending", None, {"reason": "watch_waiting_5m_data"}
+        direction_value = str(watch.direction.value)
+        regime = SimpleNamespace(
+            hard_block=False,
+            breakout_allowed=(watch.strategy == Strategy.BREAKOUT_RETEST),
+            sweep_allowed=(watch.strategy == Strategy.LIQUIDITY_SWEEP),
+            risk_multiplier=float((watch.metadata or {}).get("risk_multiplier") or 1.0),
+            direction=watch.direction,
+        )
+        meta = {
+            "active": str((watch.metadata or {}).get("active_regime") or "TREND_CONTINUATION"),
+            "features": {"trend_bias": "long" if watch.direction == Direction.LONG else "short"},
+        }
+        self.branch_trace = {}
+        if watch.strategy == Strategy.BREAKOUT_RETEST:
+            setup = self._discover_breakout(regime, snapshot, watch.symbol, watch.timeframe, meta)
+            trace = dict(self.branch_trace.get("breakout") or {})
+            if setup is not None and setup.direction == watch.direction:
+                return "armed", setup, {"reason": "retest_completed", "watch_id": watch.watch_id, **trace}
+            reason = str(trace.get("reason") or "waiting_retest")
+            fatal = reason in {"mtf_bias_conflict_with_trend", "breakout_no_directional_trend", "higher_timeframe_move_exhausted"}
+            if fatal:
+                return "cancelled", None, {"reason": reason, "watch_id": watch.watch_id, **trace}
+            # Keep the watch alive while the specific breakout is still within the
+            # retest horizon. If it ages out, a new breakout must create a new watch.
+            c5 = list(frames.get("5m") or [])
+            original_ts = int((watch.metadata or {}).get("breakout_candle_ts") or 0)
+            index = next((i for i, candle in enumerate(c5) if int(getattr(candle, "timestamp", 0) or 0) == original_ts), None)
+            if index is not None and len(c5) - 1 - index > BREAKOUT_ARM_MAX_RETEST_BARS:
+                return "cancelled", None, {"reason": "breakout_retest_window_expired", "watch_id": watch.watch_id}
+            return "pending", None, {"reason": "waiting_retest", "watch_id": watch.watch_id, "detail": reason, **trace}
+
+        setup = self._discover_sweep(regime, snapshot, watch.symbol, watch.timeframe, meta)
+        trace = dict(self.branch_trace.get("sweep") or {})
+        if setup is not None and setup.direction == watch.direction:
+            return "armed", setup, {"reason": "sweep_reclaimed", "watch_id": watch.watch_id, **trace}
+        reason = str(trace.get("reason") or "waiting_sweep_reclaim")
+        if reason in {"liquidity_sweep_trend_conflict", "liquidity_sweep_no_directional_trend"}:
+            return "cancelled", None, {"reason": reason, "watch_id": watch.watch_id, **trace}
+        return "pending", None, {"reason": "waiting_sweep_reclaim", "watch_id": watch.watch_id, "detail": reason, **trace}
 
     def discover(self, regime, snapshot, symbol: str, timeframe: str,
                  regime_metadata: dict | None = None) -> ArmedSetup | None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app.coinw.live_adapter import build_live_adapter_from_credentials
 from app.execution.demo import DemoExecutionEngine
@@ -183,7 +183,7 @@ class UserTradingRuntimeManager:
                     stop_gap_bps=row.get('stop_gap_bps'),
                     exit_quote_delay_ms=row.get('exit_quote_delay_ms'),
                 )
-                for attr in ("strategy", "quality", "execution_rr", "structural_rr"):
+                for attr in ("strategy", "quality", "execution_rr", "structural_rr", "lifecycle_id", "watch_id", "setup_id"):
                     if row.get(attr) is not None:
                         setattr(restored, attr, row.get(attr))
                 position_manager.add(restored, persist=False)
@@ -271,11 +271,22 @@ class UserTradingRuntimeManager:
                     timeframe=str(raw.get("timeframe") or "5m"),
                     reasons=tuple(raw.get("reasons") or ()), metadata=dict(raw.get("metadata") or {}),
                 )
+                restored_setup = orchestrator._ensure_armed_lifecycle(restored_setup)
+                lifecycle_ctx = orchestrator._lifecycle_context(setup=restored_setup, decision_id=restored_setup.setup_id)
                 orchestrator.armed_setups[restored_setup.symbol] = restored_setup
                 self.audit.event(
                     "SETUP_RESTORED", restored_setup.setup_id, user_id=user_id, mode=mode,
-                    symbol=restored_setup.symbol, setup_id=restored_setup.setup_id,
-                    expires_at_ms=restored_setup.expires_at_ms,
+                    symbol=restored_setup.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=restored_setup.setup_id,
+                    stage="ARMED", restored=True, strategy=restored_setup.strategy.value,
+                    direction=restored_setup.direction.value, expires_at_ms=restored_setup.expires_at_ms,
+                )
+                orchestrator._schedule_lifecycle_stage(
+                    user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="ARMED",
+                    symbol=restored_setup.symbol, strategy=restored_setup.strategy,
+                    direction=restored_setup.direction, decision_id=restored_setup.setup_id,
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=restored_setup.setup_id,
+                    reason="setup_restored", details={"restored": True},
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 self.audit.event(
@@ -305,13 +316,25 @@ class UserTradingRuntimeManager:
                     timeframe=str(raw.get("timeframe") or "5m"),
                     reasons=tuple(raw.get("reasons") or ()), metadata=dict(raw.get("metadata") or {}),
                 )
+                watch_meta = dict(restored_watch.metadata or {})
+                watch_meta.setdefault("lifecycle_id", restored_watch.watch_id)
+                watch_meta.setdefault("lifecycle_origin", "restored_watch")
+                restored_watch = replace(restored_watch, metadata=watch_meta)
                 if restored_watch.symbol not in orchestrator.armed_setups:
+                    lifecycle_ctx = orchestrator._lifecycle_context(watch=restored_watch, decision_id=restored_watch.watch_id)
                     orchestrator.watching_setups[restored_watch.symbol] = restored_watch
                     self.audit.event(
                         "SETUP_WATCH_RESTORED", restored_watch.watch_id, user_id=user_id, mode=mode,
-                        symbol=restored_watch.symbol, watch_id=restored_watch.watch_id,
+                        symbol=restored_watch.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                        watch_id=restored_watch.watch_id, stage="WATCHING", restored=True,
                         strategy=restored_watch.strategy.value, direction=restored_watch.direction.value,
                         expires_at_ms=restored_watch.expires_at_ms,
+                    )
+                    orchestrator._schedule_lifecycle_stage(
+                        user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="WATCHING",
+                        symbol=restored_watch.symbol, strategy=restored_watch.strategy,
+                        direction=restored_watch.direction, decision_id=restored_watch.watch_id,
+                        watch_id=restored_watch.watch_id, reason="watch_restored", details={"restored": True},
                     )
             except (KeyError, TypeError, ValueError) as exc:
                 self.audit.event(

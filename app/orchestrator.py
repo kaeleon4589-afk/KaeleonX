@@ -67,6 +67,7 @@ class TradingOrchestrator:
         self.armed_entry_enabled = bool(armed_entry_enabled)
         self.legacy_entry_fallback_enabled = bool(legacy_entry_fallback_enabled)
         self.armed_setups = {}
+        self.watching_setups = {}
         self.rejection_funnel = RejectionFunnel(
             emit_seconds=funnel_emit_seconds, emit_every=funnel_emit_every
         )
@@ -141,6 +142,40 @@ class TradingOrchestrator:
                 "ARMED_STATE_PERSIST_ERROR", setup.setup_id, level="ERROR",
                 user_id=user_id, mode=self.execution_mode, symbol=setup.symbol, error=err,
             )
+
+    async def _persist_watch_active(self, user_id, watch) -> None:
+        expires_at = datetime.fromtimestamp(int(watch.expires_at_ms) / 1000.0, tz=timezone.utc)
+        ok, err = await self.persistence._upsert(
+            "setup_watches",
+            {"user_id": user_id, "mode": self.execution_mode, "symbol": watch.symbol},
+            {
+                "user_id": user_id, "mode": self.execution_mode, "symbol": watch.symbol,
+                "watch_id": watch.watch_id, "active": True, "watch": watch,
+                "created_at_ms": int(watch.created_at_ms), "expires_at_ms": int(watch.expires_at_ms),
+                "expires_at": expires_at, "terminal_reason": None,
+            },
+        )
+        if not ok:
+            self.audit.event(
+                "WATCH_STATE_PERSIST_ERROR", watch.watch_id, level="ERROR",
+                user_id=user_id, mode=self.execution_mode, symbol=watch.symbol, error=err,
+            )
+
+    def _schedule_watch_terminal(self, user_id, watch, reason: str) -> None:
+        now_ms = int(time.time() * 1000)
+        expires_at = datetime.fromtimestamp(max(int(watch.expires_at_ms), now_ms + 60_000) / 1000.0, tz=timezone.utc)
+        self.persistence.schedule_upsert(
+            collection="setup_watches",
+            key={"user_id": user_id, "mode": self.execution_mode, "symbol": watch.symbol},
+            document={
+                "user_id": user_id, "mode": self.execution_mode, "symbol": watch.symbol,
+                "watch_id": watch.watch_id, "active": False, "watch": watch,
+                "terminal_reason": str(reason), "terminal_at_ms": now_ms,
+                "expires_at_ms": int(watch.expires_at_ms), "expires_at": expires_at,
+            },
+            event_name="WATCH_STATE_PERSIST_ERROR", decision_id=watch.watch_id,
+            user_id=user_id, mode=self.execution_mode, symbol=watch.symbol,
+        )
 
     def _schedule_armed_terminal(self, user_id, setup, reason: str) -> None:
         now_ms = int(time.time() * 1000)
@@ -493,7 +528,9 @@ class TradingOrchestrator:
             )
             return None
         armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
-        if not allow_entries or (getattr(snapshot, 'monitor_only', False) and not armed_monitor):
+        watch_monitor = bool(getattr(snapshot, 'watch_monitor', False))
+        priority_tracking = armed_monitor or watch_monitor
+        if not allow_entries or (getattr(snapshot, 'monitor_only', False) and not priority_tracking):
             self.audit.event(
                 "ENTRY_SKIPPED", user_id, level="DEBUG", persist=False,
                 user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
@@ -522,7 +559,7 @@ class TradingOrchestrator:
                 reason='post_loss_symbol_cooldown', remaining_seconds=round(symbol_remaining, 2),
             )
             return None
-        if now - self.last_decision.get(key, 0) < self.cooldown_seconds:
+        if (not priority_tracking) and now - self.last_decision.get(key, 0) < self.cooldown_seconds:
             self.audit.event(
                 "ENTRY_SKIPPED", user_id, level="DEBUG", persist=False,
                 user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
@@ -560,11 +597,60 @@ class TradingOrchestrator:
             # plus CLOSED 1m candles; there is no reason to wait for another full
             # scanner rotation or to recompute the 5m/15m/1h regime.
             priority_armed = bool(getattr(snapshot, "armed_monitor", False))
+            priority_watch = bool(getattr(snapshot, "watch_monitor", False))
             intent = None
             strategy_trace = {}
             regime = None
             regime_meta = {}
             router_kwargs = {"snapshot": snapshot}
+
+            if priority_watch:
+                watch = self.watching_setups.get(snapshot.symbol)
+                if watch is None:
+                    return None
+                status, armed, watch_trace = self.router.advance_watch(watch, snapshot)
+                strategy_trace = getattr(self.router, "last_trace", {}) or {}
+                if status == "cancelled":
+                    self.watching_setups.pop(snapshot.symbol, None)
+                    reason = str((watch_trace or {}).get("reason") or "watch_cancelled")
+                    self._schedule_watch_terminal(user_id, watch, reason)
+                    self.last_rejection = reason
+                    self.audit.event(
+                        "SETUP_WATCH_CANCELLED", decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        watch_id=getattr(watch, "watch_id", None), reason=reason,
+                        source="watch_priority_monitor", trace=watch_trace,
+                    )
+                    return None
+                if status == "pending":
+                    reason = str((watch_trace or {}).get("reason") or "watch_pending")
+                    self.last_rejection = reason
+                    self.audit.event(
+                        "SETUP_WATCH_PENDING", decision_id, level="DEBUG", persist=False,
+                        user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                        watch_id=getattr(watch, "watch_id", None), reason=reason, trace=watch_trace,
+                    )
+                    return None
+                if armed is None:
+                    return None
+                self.watching_setups.pop(snapshot.symbol, None)
+                self._schedule_watch_terminal(user_id, watch, "setup_armed")
+                self.armed_setups[snapshot.symbol] = armed
+                await self._persist_armed_active(user_id, armed)
+                self.last_rejection = "setup_armed_waiting_trigger"
+                self._funnel("armed", user_id=user_id, symbol=snapshot.symbol)
+                self.audit.event(
+                    "SETUP_ARMED", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, setup_id=armed.setup_id, strategy=armed.strategy.value,
+                    direction=armed.direction.value, quality=armed.quality,
+                    trigger_price=armed.trigger_price, invalidation_price=armed.invalidation_price,
+                    entry_zone_low=armed.entry_zone_low, entry_zone_high=armed.entry_zone_high,
+                    stop_price=armed.stop_price, target_price=armed.target_price,
+                    expires_at_ms=armed.expires_at_ms, priority_monitor=True,
+                    source="watch_priority_monitor", watch_id=getattr(watch, "watch_id", None),
+                    watch_trace=watch_trace,
+                )
+                return None
 
             if priority_armed:
                 armed = self.armed_setups.get(snapshot.symbol)
@@ -698,6 +784,16 @@ class TradingOrchestrator:
                             source="scanner", trace=armed_trace,
                         )
                     else:
+                        existing_watch = self.watching_setups.get(snapshot.symbol)
+                        if existing_watch is not None:
+                            self.audit.event(
+                                "SETUP_WATCH_PRESENT", decision_id, level="DEBUG", persist=False,
+                                user_id=user_id, mode=self.execution_mode, symbol=snapshot.symbol,
+                                watch_id=getattr(existing_watch, "watch_id", None),
+                                strategy=getattr(getattr(existing_watch, "strategy", None), "value", None),
+                                direction=getattr(getattr(existing_watch, "direction", None), "value", None),
+                            )
+                            return None
                         armed = self.router.discover_armed(
                             regime, snapshot, snapshot.symbol, snapshot.timeframe,
                             regime_metadata=regime_meta,
@@ -716,12 +812,32 @@ class TradingOrchestrator:
                                 trigger_price=armed.trigger_price, invalidation_price=armed.invalidation_price,
                                 entry_zone_low=armed.entry_zone_low, entry_zone_high=armed.entry_zone_high,
                                 stop_price=armed.stop_price, target_price=armed.target_price,
-                                expires_at_ms=armed.expires_at_ms, priority_monitor=True,
+                                expires_at_ms=armed.expires_at_ms, priority_monitor=True, source="scanner_complete_setup",
+                            )
+                            return None
+                        watch = None
+                        if hasattr(self.router, "discover_watch"):
+                            watch = self.router.discover_watch(
+                                regime, snapshot, snapshot.symbol, snapshot.timeframe,
+                                regime_metadata=regime_meta,
+                            )
+                            strategy_trace = getattr(self.router, "last_trace", {}) or strategy_trace
+                        if watch is not None:
+                            self.watching_setups[snapshot.symbol] = watch
+                            await self._persist_watch_active(user_id, watch)
+                            self.last_rejection = "setup_watching"
+                            self._funnel("watching", user_id=user_id, symbol=snapshot.symbol)
+                            self.audit.event(
+                                "SETUP_WATCHING", decision_id, user_id=user_id, mode=self.execution_mode,
+                                symbol=snapshot.symbol, watch_id=watch.watch_id, strategy=watch.strategy.value,
+                                direction=watch.direction.value, expires_at_ms=watch.expires_at_ms,
+                                reasons=list(watch.reasons), trace=(strategy_trace.get("watch") if isinstance(strategy_trace, dict) else {}),
                             )
                             return None
                         if not self.legacy_entry_fallback_enabled:
+                            watch_trace = strategy_trace.get("watch") if isinstance(strategy_trace, dict) else {}
                             armed_trace = strategy_trace.get("armed") if isinstance(strategy_trace, dict) else {}
-                            rejection_reason = str((armed_trace or {}).get("reason") or "no_armable_setup")
+                            rejection_reason = str((watch_trace or {}).get("reason") or (armed_trace or {}).get("reason") or "no_watchable_precursor")
                             self.last_rejection = rejection_reason
                             self.last_decision[key] = now
                             self._funnel("strategy_rejected", rejection_reason, user_id=user_id, symbol=snapshot.symbol)

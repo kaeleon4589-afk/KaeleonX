@@ -228,11 +228,21 @@ class LiquiditySweepStrategy:
             return self._reject("atr_too_high", atr_pct=atr_pct, max=ATR_PCT_MAX)
         ema20, ema50 = ema(c, EMA_FAST), ema(c, EMA_MID)
 
-        long_candidate = _detect("long", o=o, h=h, l=l, c=c, v=v, ema20=ema20, ema50=ema50, atr_value=atr_value)
-        short_candidate = _detect("short", o=o, h=h, l=l, c=c, v=v, ema20=ema20, ema50=ema50, atr_value=atr_value)
-        if not long_candidate and not short_candidate:
-            return self._reject("no_valid_sweep")
-        candidate = max([x for x in (long_candidate, short_candidate) if x], key=lambda x: x["score"])
+        # Hard product rule: Liquidity Sweep never trades against the detected
+        # market trend. Bullish => LONG only, bearish => SHORT only. Neutral or
+        # unknown trend means no executable liquidity-sweep trade.
+        raw_direction = getattr(getattr(regime, "direction", None), "value", getattr(regime, "direction", None))
+        raw_direction = str(raw_direction or "").strip().upper()
+        if raw_direction in {"BULLISH", "LONG"}:
+            candidate = _detect("long", o=o, h=h, l=l, c=c, v=v, ema20=ema20, ema50=ema50, atr_value=atr_value)
+            required_side = "long"
+        elif raw_direction in {"BEARISH", "SHORT"}:
+            candidate = _detect("short", o=o, h=h, l=l, c=c, v=v, ema20=ema20, ema50=ema50, atr_value=atr_value)
+            required_side = "short"
+        else:
+            return self._reject("liquidity_sweep_no_directional_trend")
+        if not candidate:
+            return self._reject("no_valid_sweep", required_side=required_side)
         score = float(candidate["score"])
         if score < MIN_SCORE:
             return self._reject("score_too_low", score=score, min=MIN_SCORE)
@@ -265,6 +275,8 @@ class LiquiditySweepStrategy:
             "reason": "setup_valid",
             "score": score,
             "side": candidate["direction"],
+            "trend_aligned": True,
+            "trend_direction": required_side,
             "sweep_level": candidate["liquidity_level"],
             "depth_atr": candidate["sweep_depth_atr"],
             "wick_ratio": candidate["sweep_wick_ratio"],
@@ -296,7 +308,9 @@ class LiquiditySweepStrategy:
             timeframe,
             ("liquidity_swept", "level_reclaimed", "trigger_confirmed"),
             {
-                "strategy_model": "liquidity_sweep_reversal_5m_v2_entry_quality",
+                "strategy_model": "liquidity_sweep_trend_aligned_5m_v3",
+                "trend_aligned": True,
+                "trend_direction_at_entry": direction.value,
                 "score": score,
                 "atr_pct": atr_pct,
                 "atr_value": atr_value,

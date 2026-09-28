@@ -28,6 +28,9 @@ ARM_MIN_RR = 1.10
 ARM_MIN_STOP_ATR = 0.28
 ARM_MAX_STOP_ATR = 1.80
 BREAKOUT_ENTRY_MAX_EXTENSION_ATR = 0.62
+# Slightly wider freshness window for breakout/retest discovery. The structural,
+# MTF, exhaustion, retest, RR and 1m confirmation gates remain unchanged.
+BREAKOUT_ARM_MAX_RETEST_BARS = max(breakout.RETEST_MAX_BARS_AFTER_BREAKOUT, 4)
 SWEEP_ENTRY_MAX_EXTENSION_ATR = 0.90
 MICRO_TRIGGER_MIN_BODY_RATIO = 0.22
 MICRO_TRIGGER_MIN_RVOL = 0.70
@@ -358,6 +361,31 @@ class ArmedEntryEngine:
     def _active_regime(regime_metadata: dict | None) -> str:
         return str((regime_metadata or {}).get("active") or "UNKNOWN").upper()
 
+    @staticmethod
+    def _liquidity_trend_direction(regime, regime_metadata: dict | None) -> tuple[Direction | None, str]:
+        """Resolve the only direction a liquidity sweep may trade.
+
+        Liquidity Sweep is trend-following in KAELEON: bullish context permits
+        LONG only, bearish context permits SHORT only. Neutral/unknown or
+        conflicting regime-vs-feature direction blocks the strategy entirely.
+        """
+        raw_regime = getattr(getattr(regime, "direction", None), "value", getattr(regime, "direction", None))
+        raw_regime = str(raw_regime or "").strip().upper()
+        regime_side = (
+            Direction.LONG if raw_regime in {"BULLISH", "LONG"}
+            else Direction.SHORT if raw_regime in {"BEARISH", "SHORT"}
+            else None
+        )
+        features = (regime_metadata or {}).get("features") or {}
+        raw_bias = str(features.get("trend_bias") or "").strip().lower()
+        bias_side = Direction.LONG if raw_bias == "long" else (Direction.SHORT if raw_bias == "short" else None)
+        if regime_side is not None and bias_side is not None and regime_side != bias_side:
+            return None, "liquidity_sweep_trend_conflict"
+        side = regime_side or bias_side
+        if side is None:
+            return None, "liquidity_sweep_no_directional_trend"
+        return side, "liquidity_sweep_trend_aligned"
+
     def _discover_breakout(self, regime, snapshot, symbol: str, timeframe: str,
                            regime_metadata: dict | None) -> ArmedSetup | None:
         frames = getattr(snapshot, "timeframes", {}) or {}
@@ -397,7 +425,7 @@ class ArmedEntryEngine:
         o, h, l, c, v = tf5["o"], tf5["h"], tf5["l"], tf5["c"], tf5["v"]
         i = len(c) - 1
         best = None
-        for retest_count in range(1, breakout.RETEST_MAX_BARS_AFTER_BREAKOUT + 1):
+        for retest_count in range(1, BREAKOUT_ARM_MAX_RETEST_BARS + 1):
             breakout_idx = i - retest_count
             if breakout_idx <= breakout.STRUCTURE_LOOKBACK_BARS:
                 continue
@@ -475,7 +503,7 @@ class ArmedEntryEngine:
             htf_q = clamp(((float(diag1h.get("adx", 0)) - 12) + (float(diag15.get("adx", 0)) - 10)) / 30, 0, 1)
             breakout_q = clamp((rvol - 0.8) / 1.0, 0, 1)
             rr_q = clamp((rr - ARM_MIN_RR) / 1.6, 0, 1)
-            fresh_q = clamp(1.0 - (retest_count - 1) / 3.0, 0, 1)
+            fresh_q = clamp(1.0 - (retest_count - 1) / max(BREAKOUT_ARM_MAX_RETEST_BARS, 1), 0, 1)
             score = round(58 + 42 * clamp(0.34 * htf_q + 0.22 * breakout_q + 0.26 * rr_q + 0.18 * fresh_q, 0, 1), 2)
             if score < BREAKOUT_ARM_MIN_SCORE:
                 continue
@@ -526,6 +554,10 @@ class ArmedEntryEngine:
 
     def _discover_sweep(self, regime, snapshot, symbol: str, timeframe: str,
                         regime_metadata: dict | None) -> ArmedSetup | None:
+        required_direction, trend_reason = self._liquidity_trend_direction(regime, regime_metadata)
+        if required_direction is None:
+            self.branch_trace["sweep"] = {"accepted": False, "reason": trend_reason}
+            return None
         frames = getattr(snapshot, "timeframes", {}) or {}
         c5 = list(frames.get("5m", getattr(snapshot, "candles", [])) or [])
         ok, _ = candle_quality(c5, sweep.MIN_CANDLES_REQUIRED, sweep.MIN_NONZERO_VOLUME_RATIO)
@@ -550,7 +582,7 @@ class ArmedEntryEngine:
             left = max(0, sweep_idx - sweep.SWEEP_LOOKBACK)
             if sweep_idx - left < 12:
                 continue
-            for direction_name in ("long", "short"):
+            for direction_name in (("long",) if required_direction == Direction.LONG else ("short",)):
                 if direction_name == "long":
                     level = min(l[left:sweep_idx])
                     extreme = float(l[sweep_idx])
@@ -638,6 +670,10 @@ class ArmedEntryEngine:
                         "structural_rr_estimate": float(rr),
                         "stop_atr_5m": float(stop_atr),
                         "regime": self._active_regime(regime_metadata),
+                        "trend_aligned": True,
+                        "trend_direction_at_arm": required_direction.value,
+                        "trend_alignment_reason": trend_reason,
+                        "trend_alignment_guard_version": 1,
                     },
                 )
                 if best is None or candidate.quality > best.quality:
@@ -659,15 +695,35 @@ class ArmedEntryEngine:
         active = self._active_regime(regime_metadata)
         scores = (regime_metadata or {}).get("scores") or {}
         candidates: list[ArmedSetup] = []
-        # Regime is context, not a duplicate absolute gate. Breakouts are primarily
-        # trend setups. Sweeps are valid in volatile/range markets and can also be
-        # probed in trend when volatility evidence is strong.
+        # Strategy hierarchy: in TREND_CONTINUATION a valid BREAKOUT_RETEST has
+        # first priority. LIQUIDITY_SWEEP is a secondary trend-following entry
+        # only when no breakout/retest is armable. RANGE remains shadow-only.
+        breakout_item = None
         if active == "TREND_CONTINUATION" or getattr(regime, "breakout_allowed", False):
-            item = self._discover_breakout(regime, snapshot, symbol, timeframe, regime_metadata)
-            if item:
-                candidates.append(item)
+            breakout_item = self._discover_breakout(regime, snapshot, symbol, timeframe, regime_metadata)
+            if breakout_item:
+                candidates.append(breakout_item)
+
         volatile_score = float(scores.get("VOLATILE_SWEEP") or 0.0)
-        if active in {"VOLATILE_SWEEP", "RANGE"} or getattr(regime, "sweep_allowed", False) or volatile_score >= 2.0:
+        sweep_permitted = False
+        if active == "RANGE":
+            self.branch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
+        elif active == "VOLATILE_SWEEP":
+            sweep_permitted = bool(getattr(regime, "sweep_allowed", False))
+            if not sweep_permitted:
+                self.branch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
+        elif active == "TREND_CONTINUATION":
+            # Never let a sweep compete with a valid trend breakout. When breakout
+            # is absent, volatility evidence may enable an aligned sweep fallback.
+            sweep_permitted = breakout_item is None and volatile_score >= 2.0
+            if breakout_item is not None:
+                self.branch_trace["sweep"] = {"accepted": False, "reason": "primary_breakout_selected"}
+            elif not sweep_permitted:
+                self.branch_trace["sweep"] = {"accepted": False, "reason": "trend_liquidity_probe_not_met"}
+        elif getattr(regime, "sweep_allowed", False):
+            sweep_permitted = True
+
+        if sweep_permitted:
             item = self._discover_sweep(regime, snapshot, symbol, timeframe, regime_metadata)
             if item:
                 candidates.append(item)
@@ -698,7 +754,12 @@ class ArmedEntryEngine:
                 return None
         if not candidates:
             primary = "no_armable_setup"
-            if active == "TREND_CONTINUATION" and self.branch_trace.get("breakout"):
+            sweep_reason = str((self.branch_trace.get("sweep") or {}).get("reason") or "")
+            if active == "TREND_CONTINUATION" and sweep_reason in {
+                "liquidity_sweep_trend_conflict", "liquidity_sweep_no_directional_trend"
+            }:
+                primary = sweep_reason
+            elif active == "TREND_CONTINUATION" and self.branch_trace.get("breakout"):
                 primary = str(self.branch_trace["breakout"].get("reason") or primary)
             elif active in {"VOLATILE_SWEEP", "RANGE"} and self.branch_trace.get("sweep"):
                 primary = str(self.branch_trace["sweep"].get("reason") or primary)
@@ -721,6 +782,20 @@ class ArmedEntryEngine:
 
     def trigger(self, setup: ArmedSetup, snapshot, decision_id: str) -> tuple[str, TradeIntent | None, dict]:
         now_ms = _now_ms()
+        if setup.strategy == Strategy.LIQUIDITY_SWEEP:
+            meta = dict(setup.metadata or {})
+            aligned = meta.get("trend_aligned") is True and int(meta.get("trend_alignment_guard_version") or 0) >= 1
+            armed_direction = str(meta.get("trend_direction_at_arm") or "").upper()
+            if not aligned:
+                self._consume(setup, "liquidity_sweep_legacy_unaligned_setup", now_ms)
+                return "cancelled", None, {"reason": "liquidity_sweep_legacy_unaligned_setup"}
+            if armed_direction != setup.direction.value:
+                self._consume(setup, "liquidity_sweep_trend_mismatch", now_ms)
+                return "cancelled", None, {
+                    "reason": "liquidity_sweep_trend_mismatch",
+                    "trend_direction_at_arm": armed_direction,
+                    "setup_direction": setup.direction.value,
+                }
         if now_ms >= int(setup.expires_at_ms):
             self._consume(setup, "setup_expired", now_ms)
             return "cancelled", None, {"reason": "setup_expired"}

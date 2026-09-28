@@ -38,6 +38,15 @@ MICRO_TRIGGER_MIN_BODY_RATIO = 0.22
 MICRO_TRIGGER_MIN_RVOL = 0.70
 MICRO_TRIGGER_CLOSE_LONG = 0.60
 MICRO_TRIGGER_CLOSE_SHORT = 0.40
+# Evidence-driven post-arm fallback. The normal 1m rule remains unchanged. When a
+# setup is already structurally strong, the live book is healthy and the closed 1m
+# candle has a strong directional body, moderate volume may confirm instead of
+# forcing the setup to wait until price has already escaped the valid RR window.
+POSTARM_ADAPTIVE_MIN_SETUP_QUALITY = 72.0
+POSTARM_ADAPTIVE_MIN_BODY_RATIO = 0.45
+POSTARM_ADAPTIVE_MIN_RVOL = 0.50
+POSTARM_ADAPTIVE_CLOSE_LONG = 0.72
+POSTARM_ADAPTIVE_CLOSE_SHORT = 0.28
 # Fast confirmation is intentionally stricter than the normal post-arm 1m path.
 # It may reuse the most recent CLOSED 1m candle only when that candle closed
 # immediately before arming and already showed strong directional acceptance.
@@ -98,15 +107,32 @@ def _closed_1m_quality(setup: ArmedSetup, candle, candles_1m, *, close_buffer: f
     short_close = FAST_CONFIRM_CLOSE_SHORT if strict else MICRO_TRIGGER_CLOSE_SHORT
     if setup.direction == Direction.LONG:
         close_in_trigger_band = close >= setup.trigger_price - close_buffer and close <= chase_limit
-        ok = close > opened and close_in_trigger_band and body >= min_body and close_pos >= long_close and rvol >= min_rvol
+        direction_ok = close > opened
+        standard_close_ok = close_pos >= long_close
+        adaptive_close_ok = close_pos >= POSTARM_ADAPTIVE_CLOSE_LONG
     else:
         close_in_trigger_band = close <= setup.trigger_price + close_buffer and close >= chase_limit
-        ok = close < opened and close_in_trigger_band and body >= min_body and close_pos <= short_close and rvol >= min_rvol
+        direction_ok = close < opened
+        standard_close_ok = close_pos <= short_close
+        adaptive_close_ok = close_pos <= POSTARM_ADAPTIVE_CLOSE_SHORT
+    standard_shape_ok = direction_ok and body >= min_body and standard_close_ok
+    ok = standard_shape_ok and close_in_trigger_band and rvol >= min_rvol
+    adaptive_shape_ok = (
+        direction_ok
+        and close_in_trigger_band
+        and body >= POSTARM_ADAPTIVE_MIN_BODY_RATIO
+        and adaptive_close_ok
+    )
     return ok, {
         "1m_close": close,
         "1m_body_ratio": round(body, 4),
         "1m_close_pos": round(close_pos, 4),
         "1m_rvol": round(rvol, 4),
+        "1m_direction_ok": bool(direction_ok),
+        "1m_close_in_trigger_band": bool(close_in_trigger_band),
+        "1m_standard_shape_ok": bool(standard_shape_ok),
+        "1m_adaptive_shape_ok": bool(adaptive_shape_ok),
+        "1m_adaptive_volume_ok": bool(rvol >= POSTARM_ADAPTIVE_MIN_RVOL),
         "trigger_close_buffer": close_buffer,
         "chase_limit": chase_limit,
     }
@@ -259,17 +285,42 @@ def _micro_confirmation(
         setup, last, candles_1m, close_buffer=trigger_close_buffer,
         chase_limit=chase_limit, strict=False,
     )
-    if not ok:
+    book_valid = bool(getattr(snapshot, "orderbook_valid", False)) and bool(
+        getattr(snapshot, "bids", None)
+    ) and bool(getattr(snapshot, "asks", None))
+    adaptive_ok = (
+        not ok
+        and float(setup.quality) >= POSTARM_ADAPTIVE_MIN_SETUP_QUALITY
+        and bool(book_valid)
+        and bool(diag.get("1m_adaptive_shape_ok"))
+        and bool(diag.get("1m_adaptive_volume_ok"))
+    )
+    if not ok and not adaptive_ok:
         return False, "waiting_1m_confirmation", {
             "price": executable, **diag,
             "confirmation_mode": "postarm_closed_1m",
+            "postarm_adaptive_candidate": bool(
+                diag.get("1m_adaptive_shape_ok") and diag.get("1m_adaptive_volume_ok")
+            ),
+            "postarm_adaptive_book_valid": bool(book_valid),
+            "postarm_adaptive_setup_quality_ok": bool(
+                float(setup.quality) >= POSTARM_ADAPTIVE_MIN_SETUP_QUALITY
+            ),
+            "postarm_adaptive_min_setup_quality": POSTARM_ADAPTIVE_MIN_SETUP_QUALITY,
+            "postarm_adaptive_min_rvol": POSTARM_ADAPTIVE_MIN_RVOL,
             "chase_base_limit": chase_base_limit,
             "chase_edge_tolerance": chase_edge_tolerance,
             "book_tick_size": book_tick,
         }
+    confirmation_mode = (
+        "postarm_closed_1m_strong_shape" if adaptive_ok else "postarm_closed_1m"
+    )
     return True, "triggered", {
         "price": executable, **diag,
-        "confirmation_mode": "postarm_closed_1m",
+        "confirmation_mode": confirmation_mode,
+        "postarm_adaptive_used": bool(adaptive_ok),
+        "postarm_adaptive_book_valid": bool(book_valid),
+        "postarm_adaptive_setup_quality": float(setup.quality),
         "chase_base_limit": chase_base_limit,
         "chase_edge_tolerance": chase_edge_tolerance,
         "book_tick_size": book_tick,
@@ -1143,11 +1194,12 @@ class ArmedEntryEngine:
             "target_rr_cap": target_rr_cap,
             "target_rr_capped_at_trigger": trigger_target_capped,
         }
-        confirm_reason = (
-            "micro_confirmation_fast_1m"
-            if diag.get("confirmation_mode") == "recent_prearm_closed_1m"
-            else "micro_confirmation_1m"
-        )
+        if diag.get("confirmation_mode") == "recent_prearm_closed_1m":
+            confirm_reason = "micro_confirmation_fast_1m"
+        elif diag.get("confirmation_mode") == "postarm_closed_1m_strong_shape":
+            confirm_reason = "micro_confirmation_1m_adaptive"
+        else:
+            confirm_reason = "micro_confirmation_1m"
         self._consume(setup, "setup_triggered", now_ms)
         intent = TradeIntent(
             decision_id=decision_id,

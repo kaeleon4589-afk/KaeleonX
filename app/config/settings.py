@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # lightweight quote + closed-1m monitor. This is deliberately separate from
     # market_poll_seconds so discovery quality is not traded for execution speed.
     trade_armed_monitor_poll_seconds: float = Field(2.0, ge=0.5, le=10.0)
+    # Precursors are followed independently from the rotating market scanner.
+    # WATCHING uses closed 5m/15m/1h data, so it does not need a 2-second cadence.
+    trade_setup_watch_poll_seconds: float = Field(15.0, ge=5.0, le=60.0)
+    trade_setup_watch_ttl_seconds: float = Field(1800.0, ge=300.0, le=3600.0)
     trade_funnel_emit_seconds: float = Field(300.0, ge=30.0, le=3600.0)
     trade_funnel_emit_every: int = Field(50, ge=5, le=1000)
     market_poll_seconds: float = Field(2.0, gt=0)

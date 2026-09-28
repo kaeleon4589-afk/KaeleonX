@@ -578,3 +578,203 @@ def test_v64_breakout_has_priority_over_liquidity_sweep_in_trend_regime():
     assert selected is breakout_setup
     assert sweep_calls["count"] == 0
     assert engine.last_trace["branches"]["sweep"]["reason"] == "primary_breakout_selected"
+
+
+def _breakout_precursor_snapshot():
+    c5 = [
+        Candle(i * 300_000, 100.0, 100.6, 99.4, 100.0, 100.0)
+        for i in range(260)
+    ]
+    # Fresh breakout exists now, but there is no subsequent retest candle yet.
+    c5[259] = Candle(259 * 300_000, 100.2, 101.2, 100.1, 100.95, 220.0)
+    c15 = [Candle(i * 900_000, 100.0, 100.6, 99.4, 100.0, 100.0) for i in range(220)]
+    c1h = [Candle(i * 3_600_000, 100.0, 100.6, 99.4, 100.0, 100.0) for i in range(220)]
+    return SimpleNamespace(
+        symbol="BR", timeframe="5m", candles=c5,
+        timeframes={"5m": c5, "15m": c15, "1h": c1h},
+        bid=100.90, ask=100.92, last=100.91,
+    )
+
+
+def _breakout_retest_snapshot():
+    base = _breakout_precursor_snapshot()
+    c5 = list(base.timeframes["5m"])
+    c5.append(Candle(260 * 300_000, 100.78, 100.86, 100.44, 100.64, 150.0))
+    return SimpleNamespace(
+        symbol="BR", timeframe="5m", candles=c5,
+        timeframes={"5m": c5, "15m": base.timeframes["15m"], "1h": base.timeframes["1h"]},
+        bid=100.60, ask=100.62, last=100.61,
+    )
+
+
+def _sweep_precursor_snapshot():
+    candles = [
+        Candle(i * 300_000, 100.1, 101.0, 100.0, 100.2, 100.0)
+        for i in range(260)
+    ]
+    candles[230] = Candle(230 * 300_000, 100.1, 102.5, 100.0, 100.2, 100.0)
+    # Price is approaching the lower liquidity pool but has not swept it yet.
+    candles[259] = Candle(259 * 300_000, 100.35, 100.55, 100.25, 100.30, 120.0)
+    return SimpleNamespace(
+        symbol="SW", timeframe="5m", candles=candles,
+        timeframes={"5m": candles}, bid=100.29, ask=100.31, last=100.30,
+    )
+
+
+def _sweep_reclaim_snapshot():
+    base = _sweep_precursor_snapshot()
+    candles = list(base.candles)
+    candles.append(Candle(260 * 300_000, 100.2, 100.35, 99.55, 100.18, 240.0))
+    return SimpleNamespace(
+        symbol="SW", timeframe="5m", candles=candles,
+        timeframes={"5m": candles}, bid=100.17, ask=100.19, last=100.18,
+    )
+
+
+def test_v66_breakout_precursor_enters_watching_before_retest_and_then_arms():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+
+    # The complete-entry detector correctly says "not armed yet".
+    immediate = engine.discover(regime, _breakout_precursor_snapshot(), "BR", "5m", meta)
+    assert immediate is None
+
+    # The new precursor path starts tracking the breakout instead of discarding it.
+    watch = engine.discover_watch(regime, _breakout_precursor_snapshot(), "BR", "5m", meta)
+    assert watch is not None
+    assert watch.strategy == Strategy.BREAKOUT_RETEST
+    assert watch.direction == Direction.LONG
+    assert "waiting_retest" in watch.reasons
+    assert engine.watch_trace["breakout"]["reason"] == "breakout_detected_waiting_retest"
+
+    status, armed, trace = engine.advance_watch(watch, _breakout_retest_snapshot())
+    assert status == "armed"
+    assert armed is not None
+    assert armed.strategy == Strategy.BREAKOUT_RETEST
+    assert armed.direction == Direction.LONG
+    assert trace["reason"] == "setup_armable"
+
+
+def test_v66_breakout_uses_regime_trend_as_direction_authority_when_mtf_bias_is_none():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    # Flat 1h/15m fixtures intentionally produce bias='none'. They no longer
+    # erase a clear BULLISH+long regime; explicit opposite MTF bias still blocks.
+    watch = engine.discover_watch(regime, _breakout_precursor_snapshot(), "BR", "5m", meta)
+    assert watch is not None
+    assert watch.metadata["bias_1h"] == "none"
+    assert watch.metadata["bias_15m"] == "none"
+    assert watch.direction == Direction.LONG
+
+
+def test_v66_liquidity_precursor_watches_then_arms_only_with_trend_aligned_reclaim():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    watch = engine.discover_watch(regime, _sweep_precursor_snapshot(), "SW", "5m", meta)
+    assert watch is not None
+    assert watch.strategy == Strategy.LIQUIDITY_SWEEP
+    assert watch.direction == Direction.LONG
+    assert watch.metadata["trend_direction"] == "LONG"
+
+    status, armed, trace = engine.advance_watch(watch, _sweep_reclaim_snapshot())
+    assert status == "armed"
+    assert armed is not None
+    assert armed.strategy == Strategy.LIQUIDITY_SWEEP
+    assert armed.direction == Direction.LONG
+    assert armed.metadata["trend_aligned"] is True
+    assert armed.metadata["trend_direction_at_arm"] == "LONG"
+
+
+def test_v66_watch_expiry_is_terminal_and_does_not_arm_stale_precursor():
+    from app.models.trading import SetupWatch
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    now = int(time.time() * 1000)
+    watch = SetupWatch(
+        watch_id="STALE:BRW:1:LONG", symbol="BR", strategy=Strategy.BREAKOUT_RETEST,
+        direction=Direction.LONG, created_at_ms=now - 10_000,
+        expires_at_ms=now - 1, timeframe="5m",
+        metadata={"risk_multiplier": 1.0, "active_regime": "TREND_CONTINUATION"},
+    )
+    status, armed, trace = engine.advance_watch(watch, _breakout_retest_snapshot())
+    assert status == "cancelled"
+    assert armed is None
+    assert trace["reason"] == "watch_expired"
+
+
+def test_orchestrator_v66_precursor_moves_watching_to_armed_without_scanner_rotation():
+    import asyncio
+    from app.execution.paper import PaperExecutionEngine
+    from app.models.trading import SetupWatch, ArmedSetup
+    from test_core_pipeline_refactor import build_orchestrator, snapshot as base_snapshot
+
+    class WatchRouter:
+        def __init__(self):
+            self.last_trace = {}
+            self.watch = None
+
+        def discover_armed(self, *args, **kwargs):
+            self.last_trace = {"reason": "no_armable_setup", "armed": {"accepted": False, "reason": "no_fresh_breakout_retest_arm"}}
+            return None
+
+        def discover_watch(self, regime, snapshot, symbol, timeframe, regime_metadata=None):
+            now = int(time.time() * 1000)
+            self.watch = SetupWatch(
+                watch_id="BTC:BRW:1:LONG", symbol=symbol, strategy=Strategy.BREAKOUT_RETEST,
+                direction=Direction.LONG, created_at_ms=now, expires_at_ms=now + 600_000,
+                timeframe=timeframe, reasons=("breakout_detected", "waiting_retest"),
+                metadata={"risk_multiplier": 1.0, "active_regime": "TREND_CONTINUATION"},
+            )
+            self.last_trace = {"reason": "setup_watching", "watch": {"accepted": True, "reason": "breakout_detected_waiting_retest"}}
+            return self.watch
+
+        def advance_watch(self, watch, snapshot):
+            now = int(time.time() * 1000)
+            armed = ArmedSetup(
+                setup_id="BTC:BR:1:LONG", symbol=watch.symbol, strategy=Strategy.BREAKOUT_RETEST,
+                direction=Direction.LONG, armed_at_ms=now, expires_at_ms=now + 600_000,
+                trigger_price=100.0, invalidation_price=99.0, stop_price=99.0,
+                target_price=101.5, entry_zone_low=100.0, entry_zone_high=100.5,
+                quality=82.0, risk_multiplier=1.0, timeframe="5m", metadata={"atr_value": 1.0},
+            )
+            self.last_trace = {"reason": "watch_armed", "watch": {"status": "armed", "reason": "retest_completed"}}
+            return "armed", armed, {"reason": "retest_completed"}
+
+        def trigger_armed(self, *args, **kwargs):
+            raise AssertionError("watch monitor should only promote to ARMED in this test")
+
+        def evaluate(self, *args, **kwargs):
+            raise AssertionError("legacy path should not execute")
+
+    execution = PaperExecutionEngine(initial_equity=100)
+    orchestrator, manager, _, _, _ = build_orchestrator(execution, mode="demo")
+    orchestrator.router = WatchRouter()
+    snap = base_snapshot("BTC", 100.0)
+    snap.timeframes = {"5m": snap.candles}
+
+    first = asyncio.run(orchestrator.on_snapshot(snap, 100, user_id="u1"))
+    assert first is None
+    assert "BTC" in orchestrator.watching_setups
+    assert "BTC" not in orchestrator.armed_setups
+
+    watch_snap = base_snapshot("BTC", 100.0)
+    watch_snap.timeframes = {"5m": watch_snap.candles}
+    watch_snap.monitor_only = True
+    watch_snap.watch_monitor = True
+    watch_snap.armed_monitor = False
+    promoted = asyncio.run(orchestrator.on_snapshot(watch_snap, 100, user_id="u1"))
+    assert promoted is None
+    assert "BTC" not in orchestrator.watching_setups
+    assert "BTC" in orchestrator.armed_setups
+    assert not manager.positions

@@ -29,23 +29,32 @@ def _range_sweep_snapshot():
     )
 
 
-def _range_regime():
+def _sweep_regime(direction=Direction.BULLISH):
     return SimpleNamespace(
         hard_block=False,
-        sweep_allowed=False,
+        sweep_allowed=True,
         breakout_allowed=False,
-        risk_multiplier=0.65,
+        risk_multiplier=0.80,
+        direction=direction,
     )
 
 
-def test_v6_can_arm_high_quality_sweep_while_regime_is_range():
+def _sweep_meta(active="VOLATILE_SWEEP", trend_bias="long"):
+    return {
+        "active": active,
+        "scores": {"VOLATILE_SWEEP": 4},
+        "features": {"trend_bias": trend_bias},
+    }
+
+
+def test_v6_can_arm_high_quality_sweep_when_aligned_with_bullish_trend():
     engine = ArmedEntryEngine(ttl_seconds=600)
     setup = engine.discover(
-        _range_regime(),
+        _sweep_regime(),
         _range_sweep_snapshot(),
         "TEST",
         "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_meta(),
     )
     assert setup is not None
     assert setup.strategy == Strategy.LIQUIDITY_SWEEP
@@ -60,8 +69,8 @@ def test_v6_waits_for_closed_1m_confirmation_then_builds_trade_intent():
     engine = ArmedEntryEngine(ttl_seconds=600)
     base = _range_sweep_snapshot()
     setup = engine.discover(
-        _range_regime(), base, "TEST", "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_regime(), base, "TEST", "5m",
+        _sweep_meta(),
     )
     assert setup is not None
 
@@ -111,8 +120,8 @@ def test_v6_waits_for_closed_1m_confirmation_then_builds_trade_intent():
 def test_v61_small_overshoot_does_not_cancel_setup_as_chased():
     engine = ArmedEntryEngine(ttl_seconds=600, chase_tolerance_atr=0.15)
     setup = engine.discover(
-        _range_regime(), _range_sweep_snapshot(), "TEST", "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_regime(), _range_sweep_snapshot(), "TEST", "5m",
+        _sweep_meta(),
     )
     assert setup is not None
     atr_value = float(setup.metadata["atr_value"])
@@ -129,8 +138,8 @@ def test_v61_small_overshoot_does_not_cancel_setup_as_chased():
 def test_v61_cancels_setup_only_after_price_exceeds_atr_chase_buffer():
     engine = ArmedEntryEngine(ttl_seconds=600, chase_tolerance_atr=0.15)
     setup = engine.discover(
-        _range_regime(), _range_sweep_snapshot(), "TEST", "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_regime(), _range_sweep_snapshot(), "TEST", "5m",
+        _sweep_meta(),
     )
     assert setup is not None
     atr_value = float(setup.metadata["atr_value"])
@@ -150,8 +159,8 @@ def test_v61_fresh_1m_close_can_confirm_inside_trigger_tolerance_band():
     )
     base = _range_sweep_snapshot()
     setup = engine.discover(
-        _range_regime(), base, "TEST", "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_regime(), base, "TEST", "5m",
+        _sweep_meta(),
     )
     assert setup is not None
     atr_value = float(setup.metadata["atr_value"])
@@ -188,8 +197,8 @@ def test_v61_cancelled_structure_is_consumed_and_not_rearmed():
     )
     base = _range_sweep_snapshot()
     setup = engine.discover(
-        _range_regime(), base, "TEST", "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_regime(), base, "TEST", "5m",
+        _sweep_meta(),
     )
     assert setup is not None
     atr_value = float(setup.metadata["atr_value"])
@@ -202,8 +211,8 @@ def test_v61_cancelled_structure_is_consumed_and_not_rearmed():
     assert trace["reason"] == "setup_chased"
 
     rediscovered = engine.discover(
-        _range_regime(), base, "TEST", "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_regime(), base, "TEST", "5m",
+        _sweep_meta(),
     )
     assert rediscovered is None
     assert engine.last_trace["reason"] == "setup_consumed_waiting_new_structure"
@@ -213,8 +222,8 @@ def test_v61_cancelled_structure_is_consumed_and_not_rearmed():
 def test_v6_setup_expiry_is_bounded():
     engine = ArmedEntryEngine(ttl_seconds=60)
     setup = engine.discover(
-        _range_regime(), _range_sweep_snapshot(), "TEST", "5m",
-        {"active": "RANGE", "scores": {"VOLATILE_SWEEP": 2}},
+        _sweep_regime(), _range_sweep_snapshot(), "TEST", "5m",
+        _sweep_meta(),
     )
     assert setup is not None
     expired = setup.__class__(**{**setup.__dict__, "expires_at_ms": int(time.time() * 1000) - 1})
@@ -222,6 +231,59 @@ def test_v6_setup_expiry_is_bounded():
     assert status == "cancelled"
     assert intent is None
     assert trace["reason"] == "setup_expired"
+
+
+def test_v64_liquidity_sweep_blocks_countertrend_and_neutral_contexts():
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    snap = _range_sweep_snapshot()
+
+    # The fixture contains a valid LONG sweep. It is accepted in bullish trend.
+    aligned = engine.discover(_sweep_regime(Direction.BULLISH), snap, "TEST", "5m", _sweep_meta())
+    assert aligned is not None
+    assert aligned.strategy == Strategy.LIQUIDITY_SWEEP
+    assert aligned.direction == Direction.LONG
+    assert aligned.metadata["trend_aligned"] is True
+    assert aligned.metadata["trend_direction_at_arm"] == "LONG"
+
+    # The same long sweep is forbidden when the detected trend is bearish.
+    blocked = engine.discover(
+        _sweep_regime(Direction.BEARISH), snap, "TEST-BEAR", "5m",
+        _sweep_meta(trend_bias="short"),
+    )
+    assert blocked is None
+    assert engine.last_trace["branches"]["sweep"]["reason"] == "no_liquidity_sweep_to_arm"
+
+    # No directional trend => no liquidity-sweep setup at all.
+    neutral = engine.discover(
+        _sweep_regime(Direction.NEUTRAL), snap, "TEST-NEUTRAL", "5m",
+        _sweep_meta(trend_bias="neutral"),
+    )
+    assert neutral is None
+    assert engine.last_trace["reason"] == "liquidity_sweep_no_directional_trend"
+
+
+def test_v64_range_is_shadow_only_for_liquidity_sweep():
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    range_regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=False,
+        risk_multiplier=0.65, direction=Direction.BULLISH,
+    )
+    setup = engine.discover(
+        range_regime, _range_sweep_snapshot(), "TEST", "5m",
+        _sweep_meta(active="RANGE", trend_bias="long"),
+    )
+    assert setup is None
+    assert engine.last_trace["branches"]["sweep"]["reason"] == "regime_sweep_not_allowed"
+
+
+def test_v64_old_persisted_liquidity_setup_cannot_trigger_without_alignment_stamp():
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    setup = _fast_confirm_setup(Direction.SHORT)
+    legacy = setup.__class__(**{**setup.__dict__, "metadata": {"atr_value": 1.0}})
+    status, intent, trace = engine.trigger(legacy, SimpleNamespace(), "legacy")
+    assert status == "cancelled"
+    assert intent is None
+    assert trace["reason"] == "liquidity_sweep_legacy_unaligned_setup"
 
 
 def test_orchestrator_v6_arms_first_and_executes_only_after_trigger():
@@ -305,7 +367,8 @@ def _fast_confirm_setup(direction=Direction.LONG):
         target_price=98.7, entry_zone_low=99.5, entry_zone_high=100.0,
         quality=85.0, risk_multiplier=1.0, timeframe="5m",
         metadata={"atr_value": 1.0, "structural_target_price": 98.7,
-                  "target_front_run_ratio": 1.0},
+                  "target_front_run_ratio": 1.0, "trend_aligned": True,
+                  "trend_direction_at_arm": "SHORT", "trend_alignment_guard_version": 1},
     )
 
 
@@ -445,3 +508,46 @@ def test_v63_recent_strong_prearm_closed_1m_fast_confirm_is_directionally_symmet
     assert intent.direction == Direction.SHORT
     assert intent.target_price < intent.entry_price < intent.stop_price
     assert trace["execution_rr"] >= 1.10
+
+
+def test_v64_breakout_has_priority_over_liquidity_sweep_in_trend_regime():
+    from app.models.trading import ArmedSetup
+
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    now = int(time.time() * 1000)
+    breakout_setup = ArmedSetup(
+        setup_id="PRIO:BR:1:LONG", symbol="PRIO", strategy=Strategy.BREAKOUT_RETEST,
+        direction=Direction.LONG, armed_at_ms=now, expires_at_ms=now + 300_000,
+        trigger_price=100.0, invalidation_price=99.0, stop_price=99.0,
+        target_price=101.5, entry_zone_low=100.0, entry_zone_high=100.4,
+        quality=72.0, risk_multiplier=1.0, timeframe="5m", metadata={"atr_value": 1.0},
+    )
+    sweep_setup = ArmedSetup(
+        setup_id="PRIO:LS:1:LONG", symbol="PRIO", strategy=Strategy.LIQUIDITY_SWEEP,
+        direction=Direction.LONG, armed_at_ms=now, expires_at_ms=now + 300_000,
+        trigger_price=100.0, invalidation_price=99.0, stop_price=99.0,
+        target_price=101.3, entry_zone_low=100.0, entry_zone_high=100.4,
+        quality=99.0, risk_multiplier=1.0, timeframe="5m",
+        metadata={"atr_value": 1.0, "trend_aligned": True,
+                  "trend_direction_at_arm": "LONG", "trend_alignment_guard_version": 1},
+    )
+    sweep_calls = {"count": 0}
+    engine._discover_breakout = lambda *args, **kwargs: breakout_setup
+
+    def fake_sweep(*args, **kwargs):
+        sweep_calls["count"] += 1
+        return sweep_setup
+
+    engine._discover_sweep = fake_sweep
+    regime = SimpleNamespace(
+        hard_block=False, breakout_allowed=True, sweep_allowed=False,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    selected = engine.discover(
+        regime, SimpleNamespace(), "PRIO", "5m",
+        {"active": "TREND_CONTINUATION", "scores": {"VOLATILE_SWEEP": 4},
+         "features": {"trend_bias": "long"}},
+    )
+    assert selected is breakout_setup
+    assert sweep_calls["count"] == 0
+    assert engine.last_trace["branches"]["sweep"]["reason"] == "primary_breakout_selected"

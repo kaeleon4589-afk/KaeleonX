@@ -91,7 +91,7 @@ def test_sweep_front_runs_liquidity_target_and_keeps_sweep_extreme_stop(monkeypa
                      bars_since_sweep=2)
     monkeypatch.setattr(sweep, '_detect', lambda direction, **kw:
                         candidate if direction == 'long' else None)
-    regime = SimpleNamespace(hard_block=False, sweep_allowed=True, risk_multiplier=.8)
+    regime = SimpleNamespace(hard_block=False, sweep_allowed=True, risk_multiplier=.8, direction=Direction.BULLISH)
     intent = sweep.LiquiditySweepStrategy().evaluate(
         regime, [object()]*260, 'd', 'BTC', '5m')
     assert intent.stop_price == 98.8

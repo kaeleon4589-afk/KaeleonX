@@ -262,6 +262,33 @@ def test_v64_liquidity_sweep_blocks_countertrend_and_neutral_contexts():
     assert engine.last_trace["reason"] == "liquidity_sweep_no_directional_trend"
 
 
+
+
+def test_v65_trend_continuation_evaluates_aligned_sweep_without_volatile_score_gate():
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {
+        "active": "TREND_CONTINUATION",
+        "scores": {"TREND_CONTINUATION": 6, "VOLATILE_SWEEP": 0, "RANGE": 1},
+        "features": {"trend_bias": "long"},
+    }
+    setup = engine.discover(regime, _range_sweep_snapshot(), "TEST-TREND", "5m", meta)
+    assert setup is not None
+    assert setup.strategy == Strategy.LIQUIDITY_SWEEP
+    assert setup.direction == Direction.LONG
+    assert setup.metadata["trend_aligned"] is True
+    assert setup.metadata["trend_direction_at_arm"] == "LONG"
+    assert engine.last_trace["branches"]["sweep"]["accepted"] is True
+
+
+def test_v65_breakout_arm_window_allows_up_to_five_5m_retest_bars():
+    from app.strategy import armed_entry
+    assert armed_entry.BREAKOUT_ARM_MAX_RETEST_BARS == 5
+
+
 def test_v64_range_is_shadow_only_for_liquidity_sweep():
     engine = ArmedEntryEngine(ttl_seconds=600)
     range_regime = SimpleNamespace(

@@ -59,6 +59,19 @@ CHASE_EDGE_MAX_ATR = 0.02
 WATCH_BREAKOUT_MAX_AGE_BARS = 2
 WATCH_SWEEP_PROXIMITY_ATR = 0.45
 
+# v6.10 evidence-driven adaptive breakout-retest depth. Production stateful-watch
+# telemetry clustered several otherwise trend-aligned retests around 0.089-0.101 ATR
+# while the fixed 0.12 ATR floor kept them in WATCHING until they later invalidated.
+# Keep 0.12 ATR as the default. Only a fresh (<=3 bars), clearly aligned 5m trend
+# may use the narrower 0.085 ATR floor. All penetration, close invalidation, RR,
+# stop, HTF exhaustion and post-arm confirmation guards remain unchanged.
+RETEST_PULLBACK_BASE_ATR = 0.12
+RETEST_PULLBACK_STRONG_TREND_ATR = 0.085
+RETEST_PULLBACK_ADAPTIVE_MAX_BARS = 3
+RETEST_PULLBACK_ADAPTIVE_MIN_ADX = 20.0
+RETEST_PULLBACK_ADAPTIVE_MIN_EMA_ALIGNMENT = 0.75
+RETEST_PULLBACK_ADAPTIVE_MIN_EMA_EDGE = 0.50
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -107,6 +120,47 @@ def _snapshot_trend_direction(snapshot) -> tuple[Direction | None, dict]:
         "current_adx": float(values.get("adx") or 0.0),
     }
 
+
+
+def _adaptive_retest_pullback_requirement(
+    direction: Direction, bars_since_breakout: int, trend_diag: dict
+) -> tuple[float, dict]:
+    """Return the minimum breakout pullback required for this live watch.
+
+    The fixed 0.12 ATR rule remains the default. A shallower 0.085 ATR retest is
+    allowed only when the *current* closed-5m context is still strongly aligned
+    with the watch and the retest is fresh. This is intentionally narrow: it
+    adapts one lower-bound gate and leaves every invalidation/quality/risk gate
+    untouched.
+    """
+    status = str(trend_diag.get("trend_context_status") or "")
+    adx_value = float(trend_diag.get("current_adx") or 0.0)
+    ema_alignment = float(trend_diag.get("current_ema_alignment") or 0.0)
+    ema_edge = float(trend_diag.get("current_ema_alignment_edge") or 0.0)
+    directional_edge_ok = (
+        ema_edge >= RETEST_PULLBACK_ADAPTIVE_MIN_EMA_EDGE
+        if direction == Direction.LONG
+        else ema_edge <= -RETEST_PULLBACK_ADAPTIVE_MIN_EMA_EDGE
+    )
+    eligible = (
+        status == "ok"
+        and 0 < int(bars_since_breakout) <= RETEST_PULLBACK_ADAPTIVE_MAX_BARS
+        and adx_value >= RETEST_PULLBACK_ADAPTIVE_MIN_ADX
+        and ema_alignment >= RETEST_PULLBACK_ADAPTIVE_MIN_EMA_ALIGNMENT
+        and directional_edge_ok
+    )
+    required = RETEST_PULLBACK_STRONG_TREND_ATR if eligible else RETEST_PULLBACK_BASE_ATR
+    return required, {
+        "retest_pullback_mode": "strong_trend_adaptive" if eligible else "standard",
+        "required_pullback_atr": required,
+        "retest_pullback_base_atr": RETEST_PULLBACK_BASE_ATR,
+        "retest_pullback_adaptive_floor_atr": RETEST_PULLBACK_STRONG_TREND_ATR,
+        "retest_pullback_adaptive_eligible": eligible,
+        "retest_pullback_adaptive_max_bars": RETEST_PULLBACK_ADAPTIVE_MAX_BARS,
+        "retest_pullback_adaptive_min_adx": RETEST_PULLBACK_ADAPTIVE_MIN_ADX,
+        "retest_pullback_adaptive_min_ema_alignment": RETEST_PULLBACK_ADAPTIVE_MIN_EMA_ALIGNMENT,
+        "retest_pullback_adaptive_min_ema_edge": RETEST_PULLBACK_ADAPTIVE_MIN_EMA_EDGE,
+    }
 
 
 def _book_tick_size(snapshot) -> float:
@@ -1110,6 +1164,9 @@ class ArmedEntryEngine:
         breakout_close = float(c[origin_idx])
         breakout_rvol = float((watch.metadata or {}).get("breakout_rvol") or relative_volume(v, origin_idx))
         max_close_distance = max(breakout.RETEST_MAX_CLOSE_DISTANCE_ATR, 0.34)
+        required_pullback, pullback_rule_diag = _adaptive_retest_pullback_requirement(
+            watch.direction, bars_since, guard_diag
+        )
 
         if watch.direction == Direction.LONG:
             extreme = min(float(l[j]) for j in retest_indices)
@@ -1137,11 +1194,11 @@ class ArmedEntryEngine:
                     **guard_diag,
                 }
             pullback = max(0.0, breakout_close - extreme) / atr5
-            if pullback < 0.12:
+            if pullback < required_pullback:
                 return "pending", None, {
                     "reason": "retest_pullback_insufficient", "watch_id": watch.watch_id,
-                    "pullback_atr": pullback, "required_pullback_atr": 0.12,
-                    "bars_since_breakout": bars_since, **guard_diag,
+                    "pullback_atr": pullback, "bars_since_breakout": bars_since,
+                    **pullback_rule_diag, **guard_diag,
                 }
             close_distance_atr = abs(float(c[i]) - structural_level) / atr5
             if close_distance_atr > max_close_distance:
@@ -1180,11 +1237,11 @@ class ArmedEntryEngine:
                     **guard_diag,
                 }
             pullback = max(0.0, extreme - breakout_close) / atr5
-            if pullback < 0.12:
+            if pullback < required_pullback:
                 return "pending", None, {
                     "reason": "retest_pullback_insufficient", "watch_id": watch.watch_id,
-                    "pullback_atr": pullback, "required_pullback_atr": 0.12,
-                    "bars_since_breakout": bars_since, **guard_diag,
+                    "pullback_atr": pullback, "bars_since_breakout": bars_since,
+                    **pullback_rule_diag, **guard_diag,
                 }
             close_distance_atr = abs(float(c[i]) - structural_level) / atr5
             if close_distance_atr > max_close_distance:
@@ -1255,6 +1312,7 @@ class ArmedEntryEngine:
                 "strategy_model": "stateful_breakout_retest_watch_v2",
                 "atr_value": atr5, "atr_pct": atr_pct,
                 "structural_level": structural_level, "retest_extreme": float(extreme),
+                "retest_pullback_atr": float(pullback), **pullback_rule_diag,
                 "breakout_rvol": breakout_rvol, "breakout_age_bars": int(bars_since),
                 "structural_target_price": float(structural_target),
                 "target_front_run_ratio": float(target_ratio), "target_rr_cap": float(target_rr_cap),
@@ -1272,7 +1330,7 @@ class ArmedEntryEngine:
         return "armed", setup, {
             "reason": "retest_complete", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id,
             "quality": score, "bars_since_breakout": bars_since, "structural_rr_estimate": rr,
-            **guard_diag,
+            "retest_pullback_atr": float(pullback), **pullback_rule_diag, **guard_diag,
         }
 
     def _advance_sweep_watch(self, watch: SetupWatch, snapshot) -> tuple[str, ArmedSetup | None, dict]:

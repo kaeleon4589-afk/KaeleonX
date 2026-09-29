@@ -1571,9 +1571,14 @@ class TradingOrchestrator:
                 market_ask = 0.0
 
             quote_ms = getattr(snapshot, 'quote_received_ms', now_ms)
+            execution_now_ms = int(time.time() * 1000)
+            try:
+                quote_age_ms = max(0, execution_now_ms - int(quote_ms))
+            except (TypeError, ValueError):
+                quote_age_ms = None
             if (not math.isfinite(market_bid) or not math.isfinite(market_ask)
                     or market_bid <= 0 or market_ask <= 0 or market_bid > market_ask
-                    or int(time.time() * 1000) - quote_ms > 10_000):
+                    or quote_age_ms is None or quote_age_ms > 10_000):
                 self.last_rejection = 'market_unavailable'
                 self._funnel("execution_rejected", "market_unavailable", user_id=user_id, symbol=snapshot.symbol)
                 result = {"accepted": False, "filled": False, "reason": "market_unavailable"}
@@ -1588,6 +1593,8 @@ class TradingOrchestrator:
                     direction=getattr(intent.direction, "value", str(intent.direction)),
                     reason="market_unavailable",
                     orderbook_valid=getattr(snapshot, "orderbook_valid", False),
+                    market_bid=market_bid, market_ask=market_ask,
+                    quote_received_ms=quote_ms, quote_age_ms=quote_age_ms,
                 )
                 self._terminal_lifecycle(
                     user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,

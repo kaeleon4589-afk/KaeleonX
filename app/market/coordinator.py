@@ -19,6 +19,11 @@ class MarketCoordinator:
         self.signal_factory = signal_factory
         self.poll_seconds = poll_seconds
         self.audit = audit
+        # ARMED monitoring refreshes closed 5m trend context on a bounded cadence.
+        # The quote/1m path remains high-frequency; 5m is cached per symbol so
+        # trigger-time trend revalidation does not multiply CoinW traffic.
+        self._armed_trend_cache = {}
+        self._armed_trend_cache_ttl_seconds = 15.0
 
     @staticmethod
     def _parse_klines(raw):
@@ -85,6 +90,27 @@ class MarketCoordinator:
                                last=(bid + ask) / 2, quote_received_ms=int(time.time() * 1000),
                                orderbook_valid=True, data_complete=False, monitor_only=True)
 
+    async def _armed_trend_candles(self, symbol):
+        now_mono = time.monotonic()
+        cached = self._armed_trend_cache.get(symbol)
+        if cached and now_mono - float(cached[0]) < self._armed_trend_cache_ttl_seconds:
+            return list(cached[1])
+        raw = await self.client.klines(symbol, '5m', 261)
+        now_ms = int(time.time() * 1000)
+        span = TF_MS['5m']
+        candles = [c for c in self._parse_klines(raw) if c.timestamp + span <= now_ms]
+        if len(candles) < 205:
+            raise RuntimeError(f'insufficient_armed_trend_candles:{symbol}:{len(candles)}')
+        recent = candles[-205:]
+        fresh = now_ms - recent[-1].timestamp <= span * 2 + 30_000
+        contiguous = all(b.timestamp - a.timestamp == span for a, b in zip(recent, recent[1:]))
+        if not fresh:
+            raise RuntimeError(f'stale_armed_trend_candles:{symbol}')
+        if not contiguous:
+            raise RuntimeError(f'armed_trend_candle_gap:{symbol}')
+        self._armed_trend_cache[symbol] = (now_mono, candles)
+        return list(candles)
+
     async def armed_snapshot(self, symbol):
         """Lightweight high-priority snapshot for an already ARMED setup.
 
@@ -93,8 +119,9 @@ class MarketCoordinator:
         fresh CLOSED 1m candle. Fetching only those two feeds keeps the follow-up
         fast without multiplying the expensive scanner traffic.
         """
-        quote_result, micro_result = await asyncio.gather(
+        quote_result, micro_result, trend_result = await asyncio.gather(
             self.quote(symbol), self.client.klines(symbol, '1m', 61),
+            self._armed_trend_candles(symbol),
             return_exceptions=True,
         )
         if isinstance(quote_result, Exception):
@@ -122,9 +149,18 @@ class MarketCoordinator:
                         'MARKET_MICRODATA_INVALID', 'system', level='WARNING',
                         symbol=symbol, bars=len(micro), fresh=fresh, contiguous=contiguous,
                     )
-        quote.candles = []
+        if isinstance(trend_result, Exception):
+            if self.audit:
+                self.audit.event(
+                    'MARKET_TREND_CONTEXT_ERROR', 'system', level='WARNING',
+                    symbol=symbol, error=f'{type(trend_result).__name__}: {trend_result}',
+                )
+        else:
+            frames['5m'] = list(trend_result)
+        quote.candles = list(frames.get('5m') or [])
         quote.timeframes = frames
         quote.data_complete = bool(frames.get('1m'))
+        quote.trend_context_valid = bool(frames.get('5m'))
         quote.monitor_only = True
         quote.armed_monitor = True
         return quote

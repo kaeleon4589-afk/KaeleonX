@@ -3,11 +3,11 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import replace
-from types import SimpleNamespace
 from typing import Any
 
 from app.models.enums import Direction, Strategy
 from app.models.trading import ArmedSetup, SetupWatch, TradeIntent
+from app.regime.advanced import features as regime_features
 from app.position.protection import (
     break_even_activation_ratio,
     breakout_retest_target_rr,
@@ -69,6 +69,43 @@ def _shape(candle) -> tuple[float, float]:
     body = abs(float(candle.close) - float(candle.open)) / span
     pos = clamp((float(candle.close) - float(candle.low)) / span, 0.0, 1.0)
     return body, pos
+
+
+def _snapshot_trend_direction(snapshot) -> tuple[Direction | None, dict]:
+    """Resolve current 5m trend from fresh closed candles on the monitor snapshot.
+
+    WATCHING and ARMED lifecycles must never keep trusting the direction captured
+    when they were created.  This helper intentionally uses the same `trend_bias`
+    feature that feeds RegimeEngine direction, but does not advance the regime
+    state machine on every priority poll.
+    """
+    frames = getattr(snapshot, "timeframes", {}) or {}
+    c5 = list(frames.get("5m", getattr(snapshot, "candles", [])) or [])
+    if len(c5) < 205:
+        return None, {
+            "trend_context_status": "unavailable",
+            "trend_context_bars": len(c5),
+            "current_trend_bias": "unknown",
+        }
+    try:
+        values = regime_features(c5, getattr(snapshot, "btc_candles", None))
+    except Exception as exc:
+        return None, {
+            "trend_context_status": "error",
+            "trend_context_bars": len(c5),
+            "current_trend_bias": "unknown",
+            "trend_context_error": f"{type(exc).__name__}: {exc}",
+        }
+    bias = str(values.get("trend_bias") or "neutral").strip().lower()
+    direction = Direction.LONG if bias == "long" else (Direction.SHORT if bias == "short" else None)
+    return direction, {
+        "trend_context_status": "ok",
+        "trend_context_bars": len(c5),
+        "current_trend_bias": bias,
+        "current_ema_alignment": float(values.get("ema_stack_alignment") or 0.0),
+        "current_ema_alignment_edge": float(values.get("ema_alignment_edge") or 0.0),
+        "current_adx": float(values.get("adx") or 0.0),
+    }
 
 
 
@@ -608,6 +645,9 @@ class ArmedEntryEngine:
                     "structural_rr_estimate": float(rr),
                     "stop_atr_5m": float(stop_atr),
                     "regime": self._active_regime(regime_metadata),
+                    "trend_revalidation_required": True,
+                    "trend_direction_at_arm": direction.value,
+                    "trend_revalidation_guard_version": 2,
                     **exhaustion_diag,
                 },
             )
@@ -742,6 +782,8 @@ class ArmedEntryEngine:
                         "trend_direction_at_arm": required_direction.value,
                         "trend_alignment_reason": trend_reason,
                         "trend_alignment_guard_version": 1,
+                        "trend_revalidation_required": True,
+                        "trend_revalidation_guard_version": 2,
                     },
                 )
                 if best is None or candidate.quality > best.quality:
@@ -840,7 +882,7 @@ class ArmedEntryEngine:
                 metadata={
                     "lifecycle_id": watch_id,
                     "lifecycle_origin": "breakout_precursor",
-                    "watch_model": "breakout_retest_watch_v1",
+                    "watch_model": "breakout_retest_watch_v2_stateful",
                     "breakout_candle_ts": candle_ts,
                     "structural_level": float(structural_level),
                     "atr_value_at_watch": atr5,
@@ -917,7 +959,8 @@ class ArmedEntryEngine:
             metadata={
                 "lifecycle_id": watch_id,
                 "lifecycle_origin": "liquidity_precursor",
-                "watch_model": "liquidity_sweep_watch_v1",
+                "watch_model": "liquidity_sweep_watch_v2_stateful",
+                "watch_candle_ts": int(getattr(c5[i], "timestamp", created)),
                 "liquidity_level": float(level), "atr_value_at_watch": float(atr5),
                 "proximity_atr": float(proximity), "trend_direction": required_direction.value,
                 "trend_reason": trend_reason,
@@ -956,76 +999,468 @@ class ArmedEntryEngine:
             return self._discover_sweep_watch(regime, snapshot, symbol, timeframe, regime_metadata)
         return None
 
+    @staticmethod
+    def _watch_origin_index(watch: SetupWatch, candles, metadata_key: str) -> int | None:
+        raw = int((watch.metadata or {}).get(metadata_key) or 0)
+        if raw <= 0:
+            # v6.6/v6.8 persisted watches did not store watch_candle_ts for
+            # Liquidity Sweep. The timestamp is still encoded in the watch id.
+            try:
+                raw = int(str(watch.watch_id).split(":")[2])
+            except (ValueError, IndexError):
+                raw = 0
+        if raw <= 0:
+            return None
+        return next(
+            (idx for idx, candle in enumerate(candles)
+             if int(getattr(candle, "timestamp", 0) or 0) == raw),
+            None,
+        )
+
+    @staticmethod
+    def _watch_trend_guard(watch: SetupWatch, snapshot) -> tuple[str, dict]:
+        current_direction, trend_diag = _snapshot_trend_direction(snapshot)
+        if trend_diag.get("trend_context_status") != "ok":
+            return "pending", {"reason": "watch_trend_context_unavailable", **trend_diag}
+        if current_direction is None:
+            return "cancelled", {"reason": "watch_direction_lost", **trend_diag}
+        if current_direction != watch.direction:
+            return "cancelled", {
+                "reason": "watch_direction_flipped",
+                "watch_direction": watch.direction.value,
+                "current_trend_direction": current_direction.value,
+                **trend_diag,
+            }
+        return "ok", {
+            "watch_direction": watch.direction.value,
+            "current_trend_direction": current_direction.value,
+            **trend_diag,
+        }
+
+    def _advance_breakout_watch(self, watch: SetupWatch, snapshot) -> tuple[str, ArmedSetup | None, dict]:
+        frames = getattr(snapshot, "timeframes", {}) or {}
+        c5 = list(frames.get("5m", getattr(snapshot, "candles", [])) or [])
+        c15 = list(frames.get("15m", []) or [])
+        c1h = list(frames.get("1h", []) or [])
+        if len(c5) < breakout.MIN_CANDLES_REQUIRED or len(c15) < 200 or len(c1h) < 200:
+            return "pending", None, {
+                "reason": "watch_waiting_mtf_data",
+                "bars_5m": len(c5), "bars_15m": len(c15), "bars_1h": len(c1h),
+            }
+        ok, _ = candle_quality(c5, breakout.MIN_CANDLES_REQUIRED, breakout.MIN_NONZERO_VOLUME_RATIO)
+        if not ok:
+            return "pending", None, {"reason": "watch_bad_5m_candle_quality"}
+
+        guard_status, guard_diag = self._watch_trend_guard(watch, snapshot)
+        if guard_status != "ok":
+            return guard_status, None, {"watch_id": watch.watch_id, **guard_diag}
+
+        tf5, tf15, tf1h = breakout._tf_values(c5), breakout._tf_values(c15), breakout._tf_values(c1h)
+        o, h, l, c, v = tf5["o"], tf5["h"], tf5["l"], tf5["c"], tf5["v"]
+        atr5 = float(tf5["atr"])
+        if atr5 <= 0:
+            return "pending", None, {"reason": "invalid_atr", "watch_id": watch.watch_id, **guard_diag}
+        atr_pct = atr5 / max(float(c[-1]), 1e-12)
+        if not breakout.ATR_PCT_MIN <= atr_pct <= breakout.ATR_PCT_MAX:
+            return "cancelled", None, {
+                "reason": "atr_out_of_range", "watch_id": watch.watch_id,
+                "atr_pct": atr_pct, **guard_diag,
+            }
+
+        direction_name = "long" if watch.direction == Direction.LONG else "short"
+        bias1h, diag1h = breakout._bias(tf1h, adx_min=breakout.H1_ADX_MIN)
+        bias15, diag15 = breakout._bias(tf15, adx_min=breakout.M15_ADX_MIN)
+        explicit = [x for x in (bias1h, bias15) if x != "none"]
+        if any(x != direction_name for x in explicit):
+            return "cancelled", None, {
+                "reason": "mtf_bias_conflict_with_watch", "watch_id": watch.watch_id,
+                "watch_direction": watch.direction.value, "bias_1h": bias1h, "bias_15m": bias15,
+                **guard_diag,
+            }
+        exhausted, exhaustion_diag = breakout._htf_exhaustion(direction_name, tf1h, tf15)
+        if exhausted:
+            return "cancelled", None, {
+                "reason": "higher_timeframe_move_exhausted", "watch_id": watch.watch_id,
+                **guard_diag, **exhaustion_diag,
+            }
+
+        origin_idx = self._watch_origin_index(watch, c5, "breakout_candle_ts")
+        if origin_idx is None:
+            return "cancelled", None, {
+                "reason": "breakout_origin_missing", "watch_id": watch.watch_id, **guard_diag,
+            }
+        i = len(c5) - 1
+        bars_since = i - origin_idx
+        if bars_since <= 0:
+            return "pending", None, {
+                "reason": "waiting_retest_touch", "watch_id": watch.watch_id,
+                "bars_since_breakout": bars_since, **guard_diag,
+            }
+        if bars_since > BREAKOUT_ARM_MAX_RETEST_BARS:
+            return "cancelled", None, {
+                "reason": "breakout_retest_window_expired", "watch_id": watch.watch_id,
+                "bars_since_breakout": bars_since, "max_retest_bars": BREAKOUT_ARM_MAX_RETEST_BARS,
+                **guard_diag,
+            }
+
+        structural_level = float((watch.metadata or {}).get("structural_level") or 0.0)
+        if structural_level <= 0:
+            return "cancelled", None, {"reason": "breakout_structural_level_missing", "watch_id": watch.watch_id}
+        retest_indices = list(range(origin_idx + 1, i + 1))
+        breakout_close = float(c[origin_idx])
+        breakout_rvol = float((watch.metadata or {}).get("breakout_rvol") or relative_volume(v, origin_idx))
+        max_close_distance = max(breakout.RETEST_MAX_CLOSE_DISTANCE_ATR, 0.34)
+
+        if watch.direction == Direction.LONG:
+            extreme = min(float(l[j]) for j in retest_indices)
+            touch_boundary = structural_level + atr5 * breakout.RETEST_TOUCH_TOL_ATR
+            touch = extreme <= touch_boundary
+            touch_distance_atr = max(0.0, extreme - touch_boundary) / atr5
+            if not touch:
+                return "pending", None, {
+                    "reason": "waiting_retest_touch", "watch_id": watch.watch_id,
+                    "structural_level": structural_level, "nearest_retest_low": extreme,
+                    "touch_distance_atr": touch_distance_atr, "bars_since_breakout": bars_since,
+                    **guard_diag,
+                }
+            if extreme < structural_level - atr5 * breakout.RETEST_MAX_PENETRATION_ATR:
+                return "cancelled", None, {
+                    "reason": "retest_too_deep", "watch_id": watch.watch_id,
+                    "structural_level": structural_level, "retest_extreme": extreme,
+                    "penetration_atr": (structural_level - extreme) / atr5, **guard_diag,
+                }
+            invalid_closes = [j for j in retest_indices if float(c[j]) < structural_level - atr5 * breakout.RETEST_CLOSE_INVALIDATION_ATR]
+            if invalid_closes:
+                return "cancelled", None, {
+                    "reason": "retest_close_invalidated", "watch_id": watch.watch_id,
+                    "invalid_close": float(c[invalid_closes[-1]]), "structural_level": structural_level,
+                    **guard_diag,
+                }
+            pullback = max(0.0, breakout_close - extreme) / atr5
+            if pullback < 0.12:
+                return "pending", None, {
+                    "reason": "retest_pullback_insufficient", "watch_id": watch.watch_id,
+                    "pullback_atr": pullback, "required_pullback_atr": 0.12,
+                    "bars_since_breakout": bars_since, **guard_diag,
+                }
+            close_distance_atr = abs(float(c[i]) - structural_level) / atr5
+            if close_distance_atr > max_close_distance:
+                return "cancelled", None, {
+                    "reason": "retest_too_extended", "watch_id": watch.watch_id,
+                    "close_distance_atr": close_distance_atr,
+                    "max_close_distance_atr": max_close_distance, **guard_diag,
+                }
+            trigger = max(structural_level + atr5 * 0.04, float(c[i]) + atr5 * 0.02)
+            stop = extreme - atr5 * breakout.MTF_SL_BUFFER_ATR
+            entry_zone_low = trigger
+            entry_zone_high = structural_level + atr5 * BREAKOUT_ENTRY_MAX_EXTENSION_ATR
+        else:
+            extreme = max(float(h[j]) for j in retest_indices)
+            touch_boundary = structural_level - atr5 * breakout.RETEST_TOUCH_TOL_ATR
+            touch = extreme >= touch_boundary
+            touch_distance_atr = max(0.0, touch_boundary - extreme) / atr5
+            if not touch:
+                return "pending", None, {
+                    "reason": "waiting_retest_touch", "watch_id": watch.watch_id,
+                    "structural_level": structural_level, "nearest_retest_high": extreme,
+                    "touch_distance_atr": touch_distance_atr, "bars_since_breakout": bars_since,
+                    **guard_diag,
+                }
+            if extreme > structural_level + atr5 * breakout.RETEST_MAX_PENETRATION_ATR:
+                return "cancelled", None, {
+                    "reason": "retest_too_deep", "watch_id": watch.watch_id,
+                    "structural_level": structural_level, "retest_extreme": extreme,
+                    "penetration_atr": (extreme - structural_level) / atr5, **guard_diag,
+                }
+            invalid_closes = [j for j in retest_indices if float(c[j]) > structural_level + atr5 * breakout.RETEST_CLOSE_INVALIDATION_ATR]
+            if invalid_closes:
+                return "cancelled", None, {
+                    "reason": "retest_close_invalidated", "watch_id": watch.watch_id,
+                    "invalid_close": float(c[invalid_closes[-1]]), "structural_level": structural_level,
+                    **guard_diag,
+                }
+            pullback = max(0.0, extreme - breakout_close) / atr5
+            if pullback < 0.12:
+                return "pending", None, {
+                    "reason": "retest_pullback_insufficient", "watch_id": watch.watch_id,
+                    "pullback_atr": pullback, "required_pullback_atr": 0.12,
+                    "bars_since_breakout": bars_since, **guard_diag,
+                }
+            close_distance_atr = abs(float(c[i]) - structural_level) / atr5
+            if close_distance_atr > max_close_distance:
+                return "cancelled", None, {
+                    "reason": "retest_too_extended", "watch_id": watch.watch_id,
+                    "close_distance_atr": close_distance_atr,
+                    "max_close_distance_atr": max_close_distance, **guard_diag,
+                }
+            trigger = min(structural_level - atr5 * 0.04, float(c[i]) - atr5 * 0.02)
+            stop = extreme + atr5 * breakout.MTF_SL_BUFFER_ATR
+            entry_zone_low = structural_level - atr5 * BREAKOUT_ENTRY_MAX_EXTENSION_ATR
+            entry_zone_high = trigger
+
+        stop_atr = abs(trigger - stop) / atr5
+        if stop_atr < ARM_MIN_STOP_ATR:
+            return "pending", None, {
+                "reason": "retest_stop_too_tight", "watch_id": watch.watch_id,
+                "stop_atr": stop_atr, "min_stop_atr": ARM_MIN_STOP_ATR, **guard_diag,
+            }
+        if stop_atr > ARM_MAX_STOP_ATR:
+            return "cancelled", None, {
+                "reason": "retest_stop_too_wide", "watch_id": watch.watch_id,
+                "stop_atr": stop_atr, "max_stop_atr": ARM_MAX_STOP_ATR, **guard_diag,
+            }
+
+        structural_target = breakout._structure_target(watch.direction, trigger, h, l, tf15["h"], tf15["l"])
+        target, target_ratio = front_run_target(trigger, structural_target, watch.direction)
+        target_rr_cap = breakout_retest_target_rr()
+        target, target_capped = cap_target_by_rr(trigger, stop, target, watch.direction, target_rr_cap)
+        rr = abs(target - trigger) / max(abs(trigger - stop), 1e-12)
+        if target <= 0 or rr < ARM_MIN_RR:
+            return "pending", None, {
+                "reason": "retest_rr_too_low", "watch_id": watch.watch_id,
+                "structural_rr_estimate": rr, "min_rr": ARM_MIN_RR, **guard_diag,
+            }
+        path = abs(structural_target - structural_level)
+        consumed = abs(trigger - structural_level) / max(path, 1e-12)
+        if path >= atr5 * 0.45 and consumed > 0.58:
+            return "cancelled", None, {
+                "reason": "retest_too_extended", "watch_id": watch.watch_id,
+                "impulse_consumed_ratio": consumed, **guard_diag,
+            }
+
+        htf_q = clamp(((float(diag1h.get("adx", 0)) - 12) + (float(diag15.get("adx", 0)) - 10)) / 30, 0, 1)
+        breakout_q = clamp((breakout_rvol - 0.8) / 1.0, 0, 1)
+        rr_q = clamp((rr - ARM_MIN_RR) / 1.6, 0, 1)
+        fresh_q = clamp(1.0 - (bars_since - 1) / max(BREAKOUT_ARM_MAX_RETEST_BARS, 1), 0, 1)
+        score = round(58 + 42 * clamp(0.34 * htf_q + 0.22 * breakout_q + 0.26 * rr_q + 0.18 * fresh_q, 0, 1), 2)
+        if score < BREAKOUT_ARM_MIN_SCORE:
+            return "pending", None, {
+                "reason": "retest_quality_below_arm_threshold", "watch_id": watch.watch_id,
+                "quality": score, "min_quality": BREAKOUT_ARM_MIN_SCORE, **guard_diag,
+            }
+
+        armed_at, expires_at = self._expiry(snapshot)
+        lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
+        setup = ArmedSetup(
+            setup_id=f"{watch.symbol}:BR:{int(getattr(c5[origin_idx], 'timestamp', armed_at))}:{watch.direction.value}",
+            symbol=watch.symbol, strategy=Strategy.BREAKOUT_RETEST, direction=watch.direction,
+            armed_at_ms=armed_at, expires_at_ms=expires_at,
+            trigger_price=float(trigger), invalidation_price=float(stop), stop_price=float(stop),
+            target_price=float(target), entry_zone_low=float(min(entry_zone_low, entry_zone_high)),
+            entry_zone_high=float(max(entry_zone_low, entry_zone_high)), quality=score,
+            risk_multiplier=max(float((watch.metadata or {}).get("risk_multiplier") or 1.0), 0.65),
+            timeframe=watch.timeframe,
+            reasons=("breakout_confirmed_5m", "retest_complete", "awaiting_micro_confirmation"),
+            metadata={
+                "strategy_model": "stateful_breakout_retest_watch_v2",
+                "atr_value": atr5, "atr_pct": atr_pct,
+                "structural_level": structural_level, "retest_extreme": float(extreme),
+                "breakout_rvol": breakout_rvol, "breakout_age_bars": int(bars_since),
+                "structural_target_price": float(structural_target),
+                "target_front_run_ratio": float(target_ratio), "target_rr_cap": float(target_rr_cap),
+                "target_rr_capped": bool(target_capped), "structural_rr_estimate": float(rr),
+                "stop_atr_5m": float(stop_atr), "regime": str((watch.metadata or {}).get("active_regime") or "TREND_CONTINUATION"),
+                "trend_revalidation_required": True, "trend_direction_at_arm": watch.direction.value,
+                "trend_revalidation_guard_version": 2,
+                "lifecycle_id": lifecycle_id,
+                "lifecycle_origin": str((watch.metadata or {}).get("lifecycle_origin") or "breakout_precursor"),
+                "origin_watch_id": watch.watch_id, "watch_created_at_ms": int(watch.created_at_ms),
+                "watch_promoted_at_ms": _now_ms(), "breakout_candle_ts": int(getattr(c5[origin_idx], "timestamp", 0) or 0),
+                **guard_diag, **exhaustion_diag,
+            },
+        )
+        return "armed", setup, {
+            "reason": "retest_complete", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id,
+            "quality": score, "bars_since_breakout": bars_since, "structural_rr_estimate": rr,
+            **guard_diag,
+        }
+
+    def _advance_sweep_watch(self, watch: SetupWatch, snapshot) -> tuple[str, ArmedSetup | None, dict]:
+        frames = getattr(snapshot, "timeframes", {}) or {}
+        c5 = list(frames.get("5m", getattr(snapshot, "candles", [])) or [])
+        ok, _ = candle_quality(c5, sweep.MIN_CANDLES_REQUIRED, sweep.MIN_NONZERO_VOLUME_RATIO)
+        if not ok:
+            return "pending", None, {"reason": "watch_bad_5m_candle_quality", "watch_id": watch.watch_id}
+
+        guard_status, guard_diag = self._watch_trend_guard(watch, snapshot)
+        if guard_status != "ok":
+            return guard_status, None, {"watch_id": watch.watch_id, **guard_diag}
+
+        o, h, l, c, v = extract(c5)
+        i = len(c) - 1
+        atr5 = atr(h, l, c, 14)
+        if atr5 <= 0:
+            return "pending", None, {"reason": "invalid_atr", "watch_id": watch.watch_id, **guard_diag}
+        atr_pct = float(atr5) / max(float(c[-1]), 1e-12)
+        if not sweep.ATR_PCT_MIN <= atr_pct <= sweep.ATR_PCT_MAX:
+            return "cancelled", None, {
+                "reason": "atr_out_of_range", "watch_id": watch.watch_id,
+                "atr_pct": atr_pct, **guard_diag,
+            }
+        level = float((watch.metadata or {}).get("liquidity_level") or 0.0)
+        if level <= 0:
+            return "cancelled", None, {"reason": "liquidity_level_missing", "watch_id": watch.watch_id}
+        anchor_idx = self._watch_origin_index(watch, c5, "watch_candle_ts")
+        if anchor_idx is None:
+            return "cancelled", None, {"reason": "liquidity_watch_origin_missing", "watch_id": watch.watch_id, **guard_diag}
+        bars_since_watch = i - anchor_idx
+        if bars_since_watch > sweep.SWEEP_MAX_AGE_BARS:
+            return "cancelled", None, {
+                "reason": "sweep_watch_window_expired", "watch_id": watch.watch_id,
+                "bars_since_watch": bars_since_watch, "max_watch_bars": sweep.SWEEP_MAX_AGE_BARS,
+                **guard_diag,
+            }
+
+        progress_reason = "waiting_sweep"
+        progress_diag: dict[str, Any] = {"liquidity_level": level, "bars_since_watch": bars_since_watch}
+        best: ArmedSetup | None = None
+        for sweep_idx in range(max(0, anchor_idx), i + 1):
+            if watch.direction == Direction.LONG:
+                extreme = float(l[sweep_idx])
+                depth = (level - extreme) / atr5
+                wick = sweep._lower_wick(o[sweep_idx], h[sweep_idx], l[sweep_idx], c[sweep_idx])
+                sweep_close = sweep._close_pos(h[sweep_idx], l[sweep_idx], c[sweep_idx])
+                recovered = float(c[sweep_idx]) >= level - atr5 * sweep.SWEEP_RECOVER_TOL_ATR and sweep_close >= 0.46
+            else:
+                extreme = float(h[sweep_idx])
+                depth = (extreme - level) / atr5
+                wick = sweep._upper_wick(o[sweep_idx], h[sweep_idx], l[sweep_idx], c[sweep_idx])
+                sweep_close = sweep._close_pos(h[sweep_idx], l[sweep_idx], c[sweep_idx])
+                recovered = float(c[sweep_idx]) <= level + atr5 * sweep.SWEEP_RECOVER_TOL_ATR and sweep_close <= 0.54
+            rvol = relative_volume(v, sweep_idx, 24)
+            if depth < sweep.SWEEP_MIN_DEPTH_ATR:
+                continue
+            progress_reason = "sweep_detected_waiting_reclaim"
+            progress_diag = {
+                "liquidity_level": level, "sweep_index": sweep_idx,
+                "sweep_depth_atr": float(depth), "sweep_wick_ratio": float(wick),
+                "sweep_rvol": float(rvol), "sweep_recovered": bool(recovered),
+                "bars_since_watch": bars_since_watch,
+            }
+            if wick < sweep.SWEEP_MIN_WICK_RATIO:
+                progress_reason = "sweep_detected_wick_insufficient"
+                continue
+            if rvol < sweep.SWEEP_MIN_RVOL:
+                progress_reason = "sweep_detected_volume_insufficient"
+                continue
+            if not recovered:
+                continue
+            if sweep_idx < i:
+                if watch.direction == Direction.LONG and min(l[sweep_idx + 1:i + 1]) < extreme - atr5 * sweep.RETEST_INVALIDATION_ATR:
+                    progress_reason = "sweep_reclaim_invalidated"
+                    continue
+                if watch.direction == Direction.SHORT and max(h[sweep_idx + 1:i + 1]) > extreme + atr5 * sweep.RETEST_INVALIDATION_ATR:
+                    progress_reason = "sweep_reclaim_invalidated"
+                    continue
+
+            if watch.direction == Direction.LONG:
+                trigger = max(level + atr5 * 0.04, float(c[sweep_idx]) + atr5 * 0.03)
+                stop = extreme - atr5 * sweep.SL_BUFFER_ATR
+                entry_zone_low, entry_zone_high = trigger, level + atr5 * SWEEP_ENTRY_MAX_EXTENSION_ATR
+                target_level = max(h[max(0, sweep_idx - sweep.TARGET_LOOKBACK):sweep_idx])
+            else:
+                trigger = min(level - atr5 * 0.04, float(c[sweep_idx]) - atr5 * 0.03)
+                stop = extreme + atr5 * sweep.SL_BUFFER_ATR
+                entry_zone_low, entry_zone_high = level - atr5 * SWEEP_ENTRY_MAX_EXTENSION_ATR, trigger
+                target_level = min(l[max(0, sweep_idx - sweep.TARGET_LOOKBACK):sweep_idx])
+            stop_atr = abs(trigger - stop) / atr5
+            if stop_atr < ARM_MIN_STOP_ATR:
+                progress_reason = "sweep_stop_too_tight"
+                progress_diag["stop_atr"] = stop_atr
+                continue
+            if stop_atr > ARM_MAX_STOP_ATR:
+                progress_reason = "sweep_stop_too_wide"
+                progress_diag["stop_atr"] = stop_atr
+                continue
+            target, target_ratio = front_run_target(trigger, target_level, watch.direction)
+            target_rr_cap = liquidity_sweep_target_rr()
+            target, target_capped = cap_target_by_rr(trigger, stop, target, watch.direction, target_rr_cap)
+            rr = abs(target - trigger) / max(abs(trigger - stop), 1e-12)
+            if target <= 0 or rr < ARM_MIN_RR:
+                progress_reason = "sweep_rr_too_low"
+                progress_diag["structural_rr_estimate"] = rr
+                continue
+            age = i - sweep_idx
+            depth_q = clamp((depth - sweep.SWEEP_MIN_DEPTH_ATR) / 0.65, 0, 1)
+            wick_q = clamp((wick - sweep.SWEEP_MIN_WICK_RATIO) / 0.45, 0, 1)
+            rv_q = clamp((rvol - 0.65) / 1.0, 0, 1)
+            rr_q = clamp((rr - ARM_MIN_RR) / 1.6, 0, 1)
+            fresh_q = clamp(1.0 - age / 4.0, 0, 1)
+            score = round(58 + 42 * clamp(0.25 * depth_q + 0.20 * wick_q + 0.16 * rv_q + 0.25 * rr_q + 0.14 * fresh_q, 0, 1), 2)
+            if score < SWEEP_ARM_MIN_SCORE:
+                progress_reason = "sweep_quality_below_arm_threshold"
+                progress_diag.update({"quality": score, "min_quality": SWEEP_ARM_MIN_SCORE})
+                continue
+            armed_at, expires_at = self._expiry(snapshot)
+            lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
+            candidate = ArmedSetup(
+                setup_id=f"{watch.symbol}:LS:{int(getattr(c5[sweep_idx], 'timestamp', armed_at))}:{watch.direction.value}",
+                symbol=watch.symbol, strategy=Strategy.LIQUIDITY_SWEEP, direction=watch.direction,
+                armed_at_ms=armed_at, expires_at_ms=expires_at,
+                trigger_price=float(trigger), invalidation_price=float(stop), stop_price=float(stop),
+                target_price=float(target), entry_zone_low=float(min(entry_zone_low, entry_zone_high)),
+                entry_zone_high=float(max(entry_zone_low, entry_zone_high)), quality=score,
+                risk_multiplier=max(float((watch.metadata or {}).get("risk_multiplier") or 1.0), 0.65),
+                timeframe=watch.timeframe,
+                reasons=("liquidity_sweep_5m", "level_recovered", "awaiting_micro_confirmation"),
+                metadata={
+                    "strategy_model": "stateful_liquidity_sweep_watch_v2",
+                    "atr_value": float(atr5), "atr_pct": atr_pct, "sweep_level": level,
+                    "sweep_extreme": float(extreme), "sweep_depth_atr": float(depth),
+                    "sweep_wick_ratio": float(wick), "sweep_rvol": float(rvol),
+                    "bars_since_sweep": int(age), "structural_target_price": float(target_level),
+                    "target_front_run_ratio": float(target_ratio), "target_rr_cap": float(target_rr_cap),
+                    "target_rr_capped": bool(target_capped), "structural_rr_estimate": float(rr),
+                    "stop_atr_5m": float(stop_atr),
+                    "regime": str((watch.metadata or {}).get("active_regime") or "TREND_CONTINUATION"),
+                    "trend_aligned": True, "trend_direction_at_arm": watch.direction.value,
+                    "trend_alignment_reason": "stateful_watch_current_5m_trend",
+                    "trend_alignment_guard_version": 2,
+                    "trend_revalidation_required": True, "trend_revalidation_guard_version": 2,
+                    "lifecycle_id": lifecycle_id,
+                    "lifecycle_origin": str((watch.metadata or {}).get("lifecycle_origin") or "liquidity_precursor"),
+                    "origin_watch_id": watch.watch_id, "watch_created_at_ms": int(watch.created_at_ms),
+                    "watch_promoted_at_ms": _now_ms(), "watch_candle_ts": int(getattr(c5[anchor_idx], "timestamp", 0) or 0),
+                    **guard_diag,
+                },
+            )
+            if best is None or candidate.quality > best.quality:
+                best = candidate
+
+        if best is not None:
+            lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
+            return "armed", best, {
+                "reason": "sweep_reclaimed", "watch_id": watch.watch_id,
+                "lifecycle_id": lifecycle_id, "quality": best.quality, **guard_diag,
+            }
+
+        # If price has materially broken through the watched pool without reclaim,
+        # the original level is no longer a valid trend-following sweep candidate.
+        if watch.direction == Direction.LONG:
+            failed_distance = (level - float(c[i])) / atr5
+        else:
+            failed_distance = (float(c[i]) - level) / atr5
+        if failed_distance > 0.70:
+            return "cancelled", None, {
+                "reason": "sweep_failed_no_reclaim", "watch_id": watch.watch_id,
+                "failed_close_distance_atr": failed_distance, **progress_diag, **guard_diag,
+            }
+        return "pending", None, {
+            "reason": progress_reason, "watch_id": watch.watch_id, **progress_diag, **guard_diag,
+        }
+
     def advance_watch(self, watch: SetupWatch, snapshot) -> tuple[str, ArmedSetup | None, dict]:
         now_ms = _now_ms()
         if now_ms >= int(watch.expires_at_ms):
-            return "cancelled", None, {"reason": "watch_expired"}
+            return "cancelled", None, {"reason": "watch_expired", "watch_id": watch.watch_id}
         frames = getattr(snapshot, "timeframes", {}) or {}
         if not frames.get("5m"):
-            return "pending", None, {"reason": "watch_waiting_5m_data"}
-        direction_value = str(watch.direction.value)
-        regime = SimpleNamespace(
-            hard_block=False,
-            breakout_allowed=(watch.strategy == Strategy.BREAKOUT_RETEST),
-            sweep_allowed=(watch.strategy == Strategy.LIQUIDITY_SWEEP),
-            risk_multiplier=float((watch.metadata or {}).get("risk_multiplier") or 1.0),
-            direction=watch.direction,
-        )
-        meta = {
-            "active": str((watch.metadata or {}).get("active_regime") or "TREND_CONTINUATION"),
-            "features": {"trend_bias": "long" if watch.direction == Direction.LONG else "short"},
-        }
-        self.branch_trace = {}
+            return "pending", None, {"reason": "watch_waiting_5m_data", "watch_id": watch.watch_id}
         if watch.strategy == Strategy.BREAKOUT_RETEST:
-            setup = self._discover_breakout(regime, snapshot, watch.symbol, watch.timeframe, meta)
-            trace = dict(self.branch_trace.get("breakout") or {})
-            if setup is not None and setup.direction == watch.direction:
-                lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
-                setup = replace(
-                    setup,
-                    metadata={
-                        **dict(setup.metadata or {}),
-                        "lifecycle_id": lifecycle_id,
-                        "lifecycle_origin": str((watch.metadata or {}).get("lifecycle_origin") or "breakout_precursor"),
-                        "origin_watch_id": watch.watch_id,
-                        "watch_created_at_ms": int(watch.created_at_ms),
-                        "watch_promoted_at_ms": now_ms,
-                    },
-                )
-                return "armed", setup, {"reason": "retest_completed", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id, **trace}
-            reason = str(trace.get("reason") or "waiting_retest")
-            fatal = reason in {"mtf_bias_conflict_with_trend", "breakout_no_directional_trend", "higher_timeframe_move_exhausted"}
-            if fatal:
-                return "cancelled", None, {"reason": reason, "watch_id": watch.watch_id, **trace}
-            # Keep the watch alive while the specific breakout is still within the
-            # retest horizon. If it ages out, a new breakout must create a new watch.
-            c5 = list(frames.get("5m") or [])
-            original_ts = int((watch.metadata or {}).get("breakout_candle_ts") or 0)
-            index = next((i for i, candle in enumerate(c5) if int(getattr(candle, "timestamp", 0) or 0) == original_ts), None)
-            if index is not None and len(c5) - 1 - index > BREAKOUT_ARM_MAX_RETEST_BARS:
-                return "cancelled", None, {"reason": "breakout_retest_window_expired", "watch_id": watch.watch_id}
-            return "pending", None, {"reason": "waiting_retest", "watch_id": watch.watch_id, "detail": reason, **trace}
-
-        setup = self._discover_sweep(regime, snapshot, watch.symbol, watch.timeframe, meta)
-        trace = dict(self.branch_trace.get("sweep") or {})
-        if setup is not None and setup.direction == watch.direction:
-            lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
-            setup = replace(
-                setup,
-                metadata={
-                    **dict(setup.metadata or {}),
-                    "lifecycle_id": lifecycle_id,
-                    "lifecycle_origin": str((watch.metadata or {}).get("lifecycle_origin") or "liquidity_precursor"),
-                    "origin_watch_id": watch.watch_id,
-                    "watch_created_at_ms": int(watch.created_at_ms),
-                    "watch_promoted_at_ms": now_ms,
-                },
-            )
-            return "armed", setup, {"reason": "sweep_reclaimed", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id, **trace}
-        reason = str(trace.get("reason") or "waiting_sweep_reclaim")
-        if reason in {"liquidity_sweep_trend_conflict", "liquidity_sweep_no_directional_trend"}:
-            return "cancelled", None, {"reason": reason, "watch_id": watch.watch_id, **trace}
-        return "pending", None, {"reason": "waiting_sweep_reclaim", "watch_id": watch.watch_id, "detail": reason, **trace}
+            return self._advance_breakout_watch(watch, snapshot)
+        if watch.strategy == Strategy.LIQUIDITY_SWEEP:
+            return self._advance_sweep_watch(watch, snapshot)
+        return "cancelled", None, {"reason": "unsupported_watch_strategy", "watch_id": watch.watch_id}
 
     def discover(self, regime, snapshot, symbol: str, timeframe: str,
                  regime_metadata: dict | None = None) -> ArmedSetup | None:
@@ -1140,6 +1575,31 @@ class ArmedEntryEngine:
         if now_ms >= int(setup.expires_at_ms):
             self._consume(setup, "setup_expired", now_ms)
             return "cancelled", None, {"reason": "setup_expired"}
+
+        # Stateful v6.9 safety: a setup that was valid at arm time may not keep
+        # its original direction forever. New v6.9 setups require a fresh closed
+        # 5m trend context immediately before micro-confirmation. Missing context
+        # waits; neutral/opposite context invalidates the stale directional setup.
+        meta = dict(setup.metadata or {})
+        if bool(meta.get("trend_revalidation_required")):
+            current_direction, trend_diag = _snapshot_trend_direction(snapshot)
+            if trend_diag.get("trend_context_status") != "ok":
+                return "pending", None, {"reason": "trend_context_unavailable", **trend_diag}
+            if current_direction is None:
+                self._consume(setup, "trend_direction_lost", now_ms)
+                return "cancelled", None, {
+                    "reason": "trend_direction_lost",
+                    "setup_direction": setup.direction.value,
+                    **trend_diag,
+                }
+            if current_direction != setup.direction:
+                self._consume(setup, "trend_direction_flipped", now_ms)
+                return "cancelled", None, {
+                    "reason": "trend_direction_flipped",
+                    "setup_direction": setup.direction.value,
+                    "current_trend_direction": current_direction.value,
+                    **trend_diag,
+                }
         ok, reason, diag = _micro_confirmation(
             setup,
             snapshot,

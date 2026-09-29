@@ -95,7 +95,7 @@ class MarketCoordinator:
         cached = self._armed_trend_cache.get(symbol)
         if cached and now_mono - float(cached[0]) < self._armed_trend_cache_ttl_seconds:
             return list(cached[1])
-        raw = await self.client.klines(symbol, '5m', 261)
+        raw = await self.client.klines(symbol, '5m', 321)
         now_ms = int(time.time() * 1000)
         span = TF_MS['5m']
         candles = [c for c in self._parse_klines(raw) if c.timestamp + span <= now_ms]
@@ -115,9 +115,10 @@ class MarketCoordinator:
         """Lightweight high-priority snapshot for an already ARMED setup.
 
         Discovery still uses the full 5m/15m/1h snapshot. After a setup has passed
-        those filters, triggering only needs an executable order-book quote and a
-        fresh CLOSED 1m candle. Fetching only those two feeds keeps the follow-up
-        fast without multiplying the expensive scanner traffic.
+        those filters, triggering needs an executable order-book quote, a fresh
+        CLOSED 1m candle, and the same 321-bar 5m history depth used by discovery.
+        Keeping the 5m depth identical prevents EMA200/trend-bias drift caused only
+        by re-seeding EMA calculations from a shorter history during ARMED polling.
         """
         quote_result, micro_result, trend_result = await asyncio.gather(
             self.quote(symbol), self.client.klines(symbol, '1m', 61),

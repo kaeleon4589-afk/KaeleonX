@@ -880,6 +880,17 @@ class ArmedEntryEngine:
                         continue
                     if direction == Direction.SHORT and max(h[sweep_idx + 1:i + 1]) > extreme + atr5 * sweep.RETEST_INVALIDATION_ATR:
                         continue
+                # A sweep/reclaim is not itself an entry. Require a CLOSED 5m
+                # continuation bar after the sweep so a brief 1m bounce cannot
+                # arm a falling knife. This mirrors liquidity_sweep._detect().
+                if sweep_idx >= i:
+                    continue
+                continuation_ok, continuation_reason, continuation_diag = sweep.continuation_confirmation(
+                    direction_name, sweep_idx=sweep_idx, trigger_idx=i, o=o, h=h, l=l, c=c, v=v,
+                    ema20=ema20, ema50=ema50, atr_value=atr5, level=float(level),
+                )
+                if not continuation_ok:
+                    continue
                 if direction == Direction.LONG:
                     trigger = max(float(level) + atr5 * 0.04, float(c[sweep_idx]) + atr5 * 0.03)
                     stop = extreme - atr5 * sweep.SL_BUFFER_ATR
@@ -925,9 +936,9 @@ class ArmedEntryEngine:
                     quality=score,
                     risk_multiplier=max(float(getattr(regime, "risk_multiplier", 1.0) or 1.0), 0.65),
                     timeframe=timeframe,
-                    reasons=("liquidity_sweep_5m", "level_recovered", "awaiting_micro_confirmation"),
+                    reasons=("liquidity_sweep_5m", "level_recovered", "post_sweep_5m_continuation", "awaiting_micro_confirmation"),
                     metadata={
-                        "strategy_model": "armed_liquidity_sweep_v6",
+                        "strategy_model": "armed_liquidity_sweep_v6_15",
                         "atr_value": atr5,
                         "atr_pct": atr_pct,
                         "sweep_level": float(level),
@@ -936,6 +947,9 @@ class ArmedEntryEngine:
                         "sweep_wick_ratio": float(wick),
                         "sweep_rvol": float(rvol),
                         "bars_since_sweep": int(age),
+                        "sweep_5m_continuation_confirmed": True,
+                        "sweep_5m_continuation_reason": continuation_reason,
+                        "sweep_5m_continuation": continuation_diag,
                         "structural_target_price": float(target_level),
                         "target_front_run_ratio": float(target_ratio),
                         "target_rr_cap": float(target_rr_cap),
@@ -1491,6 +1505,7 @@ class ArmedEntryEngine:
                 "reason": "atr_out_of_range", "watch_id": watch.watch_id,
                 "atr_pct": atr_pct, **guard_diag,
             }
+        ema20, ema50 = ema(c, sweep.EMA_FAST), ema(c, sweep.EMA_MID)
         level = float((watch.metadata or {}).get("liquidity_level") or 0.0)
         if level <= 0:
             return "cancelled", None, {"reason": "liquidity_level_missing", "watch_id": watch.watch_id}
@@ -1547,6 +1562,23 @@ class ArmedEntryEngine:
                     progress_reason = "sweep_reclaim_invalidated"
                     continue
 
+            # Do not arm on the sweep candle itself. Wait for a closed 5m bar
+            # that proves reclaim + directional continuation. The 1m gate still
+            # handles precise execution after this structural confirmation.
+            if sweep_idx >= i:
+                progress_reason = "sweep_reclaimed_waiting_5m_continuation"
+                progress_diag["bars_since_sweep"] = 0
+                continue
+            continuation_ok, continuation_reason, continuation_diag = sweep.continuation_confirmation(
+                "long" if watch.direction == Direction.LONG else "short",
+                sweep_idx=sweep_idx, trigger_idx=i, o=o, h=h, l=l, c=c, v=v,
+                ema20=ema20, ema50=ema50, atr_value=atr5, level=level,
+            )
+            if not continuation_ok:
+                progress_reason = continuation_reason
+                progress_diag.update(continuation_diag)
+                continue
+
             if watch.direction == Direction.LONG:
                 trigger = max(level + atr5 * 0.04, float(c[sweep_idx]) + atr5 * 0.03)
                 stop = extreme - atr5 * sweep.SL_BUFFER_ATR
@@ -1598,11 +1630,15 @@ class ArmedEntryEngine:
                 timeframe=watch.timeframe,
                 reasons=("liquidity_sweep_5m", "level_recovered", "awaiting_micro_confirmation"),
                 metadata={
-                    "strategy_model": "stateful_liquidity_sweep_watch_v2",
+                    "strategy_model": "stateful_liquidity_sweep_watch_v3_5m_continuation",
                     "atr_value": float(atr5), "atr_pct": atr_pct, "sweep_level": level,
                     "sweep_extreme": float(extreme), "sweep_depth_atr": float(depth),
                     "sweep_wick_ratio": float(wick), "sweep_rvol": float(rvol),
-                    "bars_since_sweep": int(age), "structural_target_price": float(target_level),
+                    "bars_since_sweep": int(age),
+                    "sweep_5m_continuation_confirmed": True,
+                    "sweep_5m_continuation_reason": continuation_reason,
+                    "sweep_5m_continuation": continuation_diag,
+                    "structural_target_price": float(target_level),
                     "target_front_run_ratio": float(target_ratio), "target_rr_cap": float(target_rr_cap),
                     "target_rr_capped": bool(target_capped), "structural_rr_estimate": float(rr),
                     "stop_atr_5m": float(stop_atr),

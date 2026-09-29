@@ -78,6 +78,69 @@ def _score_candidate(*, sweep_depth_atr: float, sweep_wick_ratio: float, sweep_r
     return round(min(100.0, 58.0 + 42.0 * quality), 2)
 
 
+def continuation_confirmation(direction: str, *, sweep_idx: int, trigger_idx: int,
+                              o, h, l, c, v, ema20, ema50, atr_value: float, level: float):
+    """Require a CLOSED 5m reclaim/continuation bar after the sweep.
+
+    A liquidity sweep is not a reversal by itself.  The post-sweep bar must prove
+    directional acceptance before the stateful engine may arm a trade.  This
+    helper is shared by the legacy detector and ArmedEntryEngine so both paths
+    enforce the same market structure semantics.
+    """
+    if trigger_idx <= sweep_idx:
+        return False, "sweep_waiting_5m_continuation", {"bars_since_sweep": max(trigger_idx - sweep_idx, 0)}
+
+    trigger_rvol = relative_volume(v, trigger_idx, 24)
+    trigger_body = _body_ratio(o[trigger_idx], h[trigger_idx], l[trigger_idx], c[trigger_idx])
+    trigger_close = _close_pos(h[trigger_idx], l[trigger_idx], c[trigger_idx])
+    close = float(c[trigger_idx])
+    opened = float(o[trigger_idx])
+    sweep_close = float(c[sweep_idx])
+
+    if direction == "long":
+        extension = (close - float(level)) / max(atr_value, 1e-12)
+        checks = (
+            (close > float(level), "sweep_continuation_level_not_reclaimed"),
+            (close >= sweep_close, "sweep_continuation_below_sweep_close"),
+            (close > opened, "sweep_continuation_not_directional"),
+            (close >= float(ema20[trigger_idx]) - atr_value * TRIGGER_EMA20_RECOVER_TOL_ATR, "sweep_continuation_ema20_not_recovered"),
+            (close >= float(ema50[trigger_idx]) - atr_value * TRIGGER_EMA50_RECOVER_TOL_ATR, "sweep_continuation_ema50_not_recovered"),
+            (trigger_rvol >= TRIGGER_MIN_RVOL, "sweep_continuation_volume_insufficient"),
+            (trigger_body >= TRIGGER_MIN_BODY_RATIO, "sweep_continuation_body_insufficient"),
+            (trigger_close >= TRIGGER_CLOSE_POS_LONG_MIN, "sweep_continuation_close_location_weak"),
+            (extension <= TRIGGER_EXTENSION_MAX_ATR, "sweep_continuation_too_extended"),
+        )
+    else:
+        extension = (float(level) - close) / max(atr_value, 1e-12)
+        checks = (
+            (close < float(level), "sweep_continuation_level_not_reclaimed"),
+            (close <= sweep_close, "sweep_continuation_above_sweep_close"),
+            (close < opened, "sweep_continuation_not_directional"),
+            (close <= float(ema20[trigger_idx]) + atr_value * TRIGGER_EMA20_RECOVER_TOL_ATR, "sweep_continuation_ema20_not_recovered"),
+            (close <= float(ema50[trigger_idx]) + atr_value * TRIGGER_EMA50_RECOVER_TOL_ATR, "sweep_continuation_ema50_not_recovered"),
+            (trigger_rvol >= TRIGGER_MIN_RVOL, "sweep_continuation_volume_insufficient"),
+            (trigger_body >= TRIGGER_MIN_BODY_RATIO, "sweep_continuation_body_insufficient"),
+            (trigger_close <= TRIGGER_CLOSE_POS_SHORT_MAX, "sweep_continuation_close_location_weak"),
+            (extension <= TRIGGER_EXTENSION_MAX_ATR, "sweep_continuation_too_extended"),
+        )
+
+    diag = {
+        "bars_since_sweep": int(trigger_idx - sweep_idx),
+        "trigger_rvol": float(trigger_rvol),
+        "trigger_body_ratio": float(trigger_body),
+        "trigger_close_pos": float(trigger_close),
+        "trigger_extension_atr": float(extension),
+        "trigger_close": close,
+        "trigger_open": opened,
+        "sweep_close": sweep_close,
+        "liquidity_level": float(level),
+    }
+    for passed, reason in checks:
+        if not passed:
+            return False, reason, diag
+    return True, "sweep_5m_continuation_confirmed", diag
+
+
 def _detect(direction: str, *, o, h, l, c, v, ema20, ema50, atr_value):
     if len(c) < max(SWEEP_LOOKBACK + SWEEP_MAX_AGE_BARS + 6, 90):
         return None
@@ -90,10 +153,6 @@ def _detect(direction: str, *, o, h, l, c, v, ema20, ema50, atr_value):
         bars_since = trigger_idx - sweep_idx
         if bars_since <= 0 or bars_since > SWEEP_MAX_AGE_BARS:
             continue
-        trigger_rvol = relative_volume(v, trigger_idx, 24)
-        trigger_body = _body_ratio(o[trigger_idx], h[trigger_idx], l[trigger_idx], c[trigger_idx])
-        trigger_close = _close_pos(h[trigger_idx], l[trigger_idx], c[trigger_idx])
-
         if direction == "long":
             level = min(l[left_start:sweep_idx])
             sweep_extreme = float(l[sweep_idx])
@@ -108,19 +167,16 @@ def _detect(direction: str, *, o, h, l, c, v, ema20, ema50, atr_value):
             invalidation = min(l[sweep_idx + 1:trigger_idx + 1])
             if invalidation < sweep_extreme - atr_value * RETEST_INVALIDATION_ATR:
                 continue
-            extension = (float(c[trigger_idx]) - float(level)) / max(atr_value, 1e-12)
-            trigger_ok = (
-                float(c[trigger_idx]) > float(level)
-                and float(c[trigger_idx]) >= float(c[sweep_idx])
-                and float(c[trigger_idx]) >= float(ema20[trigger_idx]) - atr_value * TRIGGER_EMA20_RECOVER_TOL_ATR
-                and float(c[trigger_idx]) >= float(ema50[trigger_idx]) - atr_value * TRIGGER_EMA50_RECOVER_TOL_ATR
-                and trigger_rvol >= TRIGGER_MIN_RVOL
-                and trigger_body >= TRIGGER_MIN_BODY_RATIO
-                and trigger_close >= TRIGGER_CLOSE_POS_LONG_MIN
-                and extension <= TRIGGER_EXTENSION_MAX_ATR
+            trigger_ok, _, trigger_diag = continuation_confirmation(
+                "long", sweep_idx=sweep_idx, trigger_idx=trigger_idx, o=o, h=h, l=l, c=c, v=v,
+                ema20=ema20, ema50=ema50, atr_value=atr_value, level=float(level),
             )
             if not trigger_ok:
                 continue
+            trigger_rvol = float(trigger_diag["trigger_rvol"])
+            trigger_body = float(trigger_diag["trigger_body_ratio"])
+            trigger_close = float(trigger_diag["trigger_close_pos"])
+            extension = float(trigger_diag["trigger_extension_atr"])
             target_start = max(0, sweep_idx - TARGET_LOOKBACK)
             target_level = max(h[target_start:sweep_idx]) if sweep_idx > target_start else max(h[:sweep_idx] or [0.0])
             stop_price = sweep_extreme - atr_value * SL_BUFFER_ATR
@@ -141,19 +197,16 @@ def _detect(direction: str, *, o, h, l, c, v, ema20, ema50, atr_value):
             invalidation = max(h[sweep_idx + 1:trigger_idx + 1])
             if invalidation > sweep_extreme + atr_value * RETEST_INVALIDATION_ATR:
                 continue
-            extension = (float(level) - float(c[trigger_idx])) / max(atr_value, 1e-12)
-            trigger_ok = (
-                float(c[trigger_idx]) < float(level)
-                and float(c[trigger_idx]) <= float(c[sweep_idx])
-                and float(c[trigger_idx]) <= float(ema20[trigger_idx]) + atr_value * TRIGGER_EMA20_RECOVER_TOL_ATR
-                and float(c[trigger_idx]) <= float(ema50[trigger_idx]) + atr_value * TRIGGER_EMA50_RECOVER_TOL_ATR
-                and trigger_rvol >= TRIGGER_MIN_RVOL
-                and trigger_body >= TRIGGER_MIN_BODY_RATIO
-                and trigger_close <= TRIGGER_CLOSE_POS_SHORT_MAX
-                and extension <= TRIGGER_EXTENSION_MAX_ATR
+            trigger_ok, _, trigger_diag = continuation_confirmation(
+                "short", sweep_idx=sweep_idx, trigger_idx=trigger_idx, o=o, h=h, l=l, c=c, v=v,
+                ema20=ema20, ema50=ema50, atr_value=atr_value, level=float(level),
             )
             if not trigger_ok:
                 continue
+            trigger_rvol = float(trigger_diag["trigger_rvol"])
+            trigger_body = float(trigger_diag["trigger_body_ratio"])
+            trigger_close = float(trigger_diag["trigger_close_pos"])
+            extension = float(trigger_diag["trigger_extension_atr"])
             target_start = max(0, sweep_idx - TARGET_LOOKBACK)
             target_level = min(l[target_start:sweep_idx]) if sweep_idx > target_start else min(l[:sweep_idx] or [0.0])
             stop_price = sweep_extreme + atr_value * SL_BUFFER_ATR

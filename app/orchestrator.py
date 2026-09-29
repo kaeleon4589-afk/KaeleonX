@@ -806,7 +806,10 @@ class TradingOrchestrator:
                 if status == "cancelled":
                     self.watching_setups.pop(snapshot.symbol, None)
                     reason = str((watch_trace or {}).get("reason") or "watch_cancelled")
+                    if hasattr(self.router, "consume_watch"):
+                        self.router.consume_watch(watch, reason)
                     self._schedule_watch_terminal(user_id, watch, reason)
+                    self._funnel("watch_cancelled", reason, user_id=user_id, symbol=snapshot.symbol)
                     self.last_rejection = reason
                     self.audit.event(
                         "SETUP_WATCH_CANCELLED", decision_id, user_id=user_id,
@@ -841,6 +844,8 @@ class TradingOrchestrator:
                 if armed is None:
                     return None
                 self.watching_setups.pop(snapshot.symbol, None)
+                if hasattr(self.router, "consume_watch"):
+                    self.router.consume_watch(watch, "setup_armed")
                 self._schedule_watch_terminal(user_id, watch, "setup_armed")
                 armed = self._ensure_armed_lifecycle(armed, watch=watch)
                 lifecycle_ctx = self._lifecycle_context(watch=watch, setup=armed, decision_id=decision_id)

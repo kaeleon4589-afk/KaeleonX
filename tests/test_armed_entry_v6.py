@@ -1289,3 +1289,117 @@ def test_v612_trigger_target_rebase_is_directionally_symmetric_for_short(monkeyp
     assert trace["execution_rr"] >= 1.10
     assert intent.target_price < setup.target_price
     assert intent.metadata["structural_target_price"] == 97.50
+
+# ---------------------------------------------------------------------------
+# v6.14 root bottleneck fix: adaptive wick penetration + terminal watch tombstone
+# ---------------------------------------------------------------------------
+
+def test_v614_strong_trend_uses_half_atr_wick_ceiling_but_standard_stays_030():
+    from app.strategy.armed_entry import _adaptive_retest_penetration_limit
+
+    strong, strong_diag = _adaptive_retest_penetration_limit(
+        Direction.LONG,
+        3,
+        {
+            "trend_context_status": "ok",
+            "current_adx": 35.0,
+            "current_ema_alignment": 0.75,
+            "current_ema_alignment_edge": 0.50,
+        },
+    )
+    weak, weak_diag = _adaptive_retest_penetration_limit(
+        Direction.LONG,
+        3,
+        {
+            "trend_context_status": "ok",
+            "current_adx": 16.0,
+            "current_ema_alignment": 0.75,
+            "current_ema_alignment_edge": 0.50,
+        },
+    )
+
+    assert strong == 0.50
+    assert strong_diag["retest_penetration_adaptive_eligible"] is True
+    assert strong_diag["retest_penetration_mode"] == "strong_trend_adaptive"
+    assert weak == 0.30
+    assert weak_diag["retest_penetration_adaptive_eligible"] is False
+    assert weak_diag["retest_penetration_mode"] == "standard"
+
+
+def test_v614_moderate_deep_wick_can_arm_in_strong_trend_but_very_deep_still_cancels(monkeypatch):
+    from app.strategy import breakout_retest as breakout_module
+
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    precursor = _breakout_precursor_snapshot()
+    watch = engine.discover_watch(regime, precursor, "BR", "5m", meta)
+    assert watch is not None
+
+    strong_guard = {
+        "watch_direction": "LONG",
+        "current_trend_direction": "LONG",
+        "trend_context_status": "ok",
+        "trend_context_bars": 320,
+        "current_trend_bias": "long",
+        "current_ema_alignment": 1.0,
+        "current_ema_alignment_edge": 1.0,
+        "current_adx": 35.0,
+    }
+    monkeypatch.setattr(engine, "_watch_trend_guard", lambda *_args: ("ok", dict(strong_guard)))
+    monkeypatch.setattr(breakout_module, "_structure_target", lambda *args, **kwargs: 103.0)
+
+    # ~0.38 ATR wick penetration: production v6.13 would cancel at the fixed 0.30 gate.
+    moderate = list(precursor.timeframes["5m"])
+    moderate.append(Candle(260 * 300_000, 100.78, 100.86, 100.15, 100.64, 150.0))
+    moderate_snapshot = SimpleNamespace(
+        symbol="BR", timeframe="5m", candles=moderate,
+        timeframes={"5m": moderate, "15m": precursor.timeframes["15m"], "1h": precursor.timeframes["1h"]},
+        bid=100.60, ask=100.62, last=100.61,
+    )
+    status, armed, trace = engine.advance_watch(watch, moderate_snapshot)
+    assert status == "armed"
+    assert armed is not None
+    assert armed.metadata["retest_penetration_mode"] == "strong_trend_adaptive"
+    assert armed.metadata["max_penetration_atr"] == 0.50
+    assert 0.30 < (watch.metadata["structural_level"] - armed.metadata["retest_extreme"]) / armed.metadata["atr_value"] < 0.50
+
+    # ~0.59 ATR still exceeds the adaptive ceiling and remains terminal.
+    very_deep = list(precursor.timeframes["5m"])
+    very_deep.append(Candle(260 * 300_000, 100.78, 100.86, 99.90, 100.64, 150.0))
+    very_deep_snapshot = SimpleNamespace(
+        symbol="BR", timeframe="5m", candles=very_deep,
+        timeframes={"5m": very_deep, "15m": precursor.timeframes["15m"], "1h": precursor.timeframes["1h"]},
+        bid=100.60, ask=100.62, last=100.61,
+    )
+    status, armed, trace = engine.advance_watch(watch, very_deep_snapshot)
+    assert status == "cancelled"
+    assert armed is None
+    assert trace["reason"] == "retest_too_deep"
+    assert trace["max_penetration_atr"] == 0.50
+    assert trace["penetration_atr"] > 0.50
+
+
+def test_v614_terminal_watch_tombstone_blocks_same_breakout_from_respawning():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    snapshot = _breakout_precursor_snapshot()
+
+    watch = engine.discover_watch(regime, snapshot, "BR", "5m", meta)
+    assert watch is not None
+    engine.consume_watch(watch, "retest_too_deep")
+
+    repeated = engine.discover_watch(regime, snapshot, "BR", "5m", meta)
+    assert repeated is None
+    assert engine.watch_trace["breakout"]["reason"] == "watch_consumed_waiting_new_structure"
+    assert engine.watch_trace["breakout"]["watch_id"] == watch.watch_id
+    record = engine.consumed_watch_record(watch.watch_id)
+    assert record is not None
+    assert record[1] == "retest_too_deep"

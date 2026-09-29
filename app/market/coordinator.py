@@ -120,14 +120,18 @@ class MarketCoordinator:
         Keeping the 5m depth identical prevents EMA200/trend-bias drift caused only
         by re-seeding EMA calculations from a shorter history during ARMED polling.
         """
-        quote_result, micro_result, trend_result = await asyncio.gather(
-            self.quote(symbol), self.client.klines(symbol, '1m', 61),
+        # Build the slower candle context first, then fetch the executable
+        # bid/ask last. CoinW kline endpoints can occasionally take several
+        # seconds; fetching depth in the same gather can make an otherwise
+        # valid quote older than the execution freshness guard by the time
+        # ARMED reaches RISK_APPROVED. Full discovery snapshots already fetch
+        # quotes after candles for this exact reason; keep ARMED consistent.
+        micro_result, trend_result = await asyncio.gather(
+            self.client.klines(symbol, '1m', 61),
             self._armed_trend_candles(symbol),
             return_exceptions=True,
         )
-        if isinstance(quote_result, Exception):
-            raise quote_result
-        quote = quote_result
+        quote = await self.quote(symbol)
         frames = {}
         if isinstance(micro_result, Exception):
             if self.audit:

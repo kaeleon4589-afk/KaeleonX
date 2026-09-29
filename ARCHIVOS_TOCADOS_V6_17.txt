@@ -1,0 +1,10 @@
+KAELEON v6.17 — archivos modificados respecto a v6.16
+
+MODIFICADOS:
+app/orchestrator.py
+app/trading/rejection_funnel.py
+
+NUEVOS:
+tests/test_execution_funnel_observability.py
+AUDITORIA_MOTOR_V6_17.md
+ARCHIVOS_TOCADOS_V6_17.txt

@@ -1,10 +1,8 @@
 MODIFICADOS
 ARCHIVOS_TOCADOS.txt
 KAELEON_V6_STRATEGY_ENGINE.md
-app/market/coordinator.py
 app/strategy/armed_entry.py
 tests/test_armed_entry_v6.py
-tests/test_armed_priority_monitor.py
 
 NUEVOS
 ninguno

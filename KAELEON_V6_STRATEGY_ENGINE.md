@@ -394,3 +394,34 @@ breakout/retest geometry, or allow Liquidity Sweep against trend. It fixes lifec
 state handling and directional staleness.
 
 Validation: `236 passed` and `python -m compileall -q app scripts` OK.
+
+## v6.10 — Adaptive strong-trend retest pullback floor
+
+Production telemetry after v6.9 confirmed that stateful watch progression and live
+trend revalidation were working, but the dominant `WATCHING -> ARMED` bottleneck
+moved to the fixed breakout-retest pullback floor. Several otherwise aligned watches
+repeated `retest_pullback_insufficient` around `0.089-0.101 ATR` against a hard
+`0.12 ATR` minimum, then later either penetrated too deeply or became too extended.
+
+v6.10 keeps `0.12 ATR` as the standard requirement and introduces one narrow adaptive
+path. A fresh retest may use a `0.085 ATR` minimum only when all of these conditions
+are simultaneously true:
+
+- current closed-5m trend context is available and still agrees with the watch;
+- the retest is within the first 3 closed 5m bars after the breakout;
+- current 5m ADX is at least `20`;
+- EMA stack alignment is at least `0.75`;
+- directional EMA alignment edge is at least `+0.50` for LONG or at most `-0.50`
+  for SHORT.
+
+If any of those conditions is missing, the original `0.12 ATR` minimum remains in
+force. This change does not modify maximum retest penetration, close invalidation,
+maximum close distance, HTF exhaustion, MTF bias conflict, structural stop geometry,
+minimum RR, arm quality, anti-chase, or post-arm 1m confirmation.
+
+Lifecycle telemetry now records `retest_pullback_mode`, `required_pullback_atr`, the
+actual `retest_pullback_atr`, and whether the adaptive rule was eligible. This makes
+future production validation explicit instead of inferring the threshold from a
+terminal rejection.
+
+Validation: `238 passed` and `python3 -m compileall -q app scripts` OK.

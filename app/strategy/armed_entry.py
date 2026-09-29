@@ -1686,8 +1686,16 @@ class ArmedEntryEngine:
                 return "cancelled", None, {"reason": reason, **diag}
             return "pending", None, {"reason": reason, **diag}
         executable = float(diag["price"])
-        target = float(setup.target_price)
         stop = float(setup.stop_price)
+        # Rebuild the executable TP from the original structural objective using
+        # the *actual* entry quote. The setup target was calculated at arm time;
+        # reusing that stale capped TP after price moves toward it artificially
+        # collapses RR and can discard otherwise valid confirmed setups.
+        structural_target = float(setup.metadata.get("structural_target_price") or setup.target_price)
+        target_ratio = float(setup.metadata.get("target_front_run_ratio") or 1.0)
+        target, target_ratio = front_run_target(
+            executable, structural_target, setup.direction, target_ratio
+        )
         target_rr_cap = (
             liquidity_sweep_target_rr()
             if setup.strategy == Strategy.LIQUIDITY_SWEEP
@@ -1703,13 +1711,27 @@ class ArmedEntryEngine:
         )
         if not geometry:
             self._consume(setup, "trigger_invalid_geometry", now_ms)
-            return "cancelled", None, {"reason": "trigger_invalid_geometry", **diag}
+            return "cancelled", None, {
+                "reason": "trigger_invalid_geometry",
+                "structural_target_price": structural_target,
+                "rebased_target_price": target,
+                **diag,
+            }
         rr = abs(target - executable) / max(abs(executable - stop), 1e-12)
         if rr < ARM_MIN_RR:
-            self._consume(setup, "trigger_rr_too_low", now_ms)
-            return "cancelled", None, {"reason": "trigger_rr_too_low", "execution_rr": rr, **diag}
-        structural_target = float(setup.metadata.get("structural_target_price") or target)
-        target_ratio = float(setup.metadata.get("target_front_run_ratio") or 1.0)
+            # Low RR caused by the current quote is not structural invalidation.
+            # Keep the ARMED setup alive: a small retrace can restore acceptable
+            # RR while the stop, structure and TTL remain valid. Permanent
+            # consumption here was a one-way lifecycle trap.
+            return "pending", None, {
+                "reason": "trigger_rr_temporarily_low",
+                "execution_rr": rr,
+                "min_rr": ARM_MIN_RR,
+                "structural_target_price": structural_target,
+                "rebased_target_price": target,
+                "target_rr_cap": target_rr_cap,
+                **diag,
+            }
         management = _management_metadata(executable, stop, target, structural_target, target_ratio,
                                           float(setup.metadata.get("atr_value") or 0.0))
         metadata = {

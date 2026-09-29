@@ -993,3 +993,95 @@ def test_v69_trigger_cancels_new_setup_if_5m_trend_flips_before_micro_confirmati
     assert trace["reason"] == "trend_direction_flipped"
     assert trace["setup_direction"] == "LONG"
     assert trace["current_trend_direction"] == "SHORT"
+
+
+# ---------------------------------------------------------------------------
+# v6.10 adaptive strong-trend retest pullback floor
+# ---------------------------------------------------------------------------
+
+def test_v610_strong_fresh_trend_can_use_adaptive_0085_retest_floor(monkeypatch):
+    from dataclasses import replace
+    from app.strategy import breakout_retest as breakout_module
+
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    precursor = _breakout_precursor_snapshot()
+    watch = engine.discover_watch(regime, precursor, "BR", "5m", meta)
+    assert watch is not None
+
+    # Build a shallow but valid ~0.10 ATR retest. The old fixed 0.12 ATR rule
+    # would remain pending here. Under a fresh, strongly aligned trend it may arm.
+    metadata = dict(watch.metadata)
+    metadata["structural_level"] = 100.72
+    watch = replace(watch, metadata=metadata)
+    c5 = list(precursor.timeframes["5m"])
+    c5.append(Candle(260 * 300_000, 100.90, 101.12, 100.835, 101.105, 150.0))
+    snapshot = SimpleNamespace(
+        symbol="BR", timeframe="5m", candles=c5,
+        timeframes={"5m": c5, "15m": precursor.timeframes["15m"], "1h": precursor.timeframes["1h"]},
+        bid=101.09, ask=101.11, last=101.10,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_watch_trend_guard",
+        lambda _watch, _snapshot: (
+            "ok",
+            {
+                "watch_direction": "LONG",
+                "current_trend_direction": "LONG",
+                "trend_context_status": "ok",
+                "trend_context_bars": 261,
+                "current_trend_bias": "long",
+                "current_ema_alignment": 1.0,
+                "current_ema_alignment_edge": 1.0,
+                "current_adx": 28.0,
+            },
+        ),
+    )
+    monkeypatch.setattr(breakout_module, "_structure_target", lambda *args, **kwargs: 102.0)
+
+    status, armed, trace = engine.advance_watch(watch, snapshot)
+
+    assert status == "armed"
+    assert armed is not None
+    assert 0.085 <= armed.metadata["retest_pullback_atr"] < 0.12
+    assert armed.metadata["required_pullback_atr"] == 0.085
+    assert armed.metadata["retest_pullback_mode"] == "strong_trend_adaptive"
+    assert armed.metadata["retest_pullback_adaptive_eligible"] is True
+    assert trace["reason"] == "retest_complete"
+
+
+def test_v610_weak_or_stale_context_keeps_standard_012_retest_floor():
+    from app.strategy.armed_entry import _adaptive_retest_pullback_requirement
+
+    weak_required, weak_diag = _adaptive_retest_pullback_requirement(
+        Direction.SHORT,
+        2,
+        {
+            "trend_context_status": "ok",
+            "current_adx": 18.0,
+            "current_ema_alignment": 0.75,
+            "current_ema_alignment_edge": -0.50,
+        },
+    )
+    stale_required, stale_diag = _adaptive_retest_pullback_requirement(
+        Direction.SHORT,
+        4,
+        {
+            "trend_context_status": "ok",
+            "current_adx": 35.0,
+            "current_ema_alignment": 1.0,
+            "current_ema_alignment_edge": -1.0,
+        },
+    )
+
+    assert weak_required == 0.12
+    assert weak_diag["retest_pullback_mode"] == "standard"
+    assert weak_diag["retest_pullback_adaptive_eligible"] is False
+    assert stale_required == 0.12
+    assert stale_diag["retest_pullback_mode"] == "standard"
+    assert stale_diag["retest_pullback_adaptive_eligible"] is False

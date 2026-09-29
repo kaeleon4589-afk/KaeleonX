@@ -660,7 +660,7 @@ def test_v66_breakout_precursor_enters_watching_before_retest_and_then_arms():
     assert armed.metadata["lifecycle_id"] == watch.watch_id
     assert armed.metadata["origin_watch_id"] == watch.watch_id
     assert trace["lifecycle_id"] == watch.watch_id
-    assert trace["reason"] == "setup_armable"
+    assert trace["reason"] == "retest_complete"
 
 
 def test_v66_breakout_uses_regime_trend_as_direction_authority_when_mtf_bias_is_none():
@@ -872,3 +872,124 @@ def test_v68_adaptive_postarm_confirmation_keeps_quality_and_orderbook_guards():
         assert trace["postarm_adaptive_candidate"] is True
         assert trace["postarm_adaptive_book_valid"] is book_valid
         assert trace["postarm_adaptive_setup_quality_ok"] is (quality >= 72.0)
+
+
+# ---------------------------------------------------------------------------
+# v6.9 stateful WATCHING + live trend revalidation
+# ---------------------------------------------------------------------------
+
+def _bearish_5m_snapshot(symbol="FLIP"):
+    candles = []
+    for i in range(260):
+        base = 110.0 - i * 0.035
+        candles.append(Candle(i * 300_000, base + 0.02, base + 0.08, base - 0.08, base, 100.0))
+    return SimpleNamespace(
+        symbol=symbol, timeframe="5m", candles=candles,
+        timeframes={"5m": candles}, bid=candles[-1].close - 0.01,
+        ask=candles[-1].close + 0.01, last=candles[-1].close,
+    )
+
+
+def test_v69_breakout_watch_reports_specific_waiting_retest_touch_state():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    precursor = _breakout_precursor_snapshot()
+    watch = engine.discover_watch(regime, precursor, "BR", "5m", meta)
+    assert watch is not None
+
+    status, armed, trace = engine.advance_watch(watch, precursor)
+
+    assert status == "pending"
+    assert armed is None
+    assert trace["reason"] == "waiting_retest_touch"
+    assert trace["watch_id"] == watch.watch_id
+    assert trace["current_trend_direction"] == "LONG"
+
+
+def test_v69_liquidity_watch_cancels_immediately_when_current_trend_flips():
+    from app.models.trading import SetupWatch
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    bearish = _bearish_5m_snapshot("FLIP")
+    anchor_ts = int(bearish.candles[-1].timestamp)
+    now = int(time.time() * 1000)
+    watch = SetupWatch(
+        watch_id=f"FLIP:LSW:{anchor_ts}:LONG",
+        symbol="FLIP", strategy=Strategy.LIQUIDITY_SWEEP, direction=Direction.LONG,
+        created_at_ms=now, expires_at_ms=now + 600_000, timeframe="5m",
+        reasons=("trend_aligned_liquidity_pool_near", "waiting_sweep_reclaim"),
+        metadata={
+            "lifecycle_id": f"FLIP:LSW:{anchor_ts}:LONG",
+            "watch_candle_ts": anchor_ts,
+            "liquidity_level": float(bearish.candles[-1].low),
+            "risk_multiplier": 1.0,
+        },
+    )
+
+    status, armed, trace = engine.advance_watch(watch, bearish)
+
+    assert status == "cancelled"
+    assert armed is None
+    assert trace["reason"] == "watch_direction_flipped"
+    assert trace["watch_direction"] == "LONG"
+    assert trace["current_trend_direction"] == "SHORT"
+
+
+def test_v69_stateful_breakout_promotes_original_watch_not_a_rediscovered_breakout():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    precursor = _breakout_precursor_snapshot()
+    watch = engine.discover_watch(regime, precursor, "BR", "5m", meta)
+    assert watch is not None
+    original_ts = watch.metadata["breakout_candle_ts"]
+    original_level = watch.metadata["structural_level"]
+
+    status, armed, trace = engine.advance_watch(watch, _breakout_retest_snapshot())
+
+    assert status == "armed"
+    assert armed is not None
+    assert armed.metadata["strategy_model"] == "stateful_breakout_retest_watch_v2"
+    assert armed.metadata["breakout_candle_ts"] == original_ts
+    assert armed.metadata["structural_level"] == original_level
+    assert armed.metadata["origin_watch_id"] == watch.watch_id
+    assert trace["reason"] == "retest_complete"
+
+
+def test_v69_trigger_cancels_new_setup_if_5m_trend_flips_before_micro_confirmation():
+    setup = _fast_confirm_setup(Direction.LONG)
+    setup = setup.__class__(**{
+        **setup.__dict__,
+        "metadata": {
+            **setup.metadata,
+            "trend_revalidation_required": True,
+            "trend_direction_at_arm": "LONG",
+            "trend_revalidation_guard_version": 2,
+        },
+    })
+    bearish = _bearish_5m_snapshot("FAST")
+    micro = _recent_prearm_micro(setup, age_ms=8_000, strong=True)
+    snap = SimpleNamespace(
+        symbol="FAST", ask=100.02, bid=100.01, last=100.015,
+        candles=bearish.candles,
+        timeframes={"5m": bearish.candles, "1m": micro},
+        quote_received_ms=setup.armed_at_ms + 2_000,
+        orderbook_valid=True,
+        bids=[(100.01, 5.0), (100.00, 4.0)],
+        asks=[(100.02, 5.0), (100.03, 4.0)],
+    )
+    engine = ArmedEntryEngine(ttl_seconds=600)
+
+    status, intent, trace = engine.trigger(setup, snap, "decision-v69-flip")
+
+    assert status == "cancelled"
+    assert intent is None
+    assert trace["reason"] == "trend_direction_flipped"
+    assert trace["setup_direction"] == "LONG"
+    assert trace["current_trend_direction"] == "SHORT"

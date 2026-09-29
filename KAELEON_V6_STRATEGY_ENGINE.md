@@ -351,3 +351,46 @@ invalidation, target RR caps, structural stop, trend alignment and all discovery
 filters are unchanged. Adaptive confirmations are logged as
 `confirmation_mode=postarm_closed_1m_strong_shape` and the resulting intent includes
 `micro_confirmation_1m_adaptive` so the behavior is fully auditable.
+
+## v6.9 — Stateful WATCHING + live trend revalidation
+
+Production lifecycle logs after v6.8 showed that the remaining bottleneck had moved
+back to `WATCHING -> ARMED`: precursors were being created and monitored, but the
+watch monitor was re-running the generic discovery functions instead of advancing
+the exact structure that originally created each lifecycle. Breakout watches therefore
+repeated `no_fresh_breakout_retest_arm` until `breakout_retest_window_expired`.
+The same logs also exposed a stale Liquidity Sweep watch whose saved LONG direction
+continued to be monitored after the current 5m trend had turned SHORT.
+
+v6.9 changes WATCHING into a genuinely stateful lifecycle:
+
+- BREAKOUT_RETEST stores and follows the original `breakout_candle_ts` and
+  `structural_level`. `advance_watch()` no longer rediscovers a new breakout.
+- Only candles after that original breakout are evaluated for the retest. Progress is
+  explicit: `waiting_retest_touch`, `retest_pullback_insufficient`,
+  `retest_close_invalidated`, `retest_too_deep`, `retest_too_extended`,
+  `retest_stop_too_tight`, `retest_stop_too_wide`, `retest_rr_too_low`,
+  `retest_quality_below_arm_threshold`, or `retest_complete`.
+- LIQUIDITY_SWEEP keeps the original watched `liquidity_level` and follows that exact
+  pool through sweep/reclaim instead of recomputing a different rolling pool on each
+  monitor pass. Its progress now distinguishes waiting for the sweep, wick/volume
+  insufficiency, reclaim, RR/stop/quality failures and failed reclaim.
+- Every WATCHING poll revalidates the current closed-5m trend. A neutral trend ends a
+  directional watch with `watch_direction_lost`; an opposite trend ends it with
+  `watch_direction_flipped`. The direction stored when the watch was created is no
+  longer treated as current market truth.
+- Every new ARMED setup carries `trend_revalidation_required=true`. Before 1m
+  confirmation can produce `TRIGGERED`, the current closed-5m trend must still agree
+  with the setup direction. Missing 5m context waits with `trend_context_unavailable`;
+  neutral/opposite context cancels with `trend_direction_lost` or
+  `trend_direction_flipped`.
+- The high-frequency ARMED market monitor still fetches quote/orderbook and closed 1m
+  on every poll, but now also supplies 5m trend context from a per-symbol 15-second
+  cache. This adds the required pre-trigger safety without fetching 5m candles every
+  ~2 seconds.
+
+This release does not lower RR, widen anti-chase, remove HTF exhaustion, loosen the
+breakout/retest geometry, or allow Liquidity Sweep against trend. It fixes lifecycle
+state handling and directional staleness.
+
+Validation: `236 passed` and `python -m compileall -q app scripts` OK.

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from app.models.enums import Direction, Strategy
 from app.models.market import Candle
+from app.models.trading import ArmedSetup
 from app.strategy.armed_entry import ArmedEntryEngine
 
 
@@ -1163,3 +1164,128 @@ def test_v611_breakout_watch_discovery_includes_third_bar_of_adaptive_window():
     assert watch.strategy == Strategy.BREAKOUT_RETEST
     assert watch.metadata["breakout_candle_ts"] == 259 * 300_000
     assert engine.watch_trace["breakout"]["breakout_age_bars"] == 3
+
+# ---------------------------------------------------------------------------
+# v6.12 trigger lifecycle recovery: execution-time target rebasing
+# ---------------------------------------------------------------------------
+
+def _v612_trigger_setup(*, structural_target=102.50):
+    now = 1_800_000_000_000
+    return ArmedSetup(
+        setup_id="RECOVER:BR:1:LONG",
+        symbol="RECOVER",
+        strategy=Strategy.BREAKOUT_RETEST,
+        direction=Direction.LONG,
+        armed_at_ms=now - 5_000,
+        expires_at_ms=now + 300_000,
+        trigger_price=100.0,
+        invalidation_price=99.0,
+        stop_price=99.0,
+        target_price=101.50,  # arm-time capped target; intentionally stale later
+        entry_zone_low=100.0,
+        entry_zone_high=100.8,
+        quality=90.0,
+        risk_multiplier=1.0,
+        timeframe="5m",
+        metadata={
+            "atr_value": 1.0,
+            "structural_target_price": structural_target,
+            "target_front_run_ratio": 0.95,
+        },
+    )
+
+
+def test_v612_trigger_rebases_target_from_structure_before_rr_check(monkeypatch):
+    from app.strategy import armed_entry as armed_module
+
+    setup = _v612_trigger_setup(structural_target=102.50)
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    monkeypatch.setattr(armed_module, "_now_ms", lambda: 1_800_000_000_000)
+    monkeypatch.setattr(
+        armed_module,
+        "_micro_confirmation",
+        lambda *args, **kwargs: (True, "triggered", {"price": 100.30, "confirmation_mode": "postarm_closed_1m"}),
+    )
+    snap = SimpleNamespace(timeframes={})
+
+    status, intent, trace = engine.trigger(setup, snap, "decision-v612-rebase")
+
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["execution_rr"] >= 1.10
+    assert intent.target_price > setup.target_price
+    assert intent.metadata["structural_target_price"] == 102.50
+    assert intent.metadata["target_rr_capped_at_trigger"] is True
+
+
+def test_v612_temporarily_low_trigger_rr_stays_pending_and_can_recover(monkeypatch):
+    from app.strategy import armed_entry as armed_module
+
+    setup = _v612_trigger_setup(structural_target=101.30)
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    monkeypatch.setattr(armed_module, "_now_ms", lambda: 1_800_000_000_000)
+    price = {"value": 100.40}
+    monkeypatch.setattr(
+        armed_module,
+        "_micro_confirmation",
+        lambda *args, **kwargs: (True, "triggered", {"price": price["value"], "confirmation_mode": "postarm_closed_1m"}),
+    )
+    snap = SimpleNamespace(timeframes={})
+
+    status, intent, trace = engine.trigger(setup, snap, "decision-v612-low-rr")
+    assert status == "pending"
+    assert intent is None
+    assert trace["reason"] == "trigger_rr_temporarily_low"
+    assert trace["execution_rr"] < 1.10
+    assert engine._is_consumed(setup.setup_id)[0] is False
+
+    # A later quote back near the trigger restores RR without rediscovering the
+    # whole market structure or waiting for the consumed-set TTL.
+    price["value"] = 100.05
+    status, intent, trace = engine.trigger(setup, snap, "decision-v612-recovered")
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["execution_rr"] >= 1.10
+
+
+def test_v612_trigger_target_rebase_is_directionally_symmetric_for_short(monkeypatch):
+    from app.strategy import armed_entry as armed_module
+
+    now = 1_800_000_000_000
+    setup = ArmedSetup(
+        setup_id="RECOVER:BR:2:SHORT",
+        symbol="RECOVER",
+        strategy=Strategy.BREAKOUT_RETEST,
+        direction=Direction.SHORT,
+        armed_at_ms=now - 5_000,
+        expires_at_ms=now + 300_000,
+        trigger_price=100.0,
+        invalidation_price=101.0,
+        stop_price=101.0,
+        target_price=98.50,
+        entry_zone_low=99.2,
+        entry_zone_high=100.0,
+        quality=90.0,
+        risk_multiplier=1.0,
+        timeframe="5m",
+        metadata={
+            "atr_value": 1.0,
+            "structural_target_price": 97.50,
+            "target_front_run_ratio": 0.95,
+        },
+    )
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    monkeypatch.setattr(armed_module, "_now_ms", lambda: now)
+    monkeypatch.setattr(
+        armed_module,
+        "_micro_confirmation",
+        lambda *args, **kwargs: (True, "triggered", {"price": 99.70, "confirmation_mode": "postarm_closed_1m"}),
+    )
+
+    status, intent, trace = engine.trigger(setup, SimpleNamespace(timeframes={}), "decision-v612-short")
+
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["execution_rr"] >= 1.10
+    assert intent.target_price < setup.target_price
+    assert intent.metadata["structural_target_price"] == 97.50

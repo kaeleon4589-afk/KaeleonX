@@ -44,6 +44,8 @@ class RejectionFunnel:
             "risk_approved": self.stages.get("risk_approved", 0),
             "submitted": self.stages.get("submitted", 0),
             "filled": self.stages.get("filled", 0),
+            "execution_rejected": self.stages.get("execution_rejected", 0),
+            "execution_error": self.stages.get("execution_error", 0),
             "armed_rate": round(self.stages.get("armed", 0) / analyzed, 4),
             "trigger_rate": round(self.stages.get("triggered", 0) / analyzed, 4),
             "fill_rate": round(self.stages.get("filled", 0) / analyzed, 4),
@@ -52,6 +54,11 @@ class RejectionFunnel:
                 {"reason": key, "count": count}
                 for key, count in self.reasons.most_common(12)
             ],
+            "top_execution_blockers": [
+                {"reason": key, "count": count}
+                for key, count in self.reasons.most_common()
+                if key.startswith("execution_rejected:") or key.startswith("execution_error:")
+            ][:12],
         }
 
     def mark_emitted(self) -> None:

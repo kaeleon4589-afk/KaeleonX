@@ -342,6 +342,29 @@ class UserTradingRuntimeManager:
                     user_id=user_id, mode=mode, symbol=watch_row.get("symbol"), error=str(exc),
                 )
 
+        # v6.14: terminal watch ids are durable tombstones too. Without this, the
+        # same breakout candle can be rediscovered after a terminal cancellation
+        # (or after a worker restart) and repeatedly consume scanner/monitor cycles.
+        terminal_watches = await asyncio.to_thread(
+            self.db.find_many, "setup_watches",
+            {"user_id": user_id, "mode": mode, "active": False}, limit=0,
+        )
+        restore_consumed_watch = getattr(orchestrator.router, "restore_consumed_watch", None)
+        if callable(restore_consumed_watch):
+            for watch_row in terminal_watches:
+                raw = watch_row.get("watch") if isinstance(watch_row.get("watch"), dict) else watch_row
+                try:
+                    until_ms = int(watch_row.get("expires_at_ms") or raw.get("expires_at_ms") or 0)
+                    if until_ms <= now_ms:
+                        continue
+                    restore_consumed_watch(
+                        str(watch_row.get("watch_id") or raw.get("watch_id") or ""),
+                        until_ms,
+                        str(watch_row.get("terminal_reason") or "restored_terminal_watch"),
+                    )
+                except (TypeError, ValueError):
+                    continue
+
         consumed_rows = await asyncio.to_thread(
             self.db.find_many, "armed_consumed_setups", {"user_id": user_id, "mode": mode}, limit=0,
         )

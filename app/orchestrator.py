@@ -1575,6 +1575,7 @@ class TradingOrchestrator:
                     or market_bid <= 0 or market_ask <= 0 or market_bid > market_ask
                     or int(time.time() * 1000) - quote_ms > 10_000):
                 self.last_rejection = 'market_unavailable'
+                self._funnel("execution_rejected", "market_unavailable", user_id=user_id, symbol=snapshot.symbol)
                 result = {"accepted": False, "filled": False, "reason": "market_unavailable"}
                 terminal_event_emitted = True
                 self.last_decision[key] = now
@@ -1608,6 +1609,7 @@ class TradingOrchestrator:
                     or (intent.direction == Direction.SHORT and target < executable_price < stop)):
                 terminal_event_emitted = True
                 self.last_rejection = 'fill_outside_trade_geometry'
+                self._funnel("execution_rejected", "fill_outside_trade_geometry", user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event('EXECUTION_REJECTED', decision_id, user_id=user_id,
                                  mode=self.execution_mode, symbol=snapshot.symbol,
                                  lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
@@ -1626,6 +1628,7 @@ class TradingOrchestrator:
                     self.db.find_one, 'positions', {'user_id': user_id, 'status': 'OPEN'})):
                 self.last_rejection = 'open_position_exists'
                 terminal_event_emitted = True
+                self._funnel("execution_rejected", "open_position_exists", user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event(
                     'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
                     symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
@@ -1642,6 +1645,7 @@ class TradingOrchestrator:
                     self.db.find_one, 'execution_pending', {'user_id': user_id, 'active': True})):
                 self.last_rejection = 'execution_pending'
                 terminal_event_emitted = True
+                self._funnel("execution_rejected", "execution_pending", user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event(
                     'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
                     symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
@@ -1672,6 +1676,7 @@ class TradingOrchestrator:
                 if claim['decision_id'] != decision_id:
                     terminal_event_emitted = True
                     self.last_rejection = 'setup_already_executed'
+                    self._funnel("execution_rejected", "setup_already_executed", user_id=user_id, symbol=snapshot.symbol)
                     self.audit.event('EXECUTION_REJECTED', decision_id, user_id=user_id,
                                      mode=self.execution_mode, symbol=snapshot.symbol,
                                      lifecycle_id=lifecycle_ctx.get("lifecycle_id"), watch_id=lifecycle_ctx.get("watch_id"),
@@ -1717,6 +1722,7 @@ class TradingOrchestrator:
             except Exception as exc:
                 terminal_event_emitted = True
                 self.last_decision[key] = now
+                self._funnel("execution_error", "execution_submit_error", user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1826,6 +1832,7 @@ class TradingOrchestrator:
             if result.get("filled") and not result.get("position"):
                 terminal_event_emitted = True
                 self.last_decision[key] = now
+                self._funnel("execution_error", "filled_result_missing_position", user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1925,6 +1932,7 @@ class TradingOrchestrator:
         except asyncio.CancelledError:
             if accepted_signal and not terminal_event_emitted:
                 terminal_event_emitted = True
+                self._funnel("execution_error", "pipeline_cancelled_after_signal_accept", user_id=user_id, symbol=getattr(snapshot, "symbol", None))
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=getattr(snapshot, "symbol", None),
@@ -1940,6 +1948,12 @@ class TradingOrchestrator:
         except Exception as exc:
             if accepted_signal and not terminal_event_emitted:
                 terminal_event_emitted = True
+                execution_error_reason = (
+                    "trading_worker_lease_expired"
+                    if str(exc) == "trading_worker_lease_expired"
+                    else f"orchestrator_unhandled:{type(exc).__name__}"
+                )
+                self._funnel("execution_error", execution_error_reason, user_id=user_id, symbol=getattr(snapshot, "symbol", None))
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=getattr(snapshot, "symbol", None),
@@ -1961,6 +1975,7 @@ class TradingOrchestrator:
             return {"accepted": bool(accepted_signal), "filled": False, "reason": "pipeline_error"}
         finally:
             if accepted_signal and not terminal_event_emitted:
+                self._funnel("execution_error", "accepted_signal_without_terminal_event", user_id=user_id, symbol=getattr(snapshot, "symbol", None))
                 self.audit.event(
                     "PIPELINE_ERROR", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=getattr(snapshot, "symbol", None),

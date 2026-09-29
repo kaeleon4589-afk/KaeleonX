@@ -1,0 +1,9 @@
+MODIFICADOS respecto a v6.17:
+app/market/coordinator.py
+app/orchestrator.py
+tests/test_armed_priority_monitor.py
+tests/test_execution_funnel_observability.py
+
+NUEVOS:
+AUDITORIA_MOTOR_V6_18.md
+ARCHIVOS_TOCADOS_V6_18.txt

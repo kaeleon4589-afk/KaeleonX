@@ -45,10 +45,14 @@ def test_post_risk_stale_quote_is_visible_in_funnel_before_submit():
     assert payload["submitted"] == 0
     assert payload["execution_rejected"] == 1
     assert _reasons(payload)["execution_rejected:market_unavailable"] == 1
-    assert any(
-        event == "EXECUTION_REJECTED" and data.get("reason") == "market_unavailable"
-        for event, _, data in audit.events
-    )
+    rejected = [
+        data for event, _, data in audit.events
+        if event == "EXECUTION_REJECTED" and data.get("reason") == "market_unavailable"
+    ]
+    assert rejected
+    assert rejected[-1]["quote_age_ms"] >= 20_000
+    assert rejected[-1]["market_bid"] == snap.bid
+    assert rejected[-1]["market_ask"] == snap.ask
 
 
 

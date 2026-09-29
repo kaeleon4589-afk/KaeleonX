@@ -164,6 +164,42 @@ def test_armed_market_monitor_fetches_quote_micro_and_cached_5m_trend_context():
     asyncio.run(run())
 
 
+
+def test_armed_snapshot_fetches_executable_quote_after_slow_context():
+    class SlowContextMarket:
+        def __init__(self):
+            self.events = []
+
+        async def depth(self, symbol):
+            self.events.append("depth")
+            return {"data": {"bids": [[100.0, 5]], "asks": [[100.01, 5]]}}
+
+        async def klines(self, symbol, timeframe, limit):
+            self.events.append(f"{timeframe}_start")
+            await asyncio.sleep(0.03 if timeframe == "1m" else 0.05)
+            now = int(time.time() * 1000)
+            span = 60_000 if timeframe == "1m" else 300_000
+            current = now - (now % span)
+            count = 61 if timeframe == "1m" else limit
+            rows = []
+            for i in range(count):
+                ts = current - (count - i) * span
+                close = 100.0 + i * (0.0002 if timeframe == "5m" else 0.0)
+                rows.append([ts, close - 0.01, close + 0.08, close - 0.08, close, 10.0])
+            self.events.append(f"{timeframe}_done")
+            return {"data": rows}
+
+    async def run():
+        market = SlowContextMarket()
+        coordinator = MarketCoordinator(market, "BTC")
+        snap = await coordinator.armed_snapshot("BTC")
+        assert market.events.index("depth") > market.events.index("1m_done")
+        assert market.events.index("depth") > market.events.index("5m_done")
+        assert int(time.time() * 1000) - snap.quote_received_ms < 1_000
+        assert snap.bid == 100.0 and snap.ask == 100.01
+
+    asyncio.run(run())
+
 def test_runtime_restores_active_and_consumed_armed_state_after_restart():
     async def run():
         from app.storage.database import Database

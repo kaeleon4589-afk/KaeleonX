@@ -1085,3 +1085,81 @@ def test_v610_weak_or_stale_context_keeps_standard_012_retest_floor():
     assert stale_required == 0.12
     assert stale_diag["retest_pullback_mode"] == "standard"
     assert stale_diag["retest_pullback_adaptive_eligible"] is False
+
+# ---------------------------------------------------------------------------
+# v6.11 lifecycle-gap fix: direct discovery and watch age use the same rule
+# ---------------------------------------------------------------------------
+
+def test_v611_direct_breakout_discovery_uses_adaptive_pullback_requirement(monkeypatch):
+    import app.strategy.armed_entry as armed_module
+
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    snapshot = _breakout_retest_snapshot()
+
+    # The fixture has a valid direct breakout/retest with ~0.44 ATR pullback.
+    # A deliberately higher dynamic requirement must now block it. Before v6.11
+    # this path ignored the adaptive helper and always compared against 0.12.
+    monkeypatch.setattr(
+        armed_module,
+        "_adaptive_retest_pullback_requirement",
+        lambda *_args, **_kwargs: (
+            0.50,
+            {
+                "retest_pullback_mode": "test_dynamic",
+                "required_pullback_atr": 0.50,
+                "retest_pullback_adaptive_eligible": False,
+            },
+        ),
+    )
+    blocked = engine._discover_breakout(regime, snapshot, "BR", "5m", meta)
+    assert blocked is None
+
+    # Lowering only the same dynamic requirement makes the identical setup arm,
+    # proving direct discovery shares the same gate as WATCHING promotion.
+    monkeypatch.setattr(
+        armed_module,
+        "_adaptive_retest_pullback_requirement",
+        lambda *_args, **_kwargs: (
+            0.085,
+            {
+                "retest_pullback_mode": "test_dynamic",
+                "required_pullback_atr": 0.085,
+                "retest_pullback_adaptive_eligible": True,
+            },
+        ),
+    )
+    armed = engine._discover_breakout(regime, snapshot, "BR", "5m", meta)
+    assert armed is not None
+    assert armed.metadata["required_pullback_atr"] == 0.085
+    assert armed.metadata["retest_pullback_mode"] == "test_dynamic"
+    assert armed.metadata["retest_pullback_atr"] >= 0.085
+
+
+def test_v611_breakout_watch_discovery_includes_third_bar_of_adaptive_window():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    base = _breakout_precursor_snapshot()
+    c5 = list(base.timeframes["5m"])
+    for offset in range(3):
+        c5.append(Candle((260 + offset) * 300_000, 100.90, 101.00, 100.80, 100.90, 100.0))
+    snapshot = SimpleNamespace(
+        symbol="BR", timeframe="5m", candles=c5,
+        timeframes={"5m": c5, "15m": base.timeframes["15m"], "1h": base.timeframes["1h"]},
+        bid=100.89, ask=100.91, last=100.90,
+    )
+
+    watch = engine.discover_watch(regime, snapshot, "BR", "5m", meta)
+
+    assert watch is not None
+    assert watch.strategy == Strategy.BREAKOUT_RETEST
+    assert watch.metadata["breakout_candle_ts"] == 259 * 300_000
+    assert engine.watch_trace["breakout"]["breakout_age_bars"] == 3

@@ -62,7 +62,7 @@ def test_v6_can_arm_high_quality_sweep_when_aligned_with_bullish_trend():
     assert setup.direction == Direction.LONG
     assert setup.entry_zone_low <= setup.trigger_price <= setup.entry_zone_high
     assert setup.stop_price < setup.trigger_price < setup.target_price
-    assert setup.metadata["strategy_model"] == "armed_liquidity_sweep_v6"
+    assert setup.metadata["strategy_model"] == "armed_liquidity_sweep_v6_15"
     assert setup.metadata["stop_atr_5m"] < 0.90  # old global floor would have rejected it
 
 
@@ -632,6 +632,22 @@ def _sweep_reclaim_snapshot():
     )
 
 
+def _sweep_continuation_snapshot(*, bearish=False):
+    base = _sweep_reclaim_snapshot()
+    candles = list(base.candles)
+    if bearish:
+        # Reclaim happened, but the next CLOSED 5m bar continues selling.
+        candles.append(Candle(261 * 300_000, 100.22, 100.32, 100.12, 100.18, 190.0))
+    else:
+        # Genuine post-sweep continuation: bullish body, high close location and volume.
+        candles.append(Candle(261 * 300_000, 100.16, 100.55, 100.10, 100.46, 210.0))
+    last = candles[-1].close
+    return SimpleNamespace(
+        symbol="SW", timeframe="5m", candles=candles,
+        timeframes={"5m": candles}, bid=last - 0.01, ask=last + 0.01, last=last,
+    )
+
+
 def test_v66_breakout_precursor_enters_watching_before_retest_and_then_arms():
     engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
     regime = SimpleNamespace(
@@ -694,15 +710,60 @@ def test_v66_liquidity_precursor_watches_then_arms_only_with_trend_aligned_recla
     assert watch.metadata["trend_direction"] == "LONG"
     assert watch.metadata["lifecycle_id"] == watch.watch_id
 
+    # v6.15: the sweep/reclaim candle itself may NOT arm a trade.
     status, armed, trace = engine.advance_watch(watch, _sweep_reclaim_snapshot())
+    assert status == "pending"
+    assert armed is None
+    assert trace["reason"] == "sweep_reclaimed_waiting_5m_continuation"
+
+    # A subsequent CLOSED 5m continuation bar is required before ARMED.
+    status, armed, trace = engine.advance_watch(watch, _sweep_continuation_snapshot())
     assert status == "armed"
     assert armed is not None
     assert armed.strategy == Strategy.LIQUIDITY_SWEEP
     assert armed.direction == Direction.LONG
     assert armed.metadata["trend_aligned"] is True
     assert armed.metadata["trend_direction_at_arm"] == "LONG"
+    assert armed.metadata["sweep_5m_continuation_confirmed"] is True
     assert armed.metadata["lifecycle_id"] == watch.watch_id
     assert armed.metadata["origin_watch_id"] == watch.watch_id
+
+
+def test_v615_liquidity_sweep_rejects_falling_knife_after_reclaim():
+    engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
+    regime = SimpleNamespace(
+        hard_block=False, sweep_allowed=False, breakout_allowed=True,
+        risk_multiplier=1.0, direction=Direction.BULLISH,
+    )
+    meta = {"active": "TREND_CONTINUATION", "features": {"trend_bias": "long"}}
+    watch = engine.discover_watch(regime, _sweep_precursor_snapshot(), "SW", "5m", meta)
+    assert watch is not None
+
+    status, armed, trace = engine.advance_watch(watch, _sweep_continuation_snapshot(bearish=True))
+    assert status == "pending"
+    assert armed is None
+    assert trace["reason"] in {
+        "sweep_continuation_level_not_reclaimed",
+        "sweep_continuation_below_sweep_close",
+        "sweep_continuation_not_directional",
+        "sweep_continuation_close_location_weak",
+    }
+
+
+def test_v615_direct_sweep_discovery_requires_post_sweep_5m_continuation():
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    regime = _sweep_regime()
+    meta = _sweep_meta()
+
+    # Same-candle reclaim must not be immediately armed by the direct path.
+    same_candle = _sweep_reclaim_snapshot()
+    assert engine.discover(regime, same_candle, "SW", "5m", meta) is None
+
+    confirmed = _sweep_continuation_snapshot()
+    setup = engine.discover(regime, confirmed, "SW", "5m", meta)
+    assert setup is not None
+    assert setup.strategy == Strategy.LIQUIDITY_SWEEP
+    assert setup.metadata["sweep_5m_continuation_confirmed"] is True
 
 
 def test_v66_watch_expiry_is_terminal_and_does_not_arm_stale_precursor():
@@ -1403,3 +1464,36 @@ def test_v614_terminal_watch_tombstone_blocks_same_breakout_from_respawning():
     record = engine.consumed_watch_record(watch.watch_id)
     assert record is not None
     assert record[1] == "retest_too_deep"
+
+
+def test_v615_liquidity_sweep_5m_continuation_is_directionally_symmetric_for_short():
+    from app.strategy import liquidity_sweep as sweep
+
+    # Synthetic closed 5m sequence: prior volume is stable, sweep candle is index 28,
+    # and index 29 is the required bearish continuation bar.
+    o = [100.0] * 30
+    h = [100.2] * 30
+    l = [99.8] * 30
+    c = [100.0] * 30
+    v = [100.0] * 30
+    ema20 = [100.0] * 30
+    ema50 = [100.0] * 30
+    o[28], h[28], l[28], c[28], v[28] = 100.1, 100.7, 99.9, 99.95, 220.0
+    o[29], h[29], l[29], c[29], v[29] = 99.95, 100.0, 99.5, 99.62, 200.0
+
+    ok, reason, diag = sweep.continuation_confirmation(
+        "short", sweep_idx=28, trigger_idx=29, o=o, h=h, l=l, c=c, v=v,
+        ema20=ema20, ema50=ema50, atr_value=1.0, level=100.0,
+    )
+    assert ok is True
+    assert reason == "sweep_5m_continuation_confirmed"
+    assert diag["trigger_close"] < diag["trigger_open"]
+
+    # Flip the confirmation candle bullish: SHORT must no longer confirm.
+    o[29], h[29], l[29], c[29] = 99.60, 100.0, 99.5, 99.92
+    ok, reason, _ = sweep.continuation_confirmation(
+        "short", sweep_idx=28, trigger_idx=29, o=o, h=h, l=l, c=c, v=v,
+        ema20=ema20, ema50=ema50, atr_value=1.0, level=100.0,
+    )
+    assert ok is False
+    assert reason in {"sweep_continuation_above_sweep_close", "sweep_continuation_not_directional", "sweep_continuation_close_location_weak"}

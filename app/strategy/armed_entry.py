@@ -56,7 +56,7 @@ FAST_CONFIRM_MIN_RVOL = 0.90
 FAST_CONFIRM_CLOSE_LONG = 0.72
 FAST_CONFIRM_CLOSE_SHORT = 0.28
 CHASE_EDGE_MAX_ATR = 0.02
-WATCH_BREAKOUT_MAX_AGE_BARS = 2
+WATCH_BREAKOUT_MAX_AGE_BARS = 3
 WATCH_SWEEP_PROXIMITY_ATR = 0.45
 
 # v6.10 evidence-driven adaptive breakout-retest depth. Production stateful-watch
@@ -583,6 +583,10 @@ class ArmedEntryEngine:
 
         o, h, l, c, v = tf5["o"], tf5["h"], tf5["l"], tf5["c"], tf5["v"]
         i = len(c) - 1
+        # Compute the live 5m trend diagnostics once per discovery pass. The
+        # adaptive retest rule consumes these diagnostics for every candidate
+        # without recalculating regime features inside the retest loop.
+        _, direct_trend_diag = _snapshot_trend_direction(snapshot)
         best = None
         for retest_count in range(1, BREAKOUT_ARM_MAX_RETEST_BARS + 1):
             breakout_idx = i - retest_count
@@ -641,7 +645,15 @@ class ArmedEntryEngine:
                 entry_zone_low = structural_level - atr5 * BREAKOUT_ENTRY_MAX_EXTENSION_ATR
                 entry_zone_high = trigger
                 direction = Direction.SHORT
-            if not (touch and no_deep and closes_valid and last_near) or pullback < 0.12:
+            # Keep direct discovery consistent with the stateful WATCHING path.
+            # v6.10 originally applied the 0.085 ATR strong-trend allowance only
+            # after a SetupWatch existed, which created a lifecycle gap: a setup
+            # first seen after the watch-discovery window could still be rejected
+            # here by the old hard-coded 0.12 ATR floor.
+            required_pullback, pullback_rule_diag = _adaptive_retest_pullback_requirement(
+                direction, retest_count, direct_trend_diag
+            )
+            if not (touch and no_deep and closes_valid and last_near) or pullback < required_pullback:
                 continue
             stop_atr = abs(trigger - stop) / atr5
             if not ARM_MIN_STOP_ATR <= stop_atr <= ARM_MAX_STOP_ATR:
@@ -690,6 +702,8 @@ class ArmedEntryEngine:
                     "atr_pct": atr_pct,
                     "structural_level": float(structural_level),
                     "retest_extreme": float(extreme),
+                    "retest_pullback_atr": float(pullback),
+                    **pullback_rule_diag,
                     "breakout_rvol": float(rvol),
                     "breakout_age_bars": int(retest_count),
                     "structural_target_price": float(structural_target),

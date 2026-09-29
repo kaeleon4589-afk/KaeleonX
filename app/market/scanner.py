@@ -33,7 +33,7 @@ class CoinWMarketScanner:
     to an empty universe on a transient CoinW error.
     """
 
-    def __init__(self, client, depth=12, blocked=None, cache_seconds=30, audit=None):
+    def __init__(self, client, depth=30, blocked=None, cache_seconds=30, audit=None):
         self.client = client
         self.depth = depth
         self.blocked = set(blocked or DEFAULT_BLOCKED)

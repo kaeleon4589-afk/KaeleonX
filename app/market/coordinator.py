@@ -238,7 +238,7 @@ class MarketCoordinator:
 
 
 class MultiMarketCoordinator:
-    def __init__(self, client, scanner, poll_seconds=2.0, audit=None, max_parallel=3,
+    def __init__(self, client, scanner, poll_seconds=2.0, audit=None, max_parallel=5,
                  heartbeat_seconds=900.0, armed_poll_seconds=None, watching_poll_seconds=15.0):
         self.client = client
         self.scanner = scanner

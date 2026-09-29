@@ -113,16 +113,18 @@ def test_armed_market_monitor_fetches_quote_micro_and_cached_5m_trend_context():
     class Market:
         def __init__(self):
             self.calls = {"1m": 0, "5m": 0}
+            self.limits = {"1m": [], "5m": []}
 
         async def depth(self, symbol):
             return {"data": {"bids": [[100.0, 5]], "asks": [[100.01, 5]]}}
 
         async def klines(self, symbol, timeframe, limit):
             self.calls[timeframe] += 1
+            self.limits[timeframe].append(limit)
             now = int(time.time() * 1000)
             span = 60_000 if timeframe == "1m" else 300_000
             current = now - (now % span)
-            count = 61 if timeframe == "1m" else 261
+            count = 61 if timeframe == "1m" else limit
             rows = []
             for i in range(count):
                 ts = current - (count - i) * span
@@ -136,7 +138,8 @@ def test_armed_market_monitor_fetches_quote_micro_and_cached_5m_trend_context():
         snap = await coordinator.armed_snapshot("BTC")
         assert snap.armed_monitor is True and snap.monitor_only is True
         assert len(snap.timeframes["1m"]) >= 20
-        assert len(snap.timeframes["5m"]) >= 205
+        assert len(snap.timeframes["5m"]) >= 320
+        assert market.limits["5m"] == [321]
         assert snap.candles == snap.timeframes["5m"]
         assert snap.trend_context_valid is True
         assert snap.bid == 100.0 and snap.ask == 100.01
@@ -146,6 +149,7 @@ def test_armed_market_monitor_fetches_quote_micro_and_cached_5m_trend_context():
         await coordinator.armed_snapshot("BTC")
         assert market.calls["1m"] == 2
         assert market.calls["5m"] == 1
+        assert market.limits["5m"] == [321]
 
         received = []
         async def callback(value):

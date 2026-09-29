@@ -31,3 +31,18 @@ def test_scanner_scores_and_blocks_memes():
     import asyncio
     rows=asyncio.run(CoinWMarketScanner(C(),depth=10,cache_seconds=1).ranked())
     assert rows and rows[0]['symbol']=='BTC'; assert all('PEPE' not in r['symbol'] for r in rows)
+
+
+def test_market_universe_expansion_defaults_are_30_and_5():
+    from app.config.settings import Settings
+    from app.market.coordinator import MultiMarketCoordinator
+    import inspect
+
+    settings = Settings(_env_file=None)
+    assert settings.market_scanner_depth == 30
+    assert settings.market_scanner_parallel == 5
+
+    scanner_sig = inspect.signature(CoinWMarketScanner.__init__)
+    coordinator_sig = inspect.signature(MultiMarketCoordinator.__init__)
+    assert scanner_sig.parameters['depth'].default == 30
+    assert coordinator_sig.parameters['max_parallel'].default == 5

@@ -72,6 +72,19 @@ RETEST_PULLBACK_ADAPTIVE_MIN_ADX = 20.0
 RETEST_PULLBACK_ADAPTIVE_MIN_EMA_ALIGNMENT = 0.75
 RETEST_PULLBACK_ADAPTIVE_MIN_EMA_EDGE = 0.50
 
+# v6.14 evidence-driven wick tolerance. Production telemetry after v6.13 showed
+# that the dominant WATCHING -> CANCELLED reason was retest_too_deep at
+# 0.35-0.47 ATR even while 5m trend alignment remained strong. The base 0.30 ATR
+# guard remains unchanged for ordinary contexts. Only a strongly aligned trend may
+# tolerate a wick up to 0.50 ATR, and the much stricter close invalidation, stop, RR,
+# HTF and micro-confirmation gates still apply. A deeper wick remains terminal.
+RETEST_PENETRATION_BASE_ATR = breakout.RETEST_MAX_PENETRATION_ATR
+RETEST_PENETRATION_STRONG_TREND_ATR = 0.50
+RETEST_PENETRATION_ADAPTIVE_MAX_BARS = BREAKOUT_ARM_MAX_RETEST_BARS
+RETEST_PENETRATION_ADAPTIVE_MIN_ADX = 20.0
+RETEST_PENETRATION_ADAPTIVE_MIN_EMA_ALIGNMENT = 0.75
+RETEST_PENETRATION_ADAPTIVE_MIN_EMA_EDGE = 0.50
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -160,6 +173,44 @@ def _adaptive_retest_pullback_requirement(
         "retest_pullback_adaptive_min_adx": RETEST_PULLBACK_ADAPTIVE_MIN_ADX,
         "retest_pullback_adaptive_min_ema_alignment": RETEST_PULLBACK_ADAPTIVE_MIN_EMA_ALIGNMENT,
         "retest_pullback_adaptive_min_ema_edge": RETEST_PULLBACK_ADAPTIVE_MIN_EMA_EDGE,
+    }
+
+
+def _adaptive_retest_penetration_limit(
+    direction: Direction, bars_since_breakout: int, trend_diag: dict
+) -> tuple[float, dict]:
+    """Return the maximum wick penetration allowed for a breakout retest.
+
+    Default remains 0.30 ATR. A strong, directionally aligned closed-5m trend may
+    tolerate a wick up to 0.50 ATR while close invalidation remains unchanged.
+    """
+    status = str(trend_diag.get("trend_context_status") or "")
+    adx_value = float(trend_diag.get("current_adx") or 0.0)
+    ema_alignment = float(trend_diag.get("current_ema_alignment") or 0.0)
+    ema_edge = float(trend_diag.get("current_ema_alignment_edge") or 0.0)
+    directional_edge_ok = (
+        ema_edge >= RETEST_PENETRATION_ADAPTIVE_MIN_EMA_EDGE
+        if direction == Direction.LONG
+        else ema_edge <= -RETEST_PENETRATION_ADAPTIVE_MIN_EMA_EDGE
+    )
+    eligible = (
+        status == "ok"
+        and 0 < int(bars_since_breakout) <= RETEST_PENETRATION_ADAPTIVE_MAX_BARS
+        and adx_value >= RETEST_PENETRATION_ADAPTIVE_MIN_ADX
+        and ema_alignment >= RETEST_PENETRATION_ADAPTIVE_MIN_EMA_ALIGNMENT
+        and directional_edge_ok
+    )
+    allowed = RETEST_PENETRATION_STRONG_TREND_ATR if eligible else RETEST_PENETRATION_BASE_ATR
+    return allowed, {
+        "retest_penetration_mode": "strong_trend_adaptive" if eligible else "standard",
+        "max_penetration_atr": float(allowed),
+        "retest_penetration_base_atr": float(RETEST_PENETRATION_BASE_ATR),
+        "retest_penetration_adaptive_ceiling_atr": RETEST_PENETRATION_STRONG_TREND_ATR,
+        "retest_penetration_adaptive_eligible": bool(eligible),
+        "retest_penetration_adaptive_max_bars": RETEST_PENETRATION_ADAPTIVE_MAX_BARS,
+        "retest_penetration_adaptive_min_adx": RETEST_PENETRATION_ADAPTIVE_MIN_ADX,
+        "retest_penetration_adaptive_min_ema_alignment": RETEST_PENETRATION_ADAPTIVE_MIN_EMA_ALIGNMENT,
+        "retest_penetration_adaptive_min_ema_edge": RETEST_PENETRATION_ADAPTIVE_MIN_EMA_EDGE,
     }
 
 
@@ -461,6 +512,7 @@ class ArmedEntryEngine:
         self.fast_confirm_max_age_seconds = max(0.0, float(fast_confirm_max_age_seconds))
         self.watch_ttl_seconds = max(300.0, float(watch_ttl_seconds))
         self._consumed_setups: dict[str, tuple[int, str]] = {}
+        self._consumed_watches: dict[str, tuple[int, str]] = {}
         self.watch_trace: dict[str, Any] = {}
         self.last_trace: dict[str, Any] = {}
         self.branch_trace: dict[str, dict[str, Any]] = {}
@@ -501,6 +553,43 @@ class ArmedEntryEngine:
         """Return the current consumed TTL/reason for durable persistence."""
         self._prune_consumed()
         return self._consumed_setups.get(str(setup_id))
+
+    def _prune_consumed_watches(self, now_ms: int | None = None) -> None:
+        now_ms = _now_ms() if now_ms is None else int(now_ms)
+        expired = [watch_id for watch_id, (until_ms, _) in self._consumed_watches.items() if until_ms <= now_ms]
+        for watch_id in expired:
+            self._consumed_watches.pop(watch_id, None)
+
+    def _is_watch_consumed(self, watch_id: str, now_ms: int | None = None) -> tuple[bool, str | None]:
+        self._prune_consumed_watches(now_ms)
+        item = self._consumed_watches.get(str(watch_id))
+        return (item is not None, item[1] if item else None)
+
+    def consume_watch(self, watch: SetupWatch, reason: str, now_ms: int | None = None) -> None:
+        """Tombstone a terminal watch so the same structural candle cannot respawn."""
+        now_ms = _now_ms() if now_ms is None else int(now_ms)
+        until_ms = max(
+            int(getattr(watch, "expires_at_ms", 0) or 0),
+            now_ms + int(self.watch_ttl_seconds * 1000),
+        )
+        self._consumed_watches[str(watch.watch_id)] = (until_ms, str(reason))
+        if len(self._consumed_watches) > 4096:
+            oldest = sorted(self._consumed_watches.items(), key=lambda item: item[1][0])[:1024]
+            for watch_id, _ in oldest:
+                self._consumed_watches.pop(watch_id, None)
+
+    def restore_consumed_watch(self, watch_id: str, until_ms: int, reason: str = "restored") -> bool:
+        now_ms = _now_ms()
+        until_ms = int(until_ms or 0)
+        if not watch_id or until_ms <= now_ms:
+            return False
+        self._consumed_watches[str(watch_id)] = (until_ms, str(reason or "restored"))
+        self._prune_consumed_watches(now_ms)
+        return True
+
+    def consumed_watch_record(self, watch_id: str) -> tuple[int, str] | None:
+        self._prune_consumed_watches()
+        return self._consumed_watches.get(str(watch_id))
 
     def _expiry(self, snapshot) -> tuple[int, int]:
         armed_at = _now_ms()
@@ -653,6 +742,13 @@ class ArmedEntryEngine:
             required_pullback, pullback_rule_diag = _adaptive_retest_pullback_requirement(
                 direction, retest_count, direct_trend_diag
             )
+            max_penetration, penetration_rule_diag = _adaptive_retest_penetration_limit(
+                direction, retest_count, direct_trend_diag
+            )
+            if direction == Direction.LONG:
+                no_deep = extreme >= structural_level - atr5 * max_penetration
+            else:
+                no_deep = extreme <= structural_level + atr5 * max_penetration
             if not (touch and no_deep and closes_valid and last_near) or pullback < required_pullback:
                 continue
             stop_atr = abs(trigger - stop) / atr5
@@ -704,6 +800,7 @@ class ArmedEntryEngine:
                     "retest_extreme": float(extreme),
                     "retest_pullback_atr": float(pullback),
                     **pullback_rule_diag,
+                    **penetration_rule_diag,
                     "breakout_rvol": float(rvol),
                     "breakout_age_bars": int(retest_count),
                     "structural_target_price": float(structural_target),
@@ -1056,7 +1153,15 @@ class ArmedEntryEngine:
         if active == "TREND_CONTINUATION" or bool(getattr(regime, "breakout_allowed", False)):
             item = self._discover_breakout_watch(regime, snapshot, symbol, timeframe, regime_metadata)
             if item is not None:
-                return item
+                was_consumed, consumed_reason = self._is_watch_consumed(item.watch_id)
+                if not was_consumed:
+                    return item
+                self.watch_trace["breakout"] = {
+                    "accepted": False,
+                    "reason": "watch_consumed_waiting_new_structure",
+                    "watch_id": item.watch_id,
+                    "consumed_reason": consumed_reason,
+                }
         if active == "RANGE":
             self.watch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
             return None
@@ -1064,7 +1169,17 @@ class ArmedEntryEngine:
             self.watch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
             return None
         if active in {"TREND_CONTINUATION", "VOLATILE_SWEEP"} or bool(getattr(regime, "sweep_allowed", False)):
-            return self._discover_sweep_watch(regime, snapshot, symbol, timeframe, regime_metadata)
+            item = self._discover_sweep_watch(regime, snapshot, symbol, timeframe, regime_metadata)
+            if item is not None:
+                was_consumed, consumed_reason = self._is_watch_consumed(item.watch_id)
+                if not was_consumed:
+                    return item
+                self.watch_trace["sweep"] = {
+                    "accepted": False,
+                    "reason": "watch_consumed_waiting_new_structure",
+                    "watch_id": item.watch_id,
+                    "consumed_reason": consumed_reason,
+                }
         return None
 
     @staticmethod
@@ -1181,6 +1296,9 @@ class ArmedEntryEngine:
         required_pullback, pullback_rule_diag = _adaptive_retest_pullback_requirement(
             watch.direction, bars_since, guard_diag
         )
+        max_penetration, penetration_rule_diag = _adaptive_retest_penetration_limit(
+            watch.direction, bars_since, guard_diag
+        )
 
         if watch.direction == Direction.LONG:
             extreme = min(float(l[j]) for j in retest_indices)
@@ -1194,11 +1312,12 @@ class ArmedEntryEngine:
                     "touch_distance_atr": touch_distance_atr, "bars_since_breakout": bars_since,
                     **guard_diag,
                 }
-            if extreme < structural_level - atr5 * breakout.RETEST_MAX_PENETRATION_ATR:
+            if extreme < structural_level - atr5 * max_penetration:
                 return "cancelled", None, {
                     "reason": "retest_too_deep", "watch_id": watch.watch_id,
                     "structural_level": structural_level, "retest_extreme": extreme,
-                    "penetration_atr": (structural_level - extreme) / atr5, **guard_diag,
+                    "penetration_atr": (structural_level - extreme) / atr5,
+                    **penetration_rule_diag, **guard_diag,
                 }
             invalid_closes = [j for j in retest_indices if float(c[j]) < structural_level - atr5 * breakout.RETEST_CLOSE_INVALIDATION_ATR]
             if invalid_closes:
@@ -1237,11 +1356,12 @@ class ArmedEntryEngine:
                     "touch_distance_atr": touch_distance_atr, "bars_since_breakout": bars_since,
                     **guard_diag,
                 }
-            if extreme > structural_level + atr5 * breakout.RETEST_MAX_PENETRATION_ATR:
+            if extreme > structural_level + atr5 * max_penetration:
                 return "cancelled", None, {
                     "reason": "retest_too_deep", "watch_id": watch.watch_id,
                     "structural_level": structural_level, "retest_extreme": extreme,
-                    "penetration_atr": (extreme - structural_level) / atr5, **guard_diag,
+                    "penetration_atr": (extreme - structural_level) / atr5,
+                    **penetration_rule_diag, **guard_diag,
                 }
             invalid_closes = [j for j in retest_indices if float(c[j]) > structural_level + atr5 * breakout.RETEST_CLOSE_INVALIDATION_ATR]
             if invalid_closes:
@@ -1327,6 +1447,7 @@ class ArmedEntryEngine:
                 "atr_value": atr5, "atr_pct": atr_pct,
                 "structural_level": structural_level, "retest_extreme": float(extreme),
                 "retest_pullback_atr": float(pullback), **pullback_rule_diag,
+                **penetration_rule_diag,
                 "breakout_rvol": breakout_rvol, "breakout_age_bars": int(bars_since),
                 "structural_target_price": float(structural_target),
                 "target_front_run_ratio": float(target_ratio), "target_rr_cap": float(target_rr_cap),
@@ -1344,7 +1465,8 @@ class ArmedEntryEngine:
         return "armed", setup, {
             "reason": "retest_complete", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id,
             "quality": score, "bars_since_breakout": bars_since, "structural_rr_estimate": rr,
-            "retest_pullback_atr": float(pullback), **pullback_rule_diag, **guard_diag,
+            "retest_pullback_atr": float(pullback), **pullback_rule_diag,
+            **penetration_rule_diag, **guard_diag,
         }
 
     def _advance_sweep_watch(self, watch: SetupWatch, snapshot) -> tuple[str, ArmedSetup | None, dict]:

@@ -155,6 +155,15 @@ class StrategyRouter:
         }
         return watch
 
+    def consume_watch(self, watch, reason: str) -> None:
+        self.armed.consume_watch(watch, reason)
+
+    def restore_consumed_watch(self, watch_id: str, until_ms: int, reason: str = "restored") -> bool:
+        return self.armed.restore_consumed_watch(watch_id, until_ms, reason)
+
+    def consumed_watch_record(self, watch_id: str):
+        return self.armed.consumed_watch_record(watch_id)
+
     def advance_watch(self, watch, snapshot):
         status, setup, trace = self.armed.advance_watch(watch, snapshot)
         self.last_trace = {

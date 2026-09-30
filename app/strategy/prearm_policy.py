@@ -18,6 +18,17 @@ class PrearmPolicy:
     breakout_max_extension: float
     sweep_proximity_atr: float
 
+    sweep_min_depth: float = .15
+    sweep_min_wick: float = .32
+    sweep_min_rvol: float = .70
+    sweep_min_score: float = 68.0
+    sweep_arm_on_reclaim: bool = False
+    sweep_continuation_body: float = .24
+    sweep_continuation_close_long: float = .62
+    sweep_continuation_rvol: float = .65
+    sweep_continuation_extension: float = 1.10
+    sweep_entry_extension: float = .90
+
     def mtf_conflict(self, direction: str, bias_1h: str, bias_15m: str) -> bool:
         opposite = "short" if direction == "long" else "long"
         if self.mtf_require_both_opposed:
@@ -26,7 +37,14 @@ class PrearmPolicy:
 
 
 STRICT = PrearmPolicy("strict", False, False, 20, 34, .30, .64, .95, .60, .45)
-RECOVERY = PrearmPolicy("recovery", True, True, 12, 12, .22, .58, .70, .85, .80)
+RECOVERY = PrearmPolicy(
+    "recovery", True, True, 12, 12, .22, .58, .70, .85, .80,
+    sweep_min_depth=.10, sweep_min_wick=.20, sweep_min_rvol=.55,
+    sweep_min_score=60.0, sweep_arm_on_reclaim=True,
+    sweep_continuation_body=.12, sweep_continuation_close_long=.52,
+    sweep_continuation_rvol=.50, sweep_continuation_extension=1.50,
+    sweep_entry_extension=1.50,
+)
 
 
 def prearm_policy() -> PrearmPolicy:

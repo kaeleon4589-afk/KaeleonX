@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.strategy.prearm_policy import STRICT, PrearmPolicy
+
 from app.models.enums import Direction, Strategy
 from app.models.trading import TradeIntent
 from app.position.protection import (
@@ -79,15 +81,15 @@ def _score_candidate(*, sweep_depth_atr: float, sweep_wick_ratio: float, sweep_r
 
 
 def continuation_confirmation(direction: str, *, sweep_idx: int, trigger_idx: int,
-                              o, h, l, c, v, ema20, ema50, atr_value: float, level: float):
-    """Require a CLOSED 5m reclaim/continuation bar after the sweep.
+                              o, h, l, c, v, ema20, ema50, atr_value: float, level: float,
+                              policy: PrearmPolicy = STRICT):
+    """Validate closed 5m structure; recovery may arm on the reclaim itself.
 
-    A liquidity sweep is not a reversal by itself.  The post-sweep bar must prove
-    directional acceptance before the stateful engine may arm a trade.  This
-    helper is shared by the legacy detector and ArmedEntryEngine so both paths
-    enforce the same market structure semantics.
+    The armed engine still requires its separate closed 1m execution gate.
+    Legacy callers retain strict behavior unless a policy is explicitly supplied.
     """
-    if trigger_idx <= sweep_idx:
+    same_bar = trigger_idx == sweep_idx and policy.sweep_arm_on_reclaim
+    if trigger_idx < sweep_idx or (trigger_idx == sweep_idx and not same_bar):
         return False, "sweep_waiting_5m_continuation", {"bars_since_sweep": max(trigger_idx - sweep_idx, 0)}
 
     trigger_rvol = relative_volume(v, trigger_idx, 24)
@@ -105,10 +107,10 @@ def continuation_confirmation(direction: str, *, sweep_idx: int, trigger_idx: in
             (close > opened, "sweep_continuation_not_directional"),
             (close >= float(ema20[trigger_idx]) - atr_value * TRIGGER_EMA20_RECOVER_TOL_ATR, "sweep_continuation_ema20_not_recovered"),
             (close >= float(ema50[trigger_idx]) - atr_value * TRIGGER_EMA50_RECOVER_TOL_ATR, "sweep_continuation_ema50_not_recovered"),
-            (trigger_rvol >= TRIGGER_MIN_RVOL, "sweep_continuation_volume_insufficient"),
-            (trigger_body >= TRIGGER_MIN_BODY_RATIO, "sweep_continuation_body_insufficient"),
-            (trigger_close >= TRIGGER_CLOSE_POS_LONG_MIN, "sweep_continuation_close_location_weak"),
-            (extension <= TRIGGER_EXTENSION_MAX_ATR, "sweep_continuation_too_extended"),
+            (trigger_rvol >= policy.sweep_continuation_rvol, "sweep_continuation_volume_insufficient"),
+            (trigger_body >= policy.sweep_continuation_body, "sweep_continuation_body_insufficient"),
+            (trigger_close >= policy.sweep_continuation_close_long, "sweep_continuation_close_location_weak"),
+            (extension <= policy.sweep_continuation_extension, "sweep_continuation_too_extended"),
         )
     else:
         extension = (float(level) - close) / max(atr_value, 1e-12)
@@ -118,13 +120,27 @@ def continuation_confirmation(direction: str, *, sweep_idx: int, trigger_idx: in
             (close < opened, "sweep_continuation_not_directional"),
             (close <= float(ema20[trigger_idx]) + atr_value * TRIGGER_EMA20_RECOVER_TOL_ATR, "sweep_continuation_ema20_not_recovered"),
             (close <= float(ema50[trigger_idx]) + atr_value * TRIGGER_EMA50_RECOVER_TOL_ATR, "sweep_continuation_ema50_not_recovered"),
-            (trigger_rvol >= TRIGGER_MIN_RVOL, "sweep_continuation_volume_insufficient"),
-            (trigger_body >= TRIGGER_MIN_BODY_RATIO, "sweep_continuation_body_insufficient"),
-            (trigger_close <= TRIGGER_CLOSE_POS_SHORT_MAX, "sweep_continuation_close_location_weak"),
-            (extension <= TRIGGER_EXTENSION_MAX_ATR, "sweep_continuation_too_extended"),
+            (trigger_rvol >= policy.sweep_continuation_rvol, "sweep_continuation_volume_insufficient"),
+            (trigger_body >= policy.sweep_continuation_body, "sweep_continuation_body_insufficient"),
+            (trigger_close <= (1.0 - policy.sweep_continuation_close_long), "sweep_continuation_close_location_weak"),
+            (extension <= policy.sweep_continuation_extension, "sweep_continuation_too_extended"),
         )
 
+    if same_bar:
+        # Wick, depth, volume and reclaim have already been checked by the
+        # caller. Do not require a directional body on that same sweep candle.
+        checks = tuple((passed, reason) for passed, reason in checks if reason not in {
+            "sweep_continuation_not_directional", "sweep_continuation_volume_insufficient",
+            "sweep_continuation_body_insufficient", "sweep_continuation_close_location_weak",
+        })
     diag = {
+        "prearm_profile": policy.name,
+        "confirmation_mode": "closed_5m_reclaim" if same_bar else "closed_5m_continuation",
+        "min_body_ratio": policy.sweep_continuation_body,
+        "min_rvol": policy.sweep_continuation_rvol,
+        "close_long_min": policy.sweep_continuation_close_long,
+        "close_short_max": 1.0 - policy.sweep_continuation_close_long,
+        "max_extension_atr": policy.sweep_continuation_extension,
         "bars_since_sweep": int(trigger_idx - sweep_idx),
         "trigger_rvol": float(trigger_rvol),
         "trigger_body_ratio": float(trigger_body),
@@ -135,10 +151,11 @@ def continuation_confirmation(direction: str, *, sweep_idx: int, trigger_idx: in
         "sweep_close": sweep_close,
         "liquidity_level": float(level),
     }
+    diag["failed_checks"] = [reason for passed, reason in checks if not passed]
     for passed, reason in checks:
         if not passed:
             return False, reason, diag
-    return True, "sweep_5m_continuation_confirmed", diag
+    return True, "sweep_5m_reclaim_confirmed" if same_bar else "sweep_5m_continuation_confirmed", diag
 
 
 def _detect(direction: str, *, o, h, l, c, v, ema20, ema50, atr_value):

@@ -834,6 +834,7 @@ class ArmedEntryEngine:
 
     def _discover_sweep(self, regime, snapshot, symbol: str, timeframe: str,
                         regime_metadata: dict | None) -> ArmedSetup | None:
+        policy = prearm_policy()
         required_direction, trend_reason = self._liquidity_trend_direction(regime, regime_metadata)
         if required_direction is None:
             self.branch_trace["sweep"] = {"accepted": False, "reason": trend_reason}
@@ -880,33 +881,32 @@ class ArmedEntryEngine:
                     recovered = float(c[sweep_idx]) <= float(level) + atr5 * sweep.SWEEP_RECOVER_TOL_ATR and sweep_close <= 0.54
                     direction = Direction.SHORT
                 rvol = relative_volume(v, sweep_idx, 24)
-                if depth < sweep.SWEEP_MIN_DEPTH_ATR or wick < sweep.SWEEP_MIN_WICK_RATIO or rvol < sweep.SWEEP_MIN_RVOL or not recovered:
+                if depth < policy.sweep_min_depth or wick < policy.sweep_min_wick or rvol < policy.sweep_min_rvol or not recovered:
                     continue
                 if sweep_idx < i:
                     if direction == Direction.LONG and min(l[sweep_idx + 1:i + 1]) < extreme - atr5 * sweep.RETEST_INVALIDATION_ATR:
                         continue
                     if direction == Direction.SHORT and max(h[sweep_idx + 1:i + 1]) > extreme + atr5 * sweep.RETEST_INVALIDATION_ATR:
                         continue
-                # A sweep/reclaim is not itself an entry. Require a CLOSED 5m
-                # continuation bar after the sweep so a brief 1m bounce cannot
-                # arm a falling knife. This mirrors liquidity_sweep._detect().
-                if sweep_idx >= i:
+                # Strict waits for another 5m close; recovery arms on closed
+                # reclaim and leaves execution confirmation to the 1m gate.
+                if sweep_idx >= i and not policy.sweep_arm_on_reclaim:
                     continue
                 continuation_ok, continuation_reason, continuation_diag = sweep.continuation_confirmation(
                     direction_name, sweep_idx=sweep_idx, trigger_idx=i, o=o, h=h, l=l, c=c, v=v,
-                    ema20=ema20, ema50=ema50, atr_value=atr5, level=float(level),
+                    ema20=ema20, ema50=ema50, atr_value=atr5, level=float(level), policy=policy,
                 )
                 if not continuation_ok:
                     continue
                 if direction == Direction.LONG:
                     trigger = max(float(level) + atr5 * 0.04, float(c[sweep_idx]) + atr5 * 0.03)
                     stop = extreme - atr5 * sweep.SL_BUFFER_ATR
-                    entry_zone_low, entry_zone_high = trigger, float(level) + atr5 * SWEEP_ENTRY_MAX_EXTENSION_ATR
+                    entry_zone_low, entry_zone_high = trigger, float(level) + atr5 * policy.sweep_entry_extension
                     target_level = max(h[max(0, sweep_idx - sweep.TARGET_LOOKBACK):sweep_idx])
                 else:
                     trigger = min(float(level) - atr5 * 0.04, float(c[sweep_idx]) - atr5 * 0.03)
                     stop = extreme + atr5 * sweep.SL_BUFFER_ATR
-                    entry_zone_low, entry_zone_high = float(level) - atr5 * SWEEP_ENTRY_MAX_EXTENSION_ATR, trigger
+                    entry_zone_low, entry_zone_high = float(level) - atr5 * policy.sweep_entry_extension, trigger
                     target_level = min(l[max(0, sweep_idx - sweep.TARGET_LOOKBACK):sweep_idx])
                 stop_atr = abs(trigger - stop) / atr5
                 if not ARM_MIN_STOP_ATR <= stop_atr <= ARM_MAX_STOP_ATR:
@@ -924,7 +924,7 @@ class ArmedEntryEngine:
                 rr_q = clamp((rr - ARM_MIN_RR) / 1.6, 0, 1)
                 fresh_q = clamp(1.0 - age / 4.0, 0, 1)
                 score = round(58 + 42 * clamp(0.25 * depth_q + 0.20 * wick_q + 0.16 * rv_q + 0.25 * rr_q + 0.14 * fresh_q, 0, 1), 2)
-                if score < SWEEP_ARM_MIN_SCORE:
+                if score < policy.sweep_min_score:
                     continue
                 armed_at, expires_at = self._expiry(snapshot)
                 candidate = ArmedSetup(
@@ -943,7 +943,7 @@ class ArmedEntryEngine:
                     quality=score,
                     risk_multiplier=max(float(getattr(regime, "risk_multiplier", 1.0) or 1.0), 0.65),
                     timeframe=timeframe,
-                    reasons=("liquidity_sweep_5m", "level_recovered", "post_sweep_5m_continuation", "awaiting_micro_confirmation"),
+                    reasons=("liquidity_sweep_5m", "level_recovered", continuation_reason, "awaiting_micro_confirmation"),
                     metadata={
                         "strategy_model": "armed_liquidity_sweep_v6_15",
                         "atr_value": atr5,
@@ -954,7 +954,13 @@ class ArmedEntryEngine:
                         "sweep_wick_ratio": float(wick),
                         "sweep_rvol": float(rvol),
                         "bars_since_sweep": int(age),
-                        "sweep_5m_continuation_confirmed": True,
+                        "prearm_profile": policy.name,
+                        "sweep_arm_min_score": policy.sweep_min_score,
+                        "sweep_min_wick_ratio": policy.sweep_min_wick,
+                        "sweep_min_rvol": policy.sweep_min_rvol,
+                        "sweep_min_depth_atr": policy.sweep_min_depth,
+                        "sweep_5m_continuation_confirmed": age > 0,
+                        "sweep_confirmation_mode": continuation_diag["confirmation_mode"],
                         "sweep_5m_continuation_reason": continuation_reason,
                         "sweep_5m_continuation": continuation_diag,
                         "structural_target_price": float(target_level),
@@ -1495,6 +1501,7 @@ class ArmedEntryEngine:
         }
 
     def _advance_sweep_watch(self, watch: SetupWatch, snapshot) -> tuple[str, ArmedSetup | None, dict]:
+        policy = prearm_policy()
         frames = getattr(snapshot, "timeframes", {}) or {}
         c5 = list(frames.get("5m", getattr(snapshot, "candles", [])) or [])
         ok, _ = candle_quality(c5, sweep.MIN_CANDLES_REQUIRED, sweep.MIN_NONZERO_VOLUME_RATIO)
@@ -1548,7 +1555,7 @@ class ArmedEntryEngine:
                 sweep_close = sweep._close_pos(h[sweep_idx], l[sweep_idx], c[sweep_idx])
                 recovered = float(c[sweep_idx]) <= level + atr5 * sweep.SWEEP_RECOVER_TOL_ATR and sweep_close <= 0.54
             rvol = relative_volume(v, sweep_idx, 24)
-            if depth < sweep.SWEEP_MIN_DEPTH_ATR:
+            if depth < policy.sweep_min_depth:
                 continue
             progress_reason = "sweep_detected_waiting_reclaim"
             progress_diag = {
@@ -1556,11 +1563,15 @@ class ArmedEntryEngine:
                 "sweep_depth_atr": float(depth), "sweep_wick_ratio": float(wick),
                 "sweep_rvol": float(rvol), "sweep_recovered": bool(recovered),
                 "bars_since_watch": bars_since_watch,
+                "prearm_profile": policy.name,
+                "min_wick_ratio": policy.sweep_min_wick,
+                "min_sweep_rvol": policy.sweep_min_rvol,
+                "min_depth_atr": policy.sweep_min_depth,
             }
-            if wick < sweep.SWEEP_MIN_WICK_RATIO:
+            if wick < policy.sweep_min_wick:
                 progress_reason = "sweep_detected_wick_insufficient"
                 continue
-            if rvol < sweep.SWEEP_MIN_RVOL:
+            if rvol < policy.sweep_min_rvol:
                 progress_reason = "sweep_detected_volume_insufficient"
                 continue
             if not recovered:
@@ -1573,17 +1584,16 @@ class ArmedEntryEngine:
                     progress_reason = "sweep_reclaim_invalidated"
                     continue
 
-            # Do not arm on the sweep candle itself. Wait for a closed 5m bar
-            # that proves reclaim + directional continuation. The 1m gate still
-            # handles precise execution after this structural confirmation.
-            if sweep_idx >= i:
+            # Recovery can arm on closed reclaim. Strict retains the extra
+            # 5m continuation requirement. Both still need the 1m trigger.
+            if sweep_idx >= i and not policy.sweep_arm_on_reclaim:
                 progress_reason = "sweep_reclaimed_waiting_5m_continuation"
                 progress_diag["bars_since_sweep"] = 0
                 continue
             continuation_ok, continuation_reason, continuation_diag = sweep.continuation_confirmation(
                 "long" if watch.direction == Direction.LONG else "short",
                 sweep_idx=sweep_idx, trigger_idx=i, o=o, h=h, l=l, c=c, v=v,
-                ema20=ema20, ema50=ema50, atr_value=atr5, level=level,
+                ema20=ema20, ema50=ema50, atr_value=atr5, level=level, policy=policy,
             )
             if not continuation_ok:
                 progress_reason = continuation_reason
@@ -1593,12 +1603,12 @@ class ArmedEntryEngine:
             if watch.direction == Direction.LONG:
                 trigger = max(level + atr5 * 0.04, float(c[sweep_idx]) + atr5 * 0.03)
                 stop = extreme - atr5 * sweep.SL_BUFFER_ATR
-                entry_zone_low, entry_zone_high = trigger, level + atr5 * SWEEP_ENTRY_MAX_EXTENSION_ATR
+                entry_zone_low, entry_zone_high = trigger, level + atr5 * policy.sweep_entry_extension
                 target_level = max(h[max(0, sweep_idx - sweep.TARGET_LOOKBACK):sweep_idx])
             else:
                 trigger = min(level - atr5 * 0.04, float(c[sweep_idx]) - atr5 * 0.03)
                 stop = extreme + atr5 * sweep.SL_BUFFER_ATR
-                entry_zone_low, entry_zone_high = level - atr5 * SWEEP_ENTRY_MAX_EXTENSION_ATR, trigger
+                entry_zone_low, entry_zone_high = level - atr5 * policy.sweep_entry_extension, trigger
                 target_level = min(l[max(0, sweep_idx - sweep.TARGET_LOOKBACK):sweep_idx])
             stop_atr = abs(trigger - stop) / atr5
             if stop_atr < ARM_MIN_STOP_ATR:
@@ -1624,9 +1634,9 @@ class ArmedEntryEngine:
             rr_q = clamp((rr - ARM_MIN_RR) / 1.6, 0, 1)
             fresh_q = clamp(1.0 - age / 4.0, 0, 1)
             score = round(58 + 42 * clamp(0.25 * depth_q + 0.20 * wick_q + 0.16 * rv_q + 0.25 * rr_q + 0.14 * fresh_q, 0, 1), 2)
-            if score < SWEEP_ARM_MIN_SCORE:
+            if score < policy.sweep_min_score:
                 progress_reason = "sweep_quality_below_arm_threshold"
-                progress_diag.update({"quality": score, "min_quality": SWEEP_ARM_MIN_SCORE})
+                progress_diag.update({"quality": score, "min_quality": policy.sweep_min_score})
                 continue
             armed_at, expires_at = self._expiry(snapshot)
             lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
@@ -1646,7 +1656,13 @@ class ArmedEntryEngine:
                     "sweep_extreme": float(extreme), "sweep_depth_atr": float(depth),
                     "sweep_wick_ratio": float(wick), "sweep_rvol": float(rvol),
                     "bars_since_sweep": int(age),
-                    "sweep_5m_continuation_confirmed": True,
+                    "prearm_profile": policy.name,
+                    "sweep_arm_min_score": policy.sweep_min_score,
+                    "sweep_min_wick_ratio": policy.sweep_min_wick,
+                    "sweep_min_rvol": policy.sweep_min_rvol,
+                    "sweep_min_depth_atr": policy.sweep_min_depth,
+                    "sweep_5m_continuation_confirmed": age > 0,
+                    "sweep_confirmation_mode": continuation_diag["confirmation_mode"],
                     "sweep_5m_continuation_reason": continuation_reason,
                     "sweep_5m_continuation": continuation_diag,
                     "structural_target_price": float(target_level),
@@ -1672,7 +1688,14 @@ class ArmedEntryEngine:
             lifecycle_id = str((watch.metadata or {}).get("lifecycle_id") or watch.watch_id)
             return "armed", best, {
                 "reason": "sweep_reclaimed", "watch_id": watch.watch_id,
-                "lifecycle_id": lifecycle_id, "quality": best.quality, **guard_diag,
+                "lifecycle_id": lifecycle_id, "quality": best.quality,
+                "prearm_profile": policy.name,
+                "confirmation_mode": best.metadata["sweep_confirmation_mode"],
+                "sweep_min_score": policy.sweep_min_score,
+                "sweep_min_wick_ratio": policy.sweep_min_wick,
+                "sweep_min_rvol": policy.sweep_min_rvol,
+                "entry_extension_max_atr": policy.sweep_entry_extension,
+                **guard_diag,
             }
 
         # If price has materially broken through the watched pool without reclaim,

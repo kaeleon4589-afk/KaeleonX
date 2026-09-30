@@ -1,0 +1,16 @@
+Comparación exacta con KaeleonX-v6.21-execution-quote-refresh.zip
+
+MODIFICADOS (4):
+app/strategy/prearm_policy.py
+app/strategy/liquidity_sweep.py
+app/strategy/armed_entry.py
+tests/test_armed_entry_v6.py
+
+NUEVOS (3):
+tests/test_sweep_recovery_v622.py
+FIX_V6_22.md
+ARCHIVOS_TOCADOS_V6_22.txt
+
+ELIMINADOS: ninguno.
+Producción: actualizar los tres módulos de app/strategy juntos.
+El test existente explicita strict en dos casos históricos que exigían otra vela 5m.

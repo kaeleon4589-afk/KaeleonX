@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import copy
 import inspect
 import math
 import time
@@ -55,7 +56,8 @@ class TradingOrchestrator:
                  entry_min_stop_atr=0.55, entry_min_stop_spreads=3.0,
                  entry_orderbook_conflict_threshold=0.35,
                  armed_entry_enabled=True, legacy_entry_fallback_enabled=False,
-                 funnel_emit_seconds=300.0, funnel_emit_every=50):
+                 funnel_emit_seconds=300.0, funnel_emit_every=50, execution_quote_provider=None):
+        self.execution_quote_provider = execution_quote_provider
         self.regime_engine = regime_engine
         self.router = router
         self.risk = risk
@@ -91,6 +93,30 @@ class TradingOrchestrator:
         self.last_loss_at = 0.0
         self.last_symbol_loss_at = {}
         self._lifecycle_progress = {}
+
+    async def _refresh_entry_quote(self, snapshot, decision_id, user_id):
+        """Refresh inside the consumer, after queue/DB waits; never retimestamp old data."""
+        if self.execution_quote_provider is None:
+            return snapshot  # Compatibility for offline/replay callers; final age guard still applies.
+        previous_ms = getattr(snapshot, "quote_received_ms", None)
+        quote = await asyncio.wait_for(self.execution_quote_provider(snapshot.symbol), timeout=8.0)
+        bid, ask = float(quote.bid), float(quote.ask)
+        received_ms = int(quote.quote_received_ms)
+        age_ms = int(time.time() * 1000) - received_ms
+        if (getattr(quote, "symbol", None) != snapshot.symbol
+                or not math.isfinite(bid) or not math.isfinite(ask)
+                or not 0 < bid <= ask or not 0 <= age_ms <= 2_000
+                or not getattr(quote, "orderbook_valid", False)):
+            raise ValueError("invalid_or_stale_execution_quote")
+        fresh = copy(snapshot)  # Snapshot is shared by users; preserve candles and monitor flags.
+        for field in ("bid", "ask", "bids", "asks", "last", "quote_received_ms", "orderbook_valid"):
+            setattr(fresh, field, getattr(quote, field, None))
+        self.audit.event(
+            "EXECUTION_QUOTE_REFRESHED", decision_id, user_id=user_id, mode=self.execution_mode,
+            symbol=snapshot.symbol, previous_quote_received_ms=previous_ms,
+            quote_received_ms=received_ms, quote_age_ms=age_ms, bid=bid, ask=ask,
+        )
+        return fresh
 
     @staticmethod
     def _enum_value(value):
@@ -783,6 +809,19 @@ class TradingOrchestrator:
         )
 
         try:
+            # Snapshot acquisition precedes the shared runtime lock, account sync and
+            # other users. Refresh only tracked entries here, BEFORE consuming a setup.
+            if snapshot.symbol in self.armed_setups and self.execution_quote_provider is not None:
+                try:
+                    snapshot = await self._refresh_entry_quote(snapshot, decision_id, user_id)
+                except Exception as exc:
+                    self.last_rejection = "execution_quote_refresh_pending"
+                    self.audit.event(
+                        "EXECUTION_QUOTE_PENDING", decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        reason=self.last_rejection, error=type(exc).__name__,
+                    )
+                    return None  # Keep ARMED for the next monitor tick, until its normal expiry.
             # ------------------------- SIGNAL STAGE -------------------------
             # Discovery and trigger-followup deliberately run on different paths.
             # Once a setup is ARMED, the priority monitor supplies only live depth
@@ -1208,6 +1247,61 @@ class TradingOrchestrator:
                 return None
 
             lifecycle_ctx = self._lifecycle_context(intent=intent, decision_id=decision_id)
+            # A worker restart or delayed persistence must not bypass the
+            # one-position-per-user rule before placing a second order.
+            if user_id and (await asyncio.to_thread(
+                    self.db.find_one, 'positions', {'user_id': user_id, 'status': 'OPEN'})):
+                self.last_rejection = 'open_position_exists'
+                terminal_event_emitted = True
+                self._funnel("execution_rejected", "open_position_exists", user_id=user_id, symbol=snapshot.symbol)
+                self.audit.event(
+                    'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                    stage="REJECTED", strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)), reason='open_position_exists',
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason='open_position_exists', strategy=intent.strategy, direction=intent.direction,
+                )
+                return {'accepted': False, 'filled': False, 'reason': 'open_position_exists'}
+            if user_id and (await asyncio.to_thread(
+                    self.db.find_one, 'execution_pending', {'user_id': user_id, 'active': True})):
+                self.last_rejection = 'execution_pending'
+                terminal_event_emitted = True
+                self._funnel("execution_rejected", "execution_pending", user_id=user_id, symbol=snapshot.symbol)
+                self.audit.event(
+                    'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
+                    stage="REJECTED", strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                    direction=getattr(intent.direction, "value", str(intent.direction)), reason='execution_pending',
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason='execution_pending', strategy=intent.strategy, direction=intent.direction,
+                )
+                return {'accepted': False, 'filled': False, 'reason': 'execution_pending'}
+            # These durable checks may be slow; fetch depth again afterwards and
+            # run ALL existing price, RR, slippage, noise and book checks on that quote.
+            if self.execution_quote_provider is not None:
+                try:
+                    snapshot = await self._refresh_entry_quote(snapshot, decision_id, user_id)
+                except Exception as exc:
+                    self.last_rejection = "execution_quote_refresh_failed"
+                    terminal_event_emitted = True
+                    self._funnel("execution_rejected", self.last_rejection, user_id=user_id, symbol=snapshot.symbol)
+                    self.audit.event(
+                        "EXECUTION_REJECTED", decision_id, user_id=user_id, mode=self.execution_mode,
+                        symbol=snapshot.symbol, reason=self.last_rejection, error=type(exc).__name__,
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="REJECTED",
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                        reason=self.last_rejection, strategy=intent.strategy, direction=intent.direction,
+                    )
+                    return {"accepted": False, "filled": False, "reason": self.last_rejection}
             signal_entry = float(intent.entry_price)
             try:
                 executable = float(snapshot.ask if intent.direction == Direction.LONG else snapshot.bid)
@@ -1629,42 +1723,6 @@ class TradingOrchestrator:
                     reason='fill_outside_trade_geometry', strategy=intent.strategy, direction=intent.direction,
                 )
                 return {'accepted': False, 'filled': False, 'reason': 'fill_outside_trade_geometry'}
-            # A worker restart or delayed persistence must not bypass the
-            # one-position-per-user rule before placing a second order.
-            if user_id and (await asyncio.to_thread(
-                    self.db.find_one, 'positions', {'user_id': user_id, 'status': 'OPEN'})):
-                self.last_rejection = 'open_position_exists'
-                terminal_event_emitted = True
-                self._funnel("execution_rejected", "open_position_exists", user_id=user_id, symbol=snapshot.symbol)
-                self.audit.event(
-                    'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
-                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
-                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
-                    stage="REJECTED", strategy=getattr(intent.strategy, "value", str(intent.strategy)),
-                    direction=getattr(intent.direction, "value", str(intent.direction)), reason='open_position_exists',
-                )
-                self._terminal_lifecycle(
-                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
-                    reason='open_position_exists', strategy=intent.strategy, direction=intent.direction,
-                )
-                return {'accepted': False, 'filled': False, 'reason': 'open_position_exists'}
-            if user_id and (await asyncio.to_thread(
-                    self.db.find_one, 'execution_pending', {'user_id': user_id, 'active': True})):
-                self.last_rejection = 'execution_pending'
-                terminal_event_emitted = True
-                self._funnel("execution_rejected", "execution_pending", user_id=user_id, symbol=snapshot.symbol)
-                self.audit.event(
-                    'EXECUTION_REJECTED', decision_id, user_id=user_id, mode=self.execution_mode,
-                    symbol=snapshot.symbol, lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
-                    watch_id=lifecycle_ctx.get("watch_id"), setup_id=lifecycle_ctx.get("setup_id"),
-                    stage="REJECTED", strategy=getattr(intent.strategy, "value", str(intent.strategy)),
-                    direction=getattr(intent.direction, "value", str(intent.direction)), reason='execution_pending',
-                )
-                self._terminal_lifecycle(
-                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
-                    reason='execution_pending', strategy=intent.strategy, direction=intent.direction,
-                )
-                return {'accepted': False, 'filled': False, 'reason': 'execution_pending'}
             if self.entry_guard is not None and not self.entry_guard():
                 raise RuntimeError('trading_worker_lease_expired')
             armed_setup_id = str((getattr(intent, 'metadata', {}) or {}).get('armed_setup_id') or '')
@@ -1701,6 +1759,27 @@ class TradingOrchestrator:
                                'decision_id': decision_id, 'order_id': None, 'created_ms': now_ms}
                 await asyncio.to_thread(self.db.upsert, 'execution_pending', {'user_id': user_id}, reservation)
                 self.pending_execution = {**reservation, 'created_monotonic': time.monotonic()}
+            # Claims/reservation also await storage. Never submit if that wait has
+            # invalidated the checked quote, and never stamp a stale quote as fresh.
+            final_quote_age_ms = int(time.time() * 1000) - int(quote_ms)
+            if final_quote_age_ms < 0 or final_quote_age_ms > 10_000:
+                if self.execution_mode == "live":
+                    await self._clear_pending(user_id)
+                self.last_rejection = "execution_quote_expired_before_submit"
+                terminal_event_emitted = True
+                self._funnel("execution_rejected", self.last_rejection, user_id=user_id, symbol=snapshot.symbol)
+                self.audit.event(
+                    "EXECUTION_REJECTED", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, reason=self.last_rejection, quote_age_ms=final_quote_age_ms,
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="REJECTED",
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
+                    reason=self.last_rejection, strategy=intent.strategy, direction=intent.direction,
+                )
+                return {"accepted": False, "filled": False, "reason": self.last_rejection}
+            if self.entry_guard is not None and not self.entry_guard():
+                raise RuntimeError('trading_worker_lease_expired')
             self._funnel("submitted", user_id=user_id, symbol=snapshot.symbol)
             self.audit.event(
                 "ORDER_SUBMITTED", decision_id, user_id=user_id, mode=self.execution_mode,

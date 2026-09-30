@@ -4,7 +4,7 @@ from app.config.settings import get_settings
 from app.logging.logger import get_logger, AuditLogger
 from app.storage.database import Database
 from app.coinw.market import CoinWMarketClient
-from app.market.coordinator import MultiMarketCoordinator
+from app.market.coordinator import MarketCoordinator, MultiMarketCoordinator
 from app.market.scanner import CoinWMarketScanner
 from app.security.credential_vault import CredentialVault
 from app.trading.profile import UserTradingProfileService
@@ -36,6 +36,8 @@ async def run():
     )
     runtimes = UserTradingRuntimeManager(s, db, audit, profiles)
     client = CoinWMarketClient(s.coinw_rest_base_url)
+    execution_quotes = MarketCoordinator(client, "BTC", audit=audit)
+    runtimes.execution_quote_provider = execution_quotes.quote
     scanner = CoinWMarketScanner(
         client, depth=s.market_scanner_depth, cache_seconds=s.market_scanner_cache_seconds, audit=audit
     )

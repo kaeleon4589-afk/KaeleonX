@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from app.strategy.breakout_retest import BreakoutRetestStrategy
 from app.strategy.armed_entry import ArmedEntryEngine
+from app.strategy.prearm_policy import prearm_policy
 from app.strategy.liquidity_sweep import LiquiditySweepStrategy
 
 
@@ -35,7 +36,7 @@ class StrategyRouter:
 
     Production v6 uses regime as context: TREND_CONTINUATION primarily arms
     breakout/retest setups, while VOLATILE_SWEEP and RANGE can arm high-quality
-    liquidity sweeps. UNKNOWN remains blocked. The legacy immediate-entry router
+    liquidity sweeps. Recovery also evaluates directional RANGE. UNKNOWN remains blocked. The legacy immediate-entry router
     is kept intact as an explicit rollback/compatibility path.
     """
 
@@ -127,6 +128,7 @@ class StrategyRouter:
         self.last_trace = {
             "selected": None,
             "reason": "setup_armed" if setup is not None else "no_armable_setup",
+            "prearm_profile": prearm_policy().name,
             "armed": dict(self.armed.last_trace or {}),
         }
         return setup
@@ -141,10 +143,12 @@ class StrategyRouter:
         if watch is None:
             sweep_reason = str((branches.get("sweep") or {}).get("reason") or "")
             breakout_reason = str((branches.get("breakout") or {}).get("reason") or "")
-            primary = sweep_reason or breakout_reason or primary
+            primary = str(branches.get("reason") or breakout_reason or sweep_reason or primary)
         self.last_trace = {
             "selected": None,
             "reason": "setup_watching" if watch is not None else primary,
+            "prearm_profile": prearm_policy().name,
+            "rejection_reasons": {key: value.get("reason") for key, value in branches.items() if isinstance(value, dict)},
             "watch": {
                 "accepted": watch is not None,
                 "reason": primary,

@@ -19,6 +19,7 @@ from app.position.protection import (
 )
 from app.strategy import breakout_retest as breakout
 from app.strategy import liquidity_sweep as sweep
+from app.strategy.prearm_policy import prearm_policy
 from app.strategy.source_math import atr, candle_quality, clamp, ema, extract, relative_volume
 
 # v6 deliberately separates setup discovery from execution confirmation.
@@ -200,10 +201,17 @@ def _adaptive_retest_penetration_limit(
         and ema_alignment >= RETEST_PENETRATION_ADAPTIVE_MIN_EMA_ALIGNMENT
         and directional_edge_ok
     )
-    allowed = RETEST_PENETRATION_STRONG_TREND_ATR if eligible else RETEST_PENETRATION_BASE_ATR
+    recovery_eligible = (
+        prearm_policy().name == "recovery"
+        and status == "ok"
+        and 0 < int(bars_since_breakout) <= RETEST_PENETRATION_ADAPTIVE_MAX_BARS
+        and directional_edge_ok
+    )
+    allowed = RETEST_PENETRATION_STRONG_TREND_ATR if eligible or recovery_eligible else RETEST_PENETRATION_BASE_ATR
     return allowed, {
-        "retest_penetration_mode": "strong_trend_adaptive" if eligible else "standard",
+        "retest_penetration_mode": "strong_trend_adaptive" if eligible else ("recovery_aligned" if recovery_eligible else "standard"),
         "max_penetration_atr": float(allowed),
+        "prearm_profile": prearm_policy().name,
         "retest_penetration_base_atr": float(RETEST_PENETRATION_BASE_ATR),
         "retest_penetration_adaptive_ceiling_atr": RETEST_PENETRATION_STRONG_TREND_ATR,
         "retest_penetration_adaptive_eligible": bool(eligible),
@@ -657,8 +665,7 @@ class ArmedEntryEngine:
             }
             return None
         direction_name = "long" if required_direction == Direction.LONG else "short"
-        explicit_biases = [x for x in (bias1h, bias15) if x != "none"]
-        if any(x != direction_name for x in explicit_biases):
+        if prearm_policy().mtf_conflict(direction_name, bias1h, bias15):
             self.branch_trace["breakout"] = {
                 "accepted": False, "reason": "mtf_bias_conflict_with_trend",
                 "trend_direction": required_direction.value,
@@ -679,9 +686,9 @@ class ArmedEntryEngine:
         best = None
         for retest_count in range(1, BREAKOUT_ARM_MAX_RETEST_BARS + 1):
             breakout_idx = i - retest_count
-            if breakout_idx <= breakout.STRUCTURE_LOOKBACK_BARS:
+            if breakout_idx <= prearm_policy().breakout_lookback:
                 continue
-            start = breakout_idx - breakout.STRUCTURE_LOOKBACK_BARS
+            start = breakout_idx - prearm_policy().breakout_lookback
             structural_level = max(h[start:breakout_idx]) if direction_name == "long" else min(l[start:breakout_idx])
             body, close_pos = breakout._candle_shape(o, h, l, c, breakout_idx)
             rvol = relative_volume(v, breakout_idx)
@@ -690,19 +697,19 @@ class ArmedEntryEngine:
                 breakout_ok = (
                     float(c[breakout_idx]) > float(o[breakout_idx])
                     and float(c[breakout_idx]) >= float(structural_level) + atr5 * breakout.BREAKOUT_CLOSE_BUFFER_ATR
-                    and body >= breakout.BREAKOUT_MIN_BODY_RATIO
-                    and close_pos >= breakout.BREAKOUT_CLOSE_POS_LONG_MIN
-                    and rvol >= breakout.BREAKOUT_MIN_RVOL
-                    and extension <= breakout.BREAKOUT_MAX_EXTENSION_ATR
+                    and body >= prearm_policy().breakout_min_body
+                    and close_pos >= prearm_policy().breakout_close_long
+                    and rvol >= prearm_policy().breakout_min_rvol
+                    and extension <= prearm_policy().breakout_max_extension
                 )
             else:
                 breakout_ok = (
                     float(c[breakout_idx]) < float(o[breakout_idx])
                     and float(c[breakout_idx]) <= float(structural_level) - atr5 * breakout.BREAKOUT_CLOSE_BUFFER_ATR
-                    and body >= breakout.BREAKOUT_MIN_BODY_RATIO
-                    and close_pos <= breakout.BREAKOUT_CLOSE_POS_SHORT_MAX
-                    and rvol >= breakout.BREAKOUT_MIN_RVOL
-                    and extension <= breakout.BREAKOUT_MAX_EXTENSION_ATR
+                    and body >= prearm_policy().breakout_min_body
+                    and close_pos <= (1.0 - prearm_policy().breakout_close_long)
+                    and rvol >= prearm_policy().breakout_min_rvol
+                    and extension <= prearm_policy().breakout_max_extension
                 )
             if not breakout_ok:
                 continue
@@ -850,9 +857,9 @@ class ArmedEntryEngine:
         ema20, ema50 = ema(c, sweep.EMA_FAST), ema(c, sweep.EMA_MID)
         i = len(c) - 1
         best = None
-        start_idx = max(sweep.SWEEP_LOOKBACK + 2, i - 3)
+        start_idx = max(prearm_policy().sweep_lookback + 2, i - 3)
         for sweep_idx in range(start_idx, i + 1):
-            left = max(0, sweep_idx - sweep.SWEEP_LOOKBACK)
+            left = max(0, sweep_idx - prearm_policy().sweep_lookback)
             if sweep_idx - left < 12:
                 continue
             for direction_name in (("long",) if required_direction == Direction.LONG else ("short",)):
@@ -1007,8 +1014,7 @@ class ArmedEntryEngine:
         direction_name = "long" if required_direction == Direction.LONG else "short"
         bias1h, diag1h = breakout._bias(tf1h, adx_min=breakout.H1_ADX_MIN)
         bias15, diag15 = breakout._bias(tf15, adx_min=breakout.M15_ADX_MIN)
-        explicit = [x for x in (bias1h, bias15) if x != "none"]
-        if any(x != direction_name for x in explicit):
+        if prearm_policy().mtf_conflict(direction_name, bias1h, bias15):
             self.watch_trace["breakout"] = {
                 "accepted": False, "reason": "mtf_bias_conflict_with_trend",
                 "trend_direction": required_direction.value, "bias_1h": bias1h, "bias_15m": bias15,
@@ -1023,9 +1029,9 @@ class ArmedEntryEngine:
         i = len(c) - 1
         for age in range(0, WATCH_BREAKOUT_MAX_AGE_BARS + 1):
             idx = i - age
-            if idx <= breakout.STRUCTURE_LOOKBACK_BARS:
+            if idx <= prearm_policy().breakout_lookback:
                 continue
-            start = idx - breakout.STRUCTURE_LOOKBACK_BARS
+            start = idx - prearm_policy().breakout_lookback
             structural_level = max(h[start:idx]) if direction_name == "long" else min(l[start:idx])
             body, close_pos = breakout._candle_shape(o, h, l, c, idx)
             rvol = relative_volume(v, idx)
@@ -1034,19 +1040,19 @@ class ArmedEntryEngine:
                 breakout_ok = (
                     float(c[idx]) > float(o[idx])
                     and float(c[idx]) >= float(structural_level) + atr5 * breakout.BREAKOUT_CLOSE_BUFFER_ATR
-                    and body >= breakout.BREAKOUT_MIN_BODY_RATIO
-                    and close_pos >= breakout.BREAKOUT_CLOSE_POS_LONG_MIN
-                    and rvol >= breakout.BREAKOUT_MIN_RVOL
-                    and extension <= breakout.BREAKOUT_MAX_EXTENSION_ATR
+                    and body >= prearm_policy().breakout_min_body
+                    and close_pos >= prearm_policy().breakout_close_long
+                    and rvol >= prearm_policy().breakout_min_rvol
+                    and extension <= prearm_policy().breakout_max_extension
                 )
             else:
                 breakout_ok = (
                     float(c[idx]) < float(o[idx])
                     and float(c[idx]) <= float(structural_level) - atr5 * breakout.BREAKOUT_CLOSE_BUFFER_ATR
-                    and body >= breakout.BREAKOUT_MIN_BODY_RATIO
-                    and close_pos <= breakout.BREAKOUT_CLOSE_POS_SHORT_MAX
-                    and rvol >= breakout.BREAKOUT_MIN_RVOL
-                    and extension <= breakout.BREAKOUT_MAX_EXTENSION_ATR
+                    and body >= prearm_policy().breakout_min_body
+                    and close_pos <= (1.0 - prearm_policy().breakout_close_long)
+                    and rvol >= prearm_policy().breakout_min_rvol
+                    and extension <= prearm_policy().breakout_max_extension
                 )
             if not breakout_ok:
                 continue
@@ -1061,6 +1067,7 @@ class ArmedEntryEngine:
                 metadata={
                     "lifecycle_id": watch_id,
                     "lifecycle_origin": "breakout_precursor",
+                    "prearm_profile": prearm_policy().name,
                     "watch_model": "breakout_retest_watch_v2_stateful",
                     "breakout_candle_ts": candle_ts,
                     "structural_level": float(structural_level),
@@ -1107,7 +1114,7 @@ class ArmedEntryEngine:
         if not sweep.ATR_PCT_MIN <= atr_pct <= sweep.ATR_PCT_MAX:
             self.watch_trace["sweep"] = {"accepted": False, "reason": "atr_out_of_range", "atr_pct": atr_pct}
             return None
-        left = max(0, i - sweep.SWEEP_LOOKBACK)
+        left = max(0, i - prearm_policy().sweep_lookback)
         if i - left < 12:
             self.watch_trace["sweep"] = {"accepted": False, "reason": "insufficient_liquidity_history"}
             return None
@@ -1121,10 +1128,13 @@ class ArmedEntryEngine:
             directional_close_distance = (float(level) - float(c[i])) / atr5
         # Start following before the sweep completes. A low/high within 0.45 ATR
         # of the liquidity pool is close enough to justify priority monitoring,
-        # but prices already far through the level are left to normal discovery.
-        if proximity > WATCH_SWEEP_PROXIMITY_ATR or directional_close_distance < -0.70:
+        # Recovery monitors at 0.80 ATR; strict preserves 0.45 ATR.
+        # Prices already far through the level are left to normal discovery.
+        if proximity > prearm_policy().sweep_proximity_atr or directional_close_distance < -0.70:
             self.watch_trace["sweep"] = {
                 "accepted": False, "reason": "sweep_level_not_reached",
+                "liquidity_lookback_bars": prearm_policy().sweep_lookback,
+                "max_proximity_atr": prearm_policy().sweep_proximity_atr,
                 "proximity_atr": float(proximity), "liquidity_level": float(level),
             }
             return None
@@ -1138,6 +1148,8 @@ class ArmedEntryEngine:
             metadata={
                 "lifecycle_id": watch_id,
                 "lifecycle_origin": "liquidity_precursor",
+                "prearm_profile": prearm_policy().name,
+                "liquidity_lookback_bars": prearm_policy().sweep_lookback,
                 "watch_model": "liquidity_sweep_watch_v2_stateful",
                 "watch_candle_ts": int(getattr(c5[i], "timestamp", created)),
                 "liquidity_level": float(level), "atr_value_at_watch": float(atr5),
@@ -1158,13 +1170,13 @@ class ArmedEntryEngine:
                        regime_metadata: dict | None = None) -> SetupWatch | None:
         self.watch_trace = {}
         active = self._active_regime(regime_metadata)
-        if getattr(regime, "hard_block", False) and active == "UNKNOWN":
-            self.watch_trace = {"accepted": False, "reason": "regime_unknown_hard_block"}
+        if getattr(regime, "hard_block", False) or active == "UNKNOWN":
+            self.watch_trace = {"accepted": False, "reason": "regime_unknown_or_hard_block"}
             return None
         # BREAKOUT_RETEST gets first-class priority in trend continuation: follow
         # the breakout immediately, rather than hoping the rotating scanner lands
         # on the symbol again after the retest has already completed.
-        if active == "TREND_CONTINUATION" or bool(getattr(regime, "breakout_allowed", False)):
+        if active == "TREND_CONTINUATION" or (active == "RANGE" and prearm_policy().range_enabled) or bool(getattr(regime, "breakout_allowed", False)):
             item = self._discover_breakout_watch(regime, snapshot, symbol, timeframe, regime_metadata)
             if item is not None:
                 was_consumed, consumed_reason = self._is_watch_consumed(item.watch_id)
@@ -1176,13 +1188,13 @@ class ArmedEntryEngine:
                     "watch_id": item.watch_id,
                     "consumed_reason": consumed_reason,
                 }
-        if active == "RANGE":
+        if active == "RANGE" and not prearm_policy().range_enabled:
             self.watch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
             return None
         if active == "VOLATILE_SWEEP" and not bool(getattr(regime, "sweep_allowed", False)):
             self.watch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
             return None
-        if active in {"TREND_CONTINUATION", "VOLATILE_SWEEP"} or bool(getattr(regime, "sweep_allowed", False)):
+        if active in {"TREND_CONTINUATION", "VOLATILE_SWEEP"} or (active == "RANGE" and prearm_policy().range_enabled) or bool(getattr(regime, "sweep_allowed", False)):
             item = self._discover_sweep_watch(regime, snapshot, symbol, timeframe, regime_metadata)
             if item is not None:
                 was_consumed, consumed_reason = self._is_watch_consumed(item.watch_id)
@@ -1267,8 +1279,7 @@ class ArmedEntryEngine:
         direction_name = "long" if watch.direction == Direction.LONG else "short"
         bias1h, diag1h = breakout._bias(tf1h, adx_min=breakout.H1_ADX_MIN)
         bias15, diag15 = breakout._bias(tf15, adx_min=breakout.M15_ADX_MIN)
-        explicit = [x for x in (bias1h, bias15) if x != "none"]
-        if any(x != direction_name for x in explicit):
+        if prearm_policy().mtf_conflict(direction_name, bias1h, bias15):
             return "cancelled", None, {
                 "reason": "mtf_bias_conflict_with_watch", "watch_id": watch.watch_id,
                 "watch_direction": watch.direction.value, "bias_1h": bias1h, "bias_15m": bias15,
@@ -1696,28 +1707,29 @@ class ArmedEntryEngine:
                  regime_metadata: dict | None = None) -> ArmedSetup | None:
         self.branch_trace = {}
         self.last_trace = {"accepted": False, "reason": "no_armable_setup", "branches": {}}
-        if getattr(regime, "hard_block", False) and self._active_regime(regime_metadata) == "UNKNOWN":
-            self.last_trace = {"accepted": False, "reason": "regime_unknown_hard_block"}
+        if getattr(regime, "hard_block", False) or self._active_regime(regime_metadata) == "UNKNOWN":
+            self.last_trace = {"accepted": False, "reason": "regime_unknown_or_hard_block"}
             return None
         active = self._active_regime(regime_metadata)
         candidates: list[ArmedSetup] = []
         # Strategy hierarchy: in TREND_CONTINUATION a valid BREAKOUT_RETEST has
         # first priority. LIQUIDITY_SWEEP is a secondary trend-following entry
-        # only when no breakout/retest is armable. RANGE remains shadow-only.
+        # only when no breakout/retest is armable. Recovery also evaluates
+        # directional RANGE; neutral direction still fails inside each branch.
         breakout_item = None
-        if active == "TREND_CONTINUATION" or getattr(regime, "breakout_allowed", False):
+        if active == "TREND_CONTINUATION" or (active == "RANGE" and prearm_policy().range_enabled) or getattr(regime, "breakout_allowed", False):
             breakout_item = self._discover_breakout(regime, snapshot, symbol, timeframe, regime_metadata)
             if breakout_item:
                 candidates.append(breakout_item)
 
         sweep_permitted = False
-        if active == "RANGE":
+        if active == "RANGE" and not prearm_policy().range_enabled:
             self.branch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
         elif active == "VOLATILE_SWEEP":
             sweep_permitted = bool(getattr(regime, "sweep_allowed", False))
             if not sweep_permitted:
                 self.branch_trace["sweep"] = {"accepted": False, "reason": "regime_sweep_not_allowed"}
-        elif active == "TREND_CONTINUATION":
+        elif active == "TREND_CONTINUATION" or (active == "RANGE" and prearm_policy().range_enabled):
             # Never let a sweep compete with a valid trend breakout. When no fresh
             # breakout/retest is armable, always *evaluate* the trend-aligned
             # liquidity branch. The sweep still has to pass its own structural
@@ -1788,6 +1800,12 @@ class ArmedEntryEngine:
 
     def trigger(self, setup: ArmedSetup, snapshot, decision_id: str) -> tuple[str, TradeIntent | None, dict]:
         now_ms = _now_ms()
+        consumed, consumed_reason = self._is_consumed(setup.setup_id, now_ms)
+        if consumed:
+            return "cancelled", None, {
+                "reason": "setup_already_consumed", "consumed_reason": consumed_reason,
+                "setup_id": setup.setup_id,
+            }
         if setup.strategy == Strategy.LIQUIDITY_SWEEP:
             meta = dict(setup.metadata or {})
             aligned = meta.get("trend_aligned") is True and int(meta.get("trend_alignment_guard_version") or 0) >= 1

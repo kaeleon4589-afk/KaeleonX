@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+
+import pytest
 from types import SimpleNamespace
 
 from app.models.enums import Direction, Strategy
@@ -588,7 +590,7 @@ def _breakout_precursor_snapshot():
         for i in range(260)
     ]
     # Fresh breakout exists now, but there is no subsequent retest candle yet.
-    c5[259] = Candle(259 * 300_000, 100.2, 101.2, 100.1, 100.95, 220.0)
+    c5[259] = Candle(259 * 300_000, 100.2, 101.5, 100.1, 100.95, 220.0)
     c15 = [Candle(i * 900_000, 100.0, 100.6, 99.4, 100.0, 100.0) for i in range(220)]
     c1h = [Candle(i * 3_600_000, 100.0, 100.6, 99.4, 100.0, 100.0) for i in range(220)]
     return SimpleNamespace(
@@ -1285,7 +1287,7 @@ def test_v612_trigger_rebases_target_from_structure_before_rr_check(monkeypatch)
 def test_v612_temporarily_low_trigger_rr_stays_pending_and_can_recover(monkeypatch):
     from app.strategy import armed_entry as armed_module
 
-    setup = _v612_trigger_setup(structural_target=101.30)
+    setup = _v612_trigger_setup(structural_target=101.40)
     engine = ArmedEntryEngine(ttl_seconds=600)
     monkeypatch.setattr(armed_module, "_now_ms", lambda: 1_800_000_000_000)
     price = {"value": 100.40}
@@ -1300,7 +1302,7 @@ def test_v612_temporarily_low_trigger_rr_stays_pending_and_can_recover(monkeypat
     assert status == "pending"
     assert intent is None
     assert trace["reason"] == "trigger_rr_temporarily_low"
-    assert trace["execution_rr"] < 1.10
+    assert trace["execution_rr"] < 1.20
     assert engine._is_consumed(setup.setup_id)[0] is False
 
     # A later quote back near the trigger restores RR without rediscovering the
@@ -1309,7 +1311,103 @@ def test_v612_temporarily_low_trigger_rr_stays_pending_and_can_recover(monkeypat
     status, intent, trace = engine.trigger(setup, snap, "decision-v612-recovered")
     assert status == "triggered"
     assert intent is not None
-    assert trace["execution_rr"] >= 1.10
+    assert trace["execution_rr"] >= 1.20
+
+
+def test_breakout_adaptive_confirmation_rejects_stop_inside_5m_noise(monkeypatch):
+    from app.strategy import armed_entry as armed_module
+
+    now = 1_800_000_000_000
+    setup = ArmedSetup(
+        setup_id="SYRUP-LIKE:BR:1:SHORT",
+        symbol="SYRUP-LIKE",
+        strategy=Strategy.BREAKOUT_RETEST,
+        direction=Direction.SHORT,
+        armed_at_ms=now - 5_000,
+        expires_at_ms=now + 300_000,
+        trigger_price=100.0,
+        invalidation_price=100.52,
+        stop_price=100.52,
+        target_price=99.20,
+        entry_zone_low=99.5,
+        entry_zone_high=100.0,
+        quality=86.0,
+        risk_multiplier=1.0,
+        timeframe="5m",
+        metadata={
+            "atr_value": 1.0,
+            "structural_target_price": 98.8,
+            "target_front_run_ratio": 1.0,
+        },
+    )
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    monkeypatch.setattr(armed_module, "_now_ms", lambda: now)
+    monkeypatch.setattr(
+        armed_module,
+        "_micro_confirmation",
+        lambda *args, **kwargs: (
+            True,
+            "triggered",
+            {
+                "price": 100.0,
+                "confirmation_mode": "postarm_closed_1m_strong_shape",
+                "1m_rvol": 0.63,
+                "postarm_adaptive_used": True,
+            },
+        ),
+    )
+
+    status, intent, trace = engine.trigger(setup, SimpleNamespace(timeframes={}), "syrup-regression")
+
+    assert status == "pending"
+    assert intent is None
+    assert trace["reason"] == "trigger_breakout_stop_too_tight"
+    assert trace["stop_atr"] == pytest.approx(0.52)
+    assert trace["min_stop_atr"] == 0.55
+    assert trace["adaptive_confirmation"] is True
+
+
+def test_breakout_standard_confirmation_can_use_same_geometry_when_rr_is_healthy(monkeypatch):
+    from app.strategy import armed_entry as armed_module
+
+    now = 1_800_000_000_000
+    setup = ArmedSetup(
+        setup_id="STANDARD:BR:1:SHORT",
+        symbol="STANDARD",
+        strategy=Strategy.BREAKOUT_RETEST,
+        direction=Direction.SHORT,
+        armed_at_ms=now - 5_000,
+        expires_at_ms=now + 300_000,
+        trigger_price=100.0,
+        invalidation_price=100.52,
+        stop_price=100.52,
+        target_price=99.20,
+        entry_zone_low=99.5,
+        entry_zone_high=100.0,
+        quality=86.0,
+        risk_multiplier=1.0,
+        timeframe="5m",
+        metadata={
+            "atr_value": 1.0,
+            "structural_target_price": 98.8,
+            "target_front_run_ratio": 1.0,
+        },
+    )
+    engine = ArmedEntryEngine(ttl_seconds=600)
+    monkeypatch.setattr(armed_module, "_now_ms", lambda: now)
+    monkeypatch.setattr(
+        armed_module,
+        "_micro_confirmation",
+        lambda *args, **kwargs: (
+            True, "triggered", {"price": 100.0, "confirmation_mode": "postarm_closed_1m"}
+        ),
+    )
+
+    status, intent, trace = engine.trigger(setup, SimpleNamespace(timeframes={}), "standard-regression")
+
+    assert status == "triggered"
+    assert intent is not None
+    assert trace["execution_rr"] >= 1.20
 
 
 def test_v612_trigger_target_rebase_is_directionally_symmetric_for_short(monkeypatch):

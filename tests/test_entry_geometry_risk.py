@@ -211,3 +211,56 @@ def test_valid_fresh_setups_still_execute(side, stop, target):
     result = asyncio.run(orchestrator.on_snapshot(snapshot('BTC', 100), 100, user_id='u1'))
     assert result and result['filled'] is True
     assert len(manager.positions) == 1
+
+
+def test_breakout_final_execution_rr_floor_is_stricter_than_global_floor():
+    """Protect BREAKOUT_RETEST after bid/ask + DEMO slippage degrade the fill RR."""
+    audit = CapturingAudit()
+    execution = PaperExecutionEngine(initial_equity=100)
+    orchestrator, manager, _, _, _ = build_orchestrator(execution, mode='demo', audit=audit)
+
+    # At the executable DEMO price this geometry is ~1.18R: acceptable to the
+    # old global 1.05 guard, but too weak for the breakout/retest profile.
+    executable = 100.0 * 1.0001 * (1 + execution.slippage_bps / 10_000)
+    stop = 99.0
+    target = executable + 1.18 * (executable - stop)
+
+    def breakout_signal(*args, **kwargs):
+        return TradeIntent(
+            'd-breakout-rr', 'BTC', Strategy.BREAKOUT_RETEST, Direction.LONG,
+            100.0, stop, target, 86, 1, '5m',
+            metadata={'sl_pct': .01, 'atr_value': 1.0, 'entry_model': 'armed_v6'},
+        )
+
+    orchestrator.router.evaluate = breakout_signal
+    result = asyncio.run(orchestrator.on_snapshot(snapshot('BTC', 100.0), 100, user_id='u1'))
+
+    assert result is None
+    assert not manager.positions
+    assert orchestrator.last_rejection == 'execution_rr_too_low'
+    rr_events = [d for e, _, d in audit.events if e == 'SIGNAL_REJECTED' and d.get('reason') == 'execution_rr_too_low']
+    assert rr_events
+    assert rr_events[-1]['execution_rr'] == pytest.approx(1.18, abs=0.001)
+    assert rr_events[-1]['minimum_rr'] == pytest.approx(1.20)
+
+
+def test_liquidity_sweep_keeps_global_execution_rr_floor():
+    """The breakout hardening must not silently tighten LIQUIDITY_SWEEP."""
+    execution = PaperExecutionEngine(initial_equity=100)
+    orchestrator, manager, _, _, _ = build_orchestrator(execution, mode='demo')
+    executable = 100.0 * 1.0001 * (1 + execution.slippage_bps / 10_000)
+    stop = 99.0
+    target = executable + 1.18 * (executable - stop)
+
+    def sweep_signal(*args, **kwargs):
+        return TradeIntent(
+            'd-sweep-rr', 'BTC', Strategy.LIQUIDITY_SWEEP, Direction.LONG,
+            100.0, stop, target, 86, 1, '5m',
+            metadata={'sl_pct': .01, 'atr_value': 1.0},
+        )
+
+    orchestrator.router.evaluate = sweep_signal
+    result = asyncio.run(orchestrator.on_snapshot(snapshot('BTC', 100.0), 100, user_id='u1'))
+
+    assert result and result['filled'] is True
+    assert len(manager.positions) == 1

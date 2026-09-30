@@ -1,0 +1,18 @@
+MODIFICADOS respecto al ZIP v6.18 recibido:
+.env.example
+app/strategy/armed_entry.py
+app/strategy/router.py
+tests/test_armed_entry_v6.py
+
+NUEVOS:
+app/strategy/prearm_policy.py
+tests/test_prearm_recovery_v620.py
+RECOVERY_V6_20.md
+ARCHIVOS_TOCADOS_V6_20.txt
+
+ELIMINADOS: ninguno.
+Frontend, autenticación, pagos, saldos, credenciales y dependencias: sin cambios.
+
+La modificación de tests existentes conserva los casos de política anterior
+bajo strict y verifica que no reaparezca el breakout consumido aunque recovery
+pueda detectar otra estructura de liquidez.

@@ -290,7 +290,8 @@ def test_v65_breakout_arm_window_allows_up_to_five_5m_retest_bars():
     assert armed_entry.BREAKOUT_ARM_MAX_RETEST_BARS == 5
 
 
-def test_v64_range_is_shadow_only_for_liquidity_sweep():
+def test_v64_range_is_shadow_only_for_liquidity_sweep(monkeypatch):
+    monkeypatch.setenv("TRADE_PREARM_PROFILE", "strict")
     engine = ArmedEntryEngine(ttl_seconds=600)
     range_regime = SimpleNamespace(
         hard_block=False, sweep_allowed=False, breakout_allowed=False,
@@ -1355,7 +1356,8 @@ def test_v612_trigger_target_rebase_is_directionally_symmetric_for_short(monkeyp
 # v6.14 root bottleneck fix: adaptive wick penetration + terminal watch tombstone
 # ---------------------------------------------------------------------------
 
-def test_v614_strong_trend_uses_half_atr_wick_ceiling_but_standard_stays_030():
+def test_v614_strong_trend_uses_half_atr_wick_ceiling_but_standard_stays_030(monkeypatch):
+    monkeypatch.setenv("TRADE_PREARM_PROFILE", "strict")
     from app.strategy.armed_entry import _adaptive_retest_penetration_limit
 
     strong, strong_diag = _adaptive_retest_penetration_limit(
@@ -1458,7 +1460,8 @@ def test_v614_terminal_watch_tombstone_blocks_same_breakout_from_respawning():
     engine.consume_watch(watch, "retest_too_deep")
 
     repeated = engine.discover_watch(regime, snapshot, "BR", "5m", meta)
-    assert repeated is None
+    # Recovery may watch a distinct liquidity precursor, never the consumed breakout.
+    assert repeated is None or (repeated.watch_id != watch.watch_id and repeated.strategy == Strategy.LIQUIDITY_SWEEP)
     assert engine.watch_trace["breakout"]["reason"] == "watch_consumed_waiting_new_structure"
     assert engine.watch_trace["breakout"]["watch_id"] == watch.watch_id
     record = engine.consumed_watch_record(watch.watch_id)

@@ -61,6 +61,7 @@ class UserTradingRuntimeManager:
         self.signal_factory = SignalFactory()
         self.notifier = TelegramTradeNotifier(settings, db, AuthService(db), audit=audit)
         self._runtimes: dict[str, UserRuntime] = {}
+        self.execution_quote_provider = None
         self.entry_guard = None
         self._last_refresh = 0.0
         self._lock = asyncio.Lock()
@@ -212,6 +213,7 @@ class UserTradingRuntimeManager:
             position_manager,
             self.signal_factory,
             execution_mode=mode,
+            execution_quote_provider=self.execution_quote_provider,
             on_position_opened=lambda position: self.notifier.position_opened(user_id, mode, position),
             on_position_closed=lambda position: self.notifier.position_closed(user_id, mode, position),
             persistence=TradePersistence(

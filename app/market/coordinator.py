@@ -285,19 +285,31 @@ class MultiMarketCoordinator:
             try:
                 symbols = sorted(set(symbols_provider()))
                 if symbols:
-                    snaps = await asyncio.gather(
-                        *(base.armed_snapshot(symbol) for symbol in symbols),
-                        return_exceptions=True,
-                    )
-                    for symbol, snap in zip(symbols, snaps):
-                        if isinstance(snap, Exception):
-                            if self.audit:
-                                self.audit.event(
-                                    'MARKET_SNAPSHOT_ERROR', 'system', symbol=symbol,
-                                    error=f'armed_monitor:{type(snap).__name__}:{snap}',
-                                )
-                            continue
-                        await on_snapshot(snap)
+                    async def fetch(symbol):
+                        try:
+                            return symbol, await base.armed_snapshot(symbol)
+                        except Exception as exc:
+                            return symbol, exc
+
+                    # Deliver completed symbols immediately: one slow kline request
+                    # must not age every other symbol's executable quote in a gather.
+                    tasks = [asyncio.create_task(fetch(symbol)) for symbol in symbols]
+                    try:
+                        for completed in asyncio.as_completed(tasks):
+                            symbol, snap = await completed
+                            if isinstance(snap, Exception):
+                                if self.audit:
+                                    self.audit.event(
+                                        'MARKET_SNAPSHOT_ERROR', 'system', symbol=symbol,
+                                        error=f'armed_monitor:{type(snap).__name__}:{snap}',
+                                    )
+                                continue
+                            await on_snapshot(snap)
+                    finally:
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
             except Exception as exc:
                 if self.audit:
                     self.audit.event('MARKET_LOOP_ERROR', 'system', error=str(exc), symbol='ARMED_MONITOR')

@@ -697,7 +697,8 @@ def test_v66_breakout_uses_regime_trend_as_direction_authority_when_mtf_bias_is_
     assert watch.direction == Direction.LONG
 
 
-def test_v66_liquidity_precursor_watches_then_arms_only_with_trend_aligned_reclaim():
+def test_v66_liquidity_precursor_watches_then_arms_only_with_trend_aligned_reclaim(monkeypatch):
+    monkeypatch.setenv("TRADE_PREARM_PROFILE", "strict")
     engine = ArmedEntryEngine(ttl_seconds=600, watch_ttl_seconds=1800)
     regime = SimpleNamespace(
         hard_block=False, sweep_allowed=False, breakout_allowed=True,
@@ -751,7 +752,8 @@ def test_v615_liquidity_sweep_rejects_falling_knife_after_reclaim():
     }
 
 
-def test_v615_direct_sweep_discovery_requires_post_sweep_5m_continuation():
+def test_v615_direct_sweep_discovery_requires_post_sweep_5m_continuation(monkeypatch):
+    monkeypatch.setenv("TRADE_PREARM_PROFILE", "strict")
     engine = ArmedEntryEngine(ttl_seconds=600)
     regime = _sweep_regime()
     meta = _sweep_meta()

@@ -1,0 +1,21 @@
+BASE: v6.20-prearm-recovery de esta conversación.
+
+MODIFICADOS — 5:
+app/main.py
+app/orchestrator.py
+app/trading/runtime.py
+app/market/coordinator.py
+app/logging/logger.py
+
+NUEVOS — 3:
+tests/test_execution_quote_refresh_v621.py
+FIX_V6_21.md
+ARCHIVOS_TOCADOS_V6_21.txt
+
+ELIMINADOS: ninguno.
+Variables nuevas: ninguna.
+Frontend y dependencias: sin cambios.
+Estrategias/filtros: conserva v6.20 sin más relajación.
+
+Para producción actualizar los CINCO archivos juntos.
+Si vienes de v6.18, aplicar también ARCHIVOS_TOCADOS_V6_20.txt.

@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 from app.models.market import Candle
+from app.coinw.websocket import CoinWWebSocket
 
 TF_MS = {'1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000}
 
@@ -243,7 +244,9 @@ class MarketCoordinator:
 
 class MultiMarketCoordinator:
     def __init__(self, client, scanner, poll_seconds=2.0, audit=None, max_parallel=5,
-                 heartbeat_seconds=900.0, armed_poll_seconds=None, watching_poll_seconds=15.0):
+                 heartbeat_seconds=900.0, armed_poll_seconds=None, watching_poll_seconds=15.0,
+                 ws_url='wss://ws.futurescw.com/perpum', realtime_exit_ws_enabled=True,
+                 realtime_exit_reconnect_seconds=1.0, ws_factory=CoinWWebSocket):
         self.client = client
         self.scanner = scanner
         self.poll_seconds = poll_seconds
@@ -252,6 +255,10 @@ class MultiMarketCoordinator:
         self.heartbeat_seconds = heartbeat_seconds
         self.armed_poll_seconds = float(armed_poll_seconds if armed_poll_seconds is not None else poll_seconds)
         self.watching_poll_seconds = float(watching_poll_seconds)
+        self.ws_url = str(ws_url)
+        self.realtime_exit_ws_enabled = bool(realtime_exit_ws_enabled)
+        self.realtime_exit_reconnect_seconds = max(0.25, float(realtime_exit_reconnect_seconds))
+        self.ws_factory = ws_factory
         self._btc = None
         self._cursor = 0
         self._last_heartbeat = 0.0
@@ -276,6 +283,81 @@ class MultiMarketCoordinator:
                 if self.audit:
                     self.audit.event('MARKET_LOOP_ERROR', 'system', error=str(exc), symbol='MONITOR')
             await asyncio.sleep(self.poll_seconds)
+
+    async def monitor_realtime_exits(self, on_quote, symbols_provider):
+        """Stream executable bid/ask for DEMO TP/SL; REST monitor remains fallback.
+
+        Open risk must not depend on the 2-second REST cadence.  The websocket
+        connection subscribes only to symbols with locally-managed exits and is
+        rebuilt whenever that set changes.  A two-sided depth quote is required;
+        malformed/partial payloads are ignored rather than guessed.
+        """
+        if not self.realtime_exit_ws_enabled:
+            if self.audit:
+                self.audit.event('REALTIME_EXIT_MONITOR_DISABLED', 'system')
+            while True:
+                await asyncio.sleep(60.0)
+
+        feed = self.ws_factory(url=self.ws_url, audit=self.audit)
+        while True:
+            symbols = sorted(set(symbols_provider()))
+            if not symbols:
+                await asyncio.sleep(0.25)
+                continue
+
+            symbol_map = {feed._base(symbol): symbol for symbol in symbols}
+            expected = frozenset(symbols)
+            ws = None
+            try:
+                ws = await feed.connect()
+                await feed.subscribe(ws, symbols, ('depth',))
+                if self.audit:
+                    self.audit.event(
+                        'REALTIME_EXIT_MONITOR_CONNECTED', 'system',
+                        symbols=symbols, source='coinw_websocket',
+                    )
+
+                while True:
+                    # Rebuild subscriptions as soon as an open position appears or
+                    # disappears. A 1s idle timeout is only for subscription
+                    # bookkeeping; market exits are processed on every WS message.
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if frozenset(symbols_provider()) != expected:
+                            break
+                        continue
+
+                    quote = feed.parse_depth_quote(
+                        raw, symbol_map=symbol_map, received_ms=int(time.time() * 1000),
+                    )
+                    if quote is not None:
+                        await on_quote(SimpleNamespace(
+                            symbol=quote.symbol, timeframe='tick', candles=[], timeframes={},
+                            bid=quote.bid, ask=quote.ask, bids=quote.bids, asks=quote.asks,
+                            last=(quote.bid + quote.ask) / 2.0,
+                            quote_received_ms=quote.received_ms,
+                            exchange_ts_ms=quote.exchange_ts_ms, orderbook_valid=True,
+                            data_complete=False, monitor_only=True, realtime_exit_monitor=True,
+                            quote_source='websocket',
+                        ))
+                    if frozenset(symbols_provider()) != expected:
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self.audit:
+                    self.audit.event(
+                        'REALTIME_EXIT_MONITOR_ERROR', 'system', level='WARNING',
+                        symbols=symbols, error=f'{type(exc).__name__}: {exc}',
+                    )
+            finally:
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+            await asyncio.sleep(self.realtime_exit_reconnect_seconds)
 
     async def monitor_armed(self, on_snapshot, symbols_provider):
         """Prioritise ARMED symbols independently from the discovery rotation."""

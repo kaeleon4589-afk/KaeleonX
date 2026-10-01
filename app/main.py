@@ -46,6 +46,9 @@ async def run():
         max_parallel=s.market_scanner_parallel, heartbeat_seconds=s.engine_heartbeat_seconds,
         armed_poll_seconds=s.trade_armed_monitor_poll_seconds,
         watching_poll_seconds=s.trade_setup_watch_poll_seconds,
+        ws_url=s.coinw_ws_url,
+        realtime_exit_ws_enabled=s.trade_realtime_exit_ws_enabled,
+        realtime_exit_reconnect_seconds=s.trade_realtime_exit_reconnect_seconds,
     )
 
     lease = WorkerLease(db)
@@ -63,6 +66,10 @@ async def run():
             group.create_task(lease.run())
             group.create_task(market.run(on_snapshot))
             group.create_task(market.monitor(on_snapshot, runtimes.tracked_symbols))
+            if s.trade_realtime_exit_ws_enabled:
+                group.create_task(market.monitor_realtime_exits(
+                    runtimes.run_exit_quote, runtimes.local_exit_symbols,
+                ))
             group.create_task(market.monitor_armed(on_snapshot, runtimes.armed_symbols))
             group.create_task(market.monitor_watching(on_snapshot, runtimes.watching_symbols))
             group.create_task(runtimes.notifier.run())

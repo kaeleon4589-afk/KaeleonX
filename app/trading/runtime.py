@@ -469,6 +469,16 @@ class UserTradingRuntimeManager:
                        for runtime in self._runtimes.values() if runtime.orchestrator.pending_execution)
         return symbols
 
+    def local_exit_symbols(self):
+        """DEMO symbols whose TP/SL is managed locally by KAELEON."""
+        return {
+            p.symbol
+            for runtime in self._runtimes.values()
+            if runtime.position_manager.evaluate_local_exits
+            for p in runtime.position_manager.positions.values()
+            if p.status == 'OPEN'
+        }
+
     def armed_symbols(self):
         """Symbols with an already-approved ARMED setup that need priority monitoring."""
         now_ms = int(time.time() * 1000)
@@ -488,6 +498,46 @@ class UserTradingRuntimeManager:
             for symbol, watch in runtime.orchestrator.watching_setups.items()
             if int(getattr(watch, "expires_at_ms", 0) or 0) > now_ms
         }
+
+    async def run_exit_quote(self, snapshot) -> None:
+        """Fast path for websocket exit quotes.
+
+        This deliberately bypasses regime/strategy/equity work on every depth tick.
+        It only marks locally-managed DEMO positions and persists dashboard state
+        when the quote actually changes terminal/protection state.
+        """
+        async with self._processing_lock:
+            now_ms = int(time.time() * 1000)
+            for runtime in list(self._runtimes.values()):
+                manager = runtime.position_manager
+                if not manager.evaluate_local_exits:
+                    continue
+                if not any(p.status == 'OPEN' and p.symbol == snapshot.symbol
+                           for p in manager.positions.values()):
+                    continue
+                manager.mark(
+                    snapshot.symbol, getattr(snapshot, 'last', None), now_ms,
+                    bid=getattr(snapshot, 'bid', None), ask=getattr(snapshot, 'ask', None),
+                    quote_received_ms=getattr(snapshot, 'quote_received_ms', None),
+                    quote_source=getattr(snapshot, 'quote_source', 'websocket'),
+                )
+                state_changed = manager.consume_state_changed()
+                if not state_changed:
+                    continue
+
+                available_equity = await runtime.execution.get_equity()
+                effective_capital = min(runtime.configured_capital, max(0.0, float(available_equity)))
+                if any(p.status == 'OPEN' for p in manager.positions.values()):
+                    status = 'OPERANDO'
+                elif runtime.orchestrator.pending_execution:
+                    status = 'CONFIRMANDO_ORDEN'
+                elif effective_capital < self.settings.min_operating_capital:
+                    status = 'INSUFFICIENT_CAPITAL'
+                else:
+                    status = 'ACTIVO' if runtime.trading_enabled else 'PAUSADO'
+                await self._persist_state(
+                    runtime, float(available_equity), effective_capital, status, snapshot, force=True,
+                )
 
     async def run_snapshot(self, snapshot) -> None:
         async with self._processing_lock:

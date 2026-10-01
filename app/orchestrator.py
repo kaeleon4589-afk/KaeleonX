@@ -9,8 +9,7 @@ from uuid import uuid4
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 
-from app.models.enums import Direction, Strategy
-from app.strategy import breakout_retest as breakout
+from app.models.enums import Direction
 from app.models.trading import Position
 from app.position.protection import apply_intent_management
 from app.trading.persistence import TradePersistence
@@ -673,6 +672,7 @@ class TradingOrchestrator:
                 bid=getattr(snapshot, "bid", None),
                 ask=getattr(snapshot, "ask", None),
                 quote_received_ms=getattr(snapshot, "quote_received_ms", None),
+                quote_source=getattr(snapshot, "quote_source", "rest"),
             )
             if protection_changes and hasattr(self.execution, 'ensure_protection'):
                 for position in protection_changes:
@@ -1352,10 +1352,6 @@ class TradingOrchestrator:
             # signal or invalidated the confirmation, wait for a fresh setup instead
             # of buying/selling the exhausted move.
             metadata = getattr(intent, 'metadata', {}) or {}
-            armed_breakout = (
-                intent.strategy == Strategy.BREAKOUT_RETEST
-                and metadata.get("entry_model") == "armed_v6"
-            )
             try:
                 atr_value = float(metadata.get('atr_value') or 0.0)
             except (TypeError, ValueError):
@@ -1418,21 +1414,8 @@ class TradingOrchestrator:
                     spread_abs = max(0.0, float(snapshot.ask) - float(snapshot.bid))
                 except (TypeError, ValueError):
                     pass
-                minimum_stop_atr = self.entry_min_stop_atr
-                if armed_breakout:
-                    micro = metadata.get("micro_confirmation") or {}
-                    adaptive_confirmation = (
-                        isinstance(micro, dict)
-                        and micro.get("confirmation_mode") == "postarm_closed_1m_strong_shape"
-                    )
-                    breakout_floor = (
-                        breakout.ARMED_ADAPTIVE_MIN_STOP_ATR_5M
-                        if adaptive_confirmation
-                        else breakout.ARMED_MIN_STOP_ATR_5M
-                    )
-                    minimum_stop_atr = max(minimum_stop_atr, breakout_floor)
                 minimum_stop_distance = max(
-                    atr_value * minimum_stop_atr,
+                    atr_value * self.entry_min_stop_atr,
                     spread_abs * self.entry_min_stop_spreads,
                 )
                 if minimum_stop_distance > 0 and risk_distance < minimum_stop_distance:
@@ -1448,7 +1431,7 @@ class TradingOrchestrator:
                         reason='stop_inside_market_noise', entry_price=entry, stop_price=stop,
                         stop_distance=risk_distance, minimum_stop_distance=minimum_stop_distance,
                         stop_atr=round(risk_distance / atr_value, 4),
-                        minimum_stop_atr=minimum_stop_atr, spread_abs=spread_abs,
+                        minimum_stop_atr=self.entry_min_stop_atr, spread_abs=spread_abs,
                     )
                     self._terminal_lifecycle(
                         user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
@@ -1549,12 +1532,7 @@ class TradingOrchestrator:
                     )
                     return None
 
-            minimum_execution_rr = (
-                max(MIN_EXECUTION_RR, breakout.ARMED_MIN_EXECUTION_RR)
-                if armed_breakout
-                else MIN_EXECUTION_RR
-            )
-            if execution_rr < minimum_execution_rr:
+            if execution_rr < MIN_EXECUTION_RR:
                 self.last_decision[key] = now
                 self.last_rejection = 'execution_rr_too_low'
                 self.audit.event(
@@ -1566,7 +1544,7 @@ class TradingOrchestrator:
                     direction=getattr(intent.direction, "value", str(intent.direction)),
                     reason='execution_rr_too_low', entry_price=entry,
                     stop_price=stop, target_price=target,
-                    execution_rr=round(execution_rr, 4), minimum_rr=minimum_execution_rr,
+                    execution_rr=round(execution_rr, 4), minimum_rr=MIN_EXECUTION_RR,
                 )
                 self._terminal_lifecycle(
                     user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,

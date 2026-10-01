@@ -22,10 +22,9 @@ class Settings(BaseSettings):
     paper_slippage_bps: float = Field(2.0, ge=0)
     paper_max_spread_bps: float = Field(30.0, ge=0)
     trade_target_front_run_ratio: float = Field(0.92, ge=0.80, le=1.0)
-    # Evaluation profile: keep TP close to the original stop distance so win rate
-    # can be measured without depending on rare multi-R extensions.
-    trade_liquidity_sweep_target_rr: float = Field(1.30, ge=1.05, le=1.50)
-    trade_breakout_retest_target_rr: float = Field(1.50, ge=1.05, le=1.80)
+    # V2 strategy TP levels are structure/strength-derived. There is deliberately
+    # no server-side BREAKOUT/SWEEP target-RR setting: RR is measured after the
+    # natural target is selected and is used only as an edge/geometry check.
     # Disabled during strategy-validation phase: keep the original SL untouched
     # so every trade resolves naturally at its initial SL or TP.
     trade_dynamic_protection_enabled: bool = False

@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     trade_setup_watch_ttl_seconds: float = Field(1800.0, ge=300.0, le=3600.0)
     trade_funnel_emit_seconds: float = Field(300.0, ge=30.0, le=3600.0)
     trade_funnel_emit_every: int = Field(50, ge=5, le=1000)
+    # DEMO TP/SL uses the public CoinW depth websocket as its primary exit feed.
+    # The existing REST position monitor remains active as a fallback.
+    trade_realtime_exit_ws_enabled: bool = True
+    trade_realtime_exit_reconnect_seconds: float = Field(1.0, ge=0.25, le=30.0)
     market_poll_seconds: float = Field(2.0, gt=0)
     market_scanner_depth: int = Field(30, ge=1, le=50)
     market_scanner_parallel: int = Field(5, ge=1, le=10)

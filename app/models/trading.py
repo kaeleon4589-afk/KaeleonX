@@ -53,4 +53,5 @@ class Position:
     exit_trigger_price:float|None=None
     stop_gap_bps:float|None=None
     exit_quote_delay_ms:int|None=None
+    exit_quote_source:str|None=None
     opened_at:int|None=None; closed_at:int|None=None; exit_price:float|None=None; exit_reason:str|None=None

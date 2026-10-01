@@ -725,7 +725,7 @@ class ArmedEntryEngine:
                 last_near = abs(float(c[i]) - structural_level) <= atr5 * max(breakout.RETEST_MAX_CLOSE_DISTANCE_ATR, 0.34)
                 pullback = max(0.0, float(c[breakout_idx]) - extreme) / atr5
                 trigger = max(structural_level + atr5 * 0.04, float(c[i]) + atr5 * 0.02)
-                stop = extreme - atr5 * breakout.ARMED_STOP_BUFFER_ATR
+                stop = extreme - atr5 * breakout.MTF_SL_BUFFER_ATR
                 entry_zone_low = trigger
                 entry_zone_high = structural_level + atr5 * BREAKOUT_ENTRY_MAX_EXTENSION_ATR
                 direction = Direction.LONG
@@ -737,7 +737,7 @@ class ArmedEntryEngine:
                 last_near = abs(float(c[i]) - structural_level) <= atr5 * max(breakout.RETEST_MAX_CLOSE_DISTANCE_ATR, 0.34)
                 pullback = max(0.0, extreme - float(c[breakout_idx])) / atr5
                 trigger = min(structural_level - atr5 * 0.04, float(c[i]) - atr5 * 0.02)
-                stop = extreme + atr5 * breakout.ARMED_STOP_BUFFER_ATR
+                stop = extreme + atr5 * breakout.MTF_SL_BUFFER_ATR
                 entry_zone_low = structural_level - atr5 * BREAKOUT_ENTRY_MAX_EXTENSION_ATR
                 entry_zone_high = trigger
                 direction = Direction.SHORT
@@ -759,7 +759,7 @@ class ArmedEntryEngine:
             if not (touch and no_deep and closes_valid and last_near) or pullback < required_pullback:
                 continue
             stop_atr = abs(trigger - stop) / atr5
-            if not breakout.ARMED_MIN_STOP_ATR_5M <= stop_atr <= ARM_MAX_STOP_ATR:
+            if not ARM_MIN_STOP_ATR <= stop_atr <= ARM_MAX_STOP_ATR:
                 continue
 
             structural_target = breakout._structure_target(direction, trigger, h, l, tf15["h"], tf15["l"])
@@ -816,8 +816,6 @@ class ArmedEntryEngine:
                     "target_rr_capped": bool(target_capped),
                     "structural_rr_estimate": float(rr),
                     "stop_atr_5m": float(stop_atr),
-                    "armed_stop_buffer_atr": float(breakout.ARMED_STOP_BUFFER_ATR),
-                    "armed_min_stop_atr_5m": float(breakout.ARMED_MIN_STOP_ATR_5M),
                     "regime": self._active_regime(regime_metadata),
                     "trend_revalidation_required": True,
                     "trend_direction_at_arm": direction.value,
@@ -1374,7 +1372,7 @@ class ArmedEntryEngine:
                     "max_close_distance_atr": max_close_distance, **guard_diag,
                 }
             trigger = max(structural_level + atr5 * 0.04, float(c[i]) + atr5 * 0.02)
-            stop = extreme - atr5 * breakout.ARMED_STOP_BUFFER_ATR
+            stop = extreme - atr5 * breakout.MTF_SL_BUFFER_ATR
             entry_zone_low = trigger
             entry_zone_high = structural_level + atr5 * BREAKOUT_ENTRY_MAX_EXTENSION_ATR
         else:
@@ -1418,17 +1416,15 @@ class ArmedEntryEngine:
                     "max_close_distance_atr": max_close_distance, **guard_diag,
                 }
             trigger = min(structural_level - atr5 * 0.04, float(c[i]) - atr5 * 0.02)
-            stop = extreme + atr5 * breakout.ARMED_STOP_BUFFER_ATR
+            stop = extreme + atr5 * breakout.MTF_SL_BUFFER_ATR
             entry_zone_low = structural_level - atr5 * BREAKOUT_ENTRY_MAX_EXTENSION_ATR
             entry_zone_high = trigger
 
         stop_atr = abs(trigger - stop) / atr5
-        if stop_atr < breakout.ARMED_MIN_STOP_ATR_5M:
+        if stop_atr < ARM_MIN_STOP_ATR:
             return "pending", None, {
                 "reason": "retest_stop_too_tight", "watch_id": watch.watch_id,
-                "stop_atr": stop_atr,
-                "min_stop_atr": breakout.ARMED_MIN_STOP_ATR_5M,
-                **guard_diag,
+                "stop_atr": stop_atr, "min_stop_atr": ARM_MIN_STOP_ATR, **guard_diag,
             }
         if stop_atr > ARM_MAX_STOP_ATR:
             return "cancelled", None, {
@@ -1487,10 +1483,7 @@ class ArmedEntryEngine:
                 "structural_target_price": float(structural_target),
                 "target_front_run_ratio": float(target_ratio), "target_rr_cap": float(target_rr_cap),
                 "target_rr_capped": bool(target_capped), "structural_rr_estimate": float(rr),
-                "stop_atr_5m": float(stop_atr),
-                "armed_stop_buffer_atr": float(breakout.ARMED_STOP_BUFFER_ATR),
-                "armed_min_stop_atr_5m": float(breakout.ARMED_MIN_STOP_ATR_5M),
-                "regime": str((watch.metadata or {}).get("active_regime") or "TREND_CONTINUATION"),
+                "stop_atr_5m": float(stop_atr), "regime": str((watch.metadata or {}).get("active_regime") or "TREND_CONTINUATION"),
                 "trend_revalidation_required": True, "trend_direction_at_arm": watch.direction.value,
                 "trend_revalidation_guard_version": 2,
                 "lifecycle_id": lifecycle_id,
@@ -1503,9 +1496,6 @@ class ArmedEntryEngine:
         return "armed", setup, {
             "reason": "retest_complete", "watch_id": watch.watch_id, "lifecycle_id": lifecycle_id,
             "quality": score, "bars_since_breakout": bars_since, "structural_rr_estimate": rr,
-            "stop_atr_5m": float(stop_atr),
-            "stop_buffer_atr": float(breakout.ARMED_STOP_BUFFER_ATR),
-            "min_stop_atr_5m": float(breakout.ARMED_MIN_STOP_ATR_5M),
             "retest_pullback_atr": float(pullback), **pullback_rule_diag,
             **penetration_rule_diag, **guard_diag,
         }
@@ -1896,35 +1886,6 @@ class ArmedEntryEngine:
             return "pending", None, {"reason": reason, **diag}
         executable = float(diag["price"])
         stop = float(setup.stop_price)
-
-        # Breakout/retest has its own volatility floor. The generic ARMED floor is
-        # intentionally looser because LIQUIDITY_SWEEP uses a different geometry.
-        # Adaptive 1m confirmation gets a slightly stricter floor because it is
-        # allowed to confirm on lower relative volume than the standard path.
-        if setup.strategy == Strategy.BREAKOUT_RETEST:
-            try:
-                atr_value = float(setup.metadata.get("atr_value") or 0.0)
-            except (TypeError, ValueError):
-                atr_value = 0.0
-            if math.isfinite(atr_value) and atr_value > 0:
-                stop_atr_at_trigger = abs(executable - stop) / atr_value
-                adaptive_confirmation = (
-                    diag.get("confirmation_mode") == "postarm_closed_1m_strong_shape"
-                )
-                required_stop_atr = (
-                    breakout.ARMED_ADAPTIVE_MIN_STOP_ATR_5M
-                    if adaptive_confirmation
-                    else breakout.ARMED_MIN_STOP_ATR_5M
-                )
-                if stop_atr_at_trigger < required_stop_atr:
-                    return "pending", None, {
-                        "reason": "trigger_breakout_stop_too_tight",
-                        "stop_atr": stop_atr_at_trigger,
-                        "min_stop_atr": required_stop_atr,
-                        "adaptive_confirmation": adaptive_confirmation,
-                        **diag,
-                    }
-
         # Rebuild the executable TP from the original structural objective using
         # the *actual* entry quote. The setup target was calculated at arm time;
         # reusing that stale capped TP after price moves toward it artificially
@@ -1956,12 +1917,7 @@ class ArmedEntryEngine:
                 **diag,
             }
         rr = abs(target - executable) / max(abs(executable - stop), 1e-12)
-        min_trigger_rr = (
-            breakout.ARMED_MIN_EXECUTION_RR
-            if setup.strategy == Strategy.BREAKOUT_RETEST
-            else ARM_MIN_RR
-        )
-        if rr < min_trigger_rr:
+        if rr < ARM_MIN_RR:
             # Low RR caused by the current quote is not structural invalidation.
             # Keep the ARMED setup alive: a small retrace can restore acceptable
             # RR while the stop, structure and TTL remain valid. Permanent
@@ -1969,7 +1925,7 @@ class ArmedEntryEngine:
             return "pending", None, {
                 "reason": "trigger_rr_temporarily_low",
                 "execution_rr": rr,
-                "min_rr": min_trigger_rr,
+                "min_rr": ARM_MIN_RR,
                 "structural_target_price": structural_target,
                 "rebased_target_price": target,
                 "target_rr_cap": target_rr_cap,

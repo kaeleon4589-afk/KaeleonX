@@ -53,15 +53,6 @@ HTF_RANGE_EDGE = 0.92
 H1_MAX_EMA20_EXTENSION_ATR = 1.65
 M15_MAX_EMA20_EXTENSION_ATR = 1.80
 MTF_SL_BUFFER_ATR = 0.10
-# Stateful ARMED execution needs more room than the legacy immediate-entry path.
-# Keep the structural retest extreme as the invalidation anchor, but add a wider
-# volatility buffer so the stop is not placed inside ordinary 5m noise.
-ARMED_STOP_BUFFER_ATR = 0.25
-ARMED_MIN_STOP_ATR_5M = 0.40
-ARMED_ADAPTIVE_MIN_STOP_ATR_5M = 0.55
-# Recheck RR after executable bid/ask and DEMO slippage. Breakout/retest uses a
-# stricter floor than the global cross-strategy safety net.
-ARMED_MIN_EXECUTION_RR = 1.20
 MIN_SIGNAL_STOP_ATR_5M = 0.95
 MIN_RR_TO_SIGNAL = 1.05
 MIN_SCORE_TO_SIGNAL = 78.0

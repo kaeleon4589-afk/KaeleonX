@@ -177,13 +177,15 @@ class PositionManager:
             )
         return True
 
-    def mark(self, symbol, price, timestamp, bid=None, ask=None, quote_received_ms=None):
+    def mark(self, symbol, price, timestamp, bid=None, ask=None, quote_received_ms=None,
+             quote_source=None):
         protection_changes = []
+        raw_price = price
         for p in list(self.positions.values()):
             if p.symbol != symbol or p.status != "OPEN":
                 continue
             mark_price = (bid if p.direction == Direction.LONG else ask)
-            mark_price = price if mark_price is None else mark_price
+            mark_price = raw_price if mark_price is None else mark_price
             if not math.isfinite(float(mark_price)) or float(mark_price) <= 0:
                 continue
             price = float(mark_price)
@@ -199,10 +201,25 @@ class PositionManager:
                     observed = (quote_received_ms if isinstance(quote_received_ms, (int, float))
                                 and 0 < quote_received_ms <= timestamp else timestamp)
                     p.exit_quote_delay_ms = max(0, int(timestamp - observed))
-                    self.close_or_reduce(p, action, price, int(observed))
+                    p.exit_quote_source = str(quote_source or 'market_snapshot')
+                    if self.audit:
+                        self.audit.event(
+                            'EXIT_TRIGGER_OBSERVED', p.decision_id,
+                            user_id=self.owner_user_id, mode=self.owner_mode,
+                            position_id=p.position_id, symbol=p.symbol,
+                            direction=getattr(p.direction, 'value', str(p.direction)),
+                            action=action, executable_price=price,
+                            bid=bid, ask=ask, last=raw_price,
+                            stop_price=p.stop_price, target_price=p.target_price,
+                            quote_source=p.exit_quote_source,
+                            quote_received_ms=int(observed),
+                            quote_delay_ms=p.exit_quote_delay_ms,
+                        )
+                    self.close_or_reduce(p, action, price, int(observed),
+                                         quote_source=p.exit_quote_source)
                     continue
-            # A mark can arrive every couple of seconds. Persist at a bounded
-            # cadence instead of turning Mongo into a per-tick event stream.
+            # Realtime websocket marks may arrive many times per second. Persist
+            # at a bounded cadence instead of turning Mongo into a per-tick stream.
             self._persist(p, force=False)
         return protection_changes
 
@@ -373,8 +390,10 @@ class PositionManager:
 
         return changes
 
-    def close_or_reduce(self, p, action, price, timestamp):
+    def close_or_reduce(self, p, action, price, timestamp, quote_source=None):
         trigger_price = price
+        if quote_source is not None:
+            p.exit_quote_source = str(quote_source)
         if self.evaluate_local_exits:
             slip = self.exit_slippage_bps / 10000
             price *= (1 - slip) if p.direction == Direction.LONG else (1 + slip)
@@ -424,6 +443,7 @@ class PositionManager:
                     realized_pnl=p.realized_pnl, gross_pnl=gross,
                     strategy=getattr(p, "strategy", None),
                     execution_rr=getattr(p, "execution_rr", None),
+                    quote_source=getattr(p, "exit_quote_source", None),
                     source="local_exit",
                 )
             self._call_callback(self.on_closed, p, "POSITION_CLOSE_CALLBACK_ERROR")

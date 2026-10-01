@@ -1,0 +1,80 @@
+KAELEON — ENGINE V2
+===================
+
+ARCHIVOS MODIFICADOS
+--------------------
+1. .env.example
+   - Añade parámetros del clasificador de régimen V2, Breakout/Retest V2,
+     Liquidity Sweep V2 y confirmación microestructural.
+
+2. app/regime/regime_engine.py
+   - Cambia el motor de régimen de producción al nuevo RegimeEngineV2.
+
+3. app/strategy/router.py
+   - Enruta TREND -> BREAKOUT_RETEST_V2.
+   - Enruta RANGE -> LIQUIDITY_SWEEP_V2.
+   - SHOCK/DEAD/TRANSITION -> NO_TRADE.
+   - Mantiene compatibilidad controlada con contextos legacy únicamente.
+   - Bloquea setups legacy persistidos que no fueron creados en un contexto de compatibilidad explícito.
+
+ARCHIVOS NUEVOS
+---------------
+4. app/regime/v2.py
+   - Regime Engine V2: TREND / RANGE / SHOCK / DEAD / TRANSITION.
+   - Usa estructura multi-timeframe, ADX, efficiency, choppiness, ATR, volumen y spread.
+   - Evita clasificar como tendencia una simple alineación EMA sin comportamiento tendencial real.
+
+5. app/strategy/v2_common.py
+   - Utilidades compartidas del motor V2: geometría, ATR, tendencia, order-book imbalance,
+     stops, objetivos estructurales y StrategyCandidate.
+
+6. app/strategy/breakout_retest_v2.py
+   - Estrategia BREAKOUT_RETEST_V2 reescrita desde cero.
+   - Breakout cerrado 5m + alineación 15m/1h + retest + continuación + anti-chase.
+
+7. app/strategy/liquidity_sweep_v2.py
+   - Estrategia LIQUIDITY_SWEEP_V2 reescrita desde cero.
+   - RANGE + sweep de liquidez + reclaim + confirmación + mean reversion.
+   - No obliga al sweep a seguir la dirección de tendencia anterior.
+
+8. app/strategy/entry_engine_v2.py
+   - Nuevo ciclo WATCH -> ARMED -> TRIGGERED.
+   - Confirmación con vela cerrada 1m + order book.
+   - Tombstones para impedir dobles entradas del mismo setup.
+
+9. tests/test_strategy_engine_v2.py
+   - Pruebas específicas de las dos estrategias V2, micro-confirmación,
+     single-use y clasificación TREND/RANGE.
+
+10. KAELEON_ENGINE_V2.md
+    - Documento técnico del nuevo flujo de producción.
+
+11. ARCHIVOS_TOCADOS_ENGINE_V2.txt
+    - Este inventario.
+
+ARCHIVOS LEGACY CONSERVADOS COMO ROLLBACK
+-----------------------------------------
+- app/regime/advanced.py
+- app/strategy/breakout_retest.py
+- app/strategy/liquidity_sweep.py
+- app/strategy/armed_entry.py
+- app/strategy/prearm_policy.py
+
+No se eliminan todavía. El router de producción V2 no los usa salvo en el modo de
+compatibilidad explícita necesario para conservar contratos/tests de versiones previas.
+
+VERIFICACION REALIZADA
+----------------------
+- python -m compileall -q app : PASS
+- PYTHONPATH=tests:. pytest -q --disable-warnings tests : 304 passed
+
+NO MODIFICADO
+-------------
+- CoinW REST/WebSocket/executor
+- DEMO/LIVE execution
+- RiskManager
+- PositionManager
+- balances / usuarios
+- persistencia MongoDB
+- Telegram
+- frontend

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from hashlib import sha1
 import time
 
-from app.models.enums import Direction, Strategy
+from app.models.enums import Direction
 from app.models.trading import ArmedSetup, SetupWatch, TradeIntent
 from app.position.protection import (
     break_even_activation_ratio,
@@ -14,8 +13,7 @@ from app.position.protection import (
     profit_lock_capture_ratio,
 )
 from app.strategy.v2_common import (
-    StrategyCandidate, env_float, executable_price, orderbook_imbalance,
-    target_from_structure,
+    StrategyCandidate, dynamic_min_rr, env_float, executable_price, orderbook_imbalance,
 )
 
 
@@ -269,12 +267,51 @@ class EntryLifecycleV2:
             self.consume(setup, "trigger_invalid_stop_geometry", now_ms)
             return "cancelled", None, {"reason": "trigger_invalid_stop_geometry", "price": price, "stop": stop}
 
+        # The strategy already locked an absolute, structure-derived target when
+        # the setup was armed. Triggering must never rebuild TP from RR or move it
+        # farther away just because the executable quote changed.
         structural_target = float(meta.get("structural_target_price") or setup.target_price)
-        target_rr = float(meta.get("target_rr_cap") or (1.50 if setup.strategy == Strategy.BREAKOUT_RETEST else 1.30))
-        target_info = target_from_structure(price, stop, structural_target, setup.direction, target_rr=target_rr)
-        if target_info is None:
-            return "pending", None, {"reason": "trigger_rr_temporarily_low", "price": price, "stop": stop, "structural_target": structural_target}
-        target, rr = target_info
+        target = float(setup.target_price)
+        if target <= 0:
+            self.consume(setup, "trigger_invalid_target_geometry", now_ms)
+            return "cancelled", None, {"reason": "trigger_invalid_target_geometry", "price": price, "target": target}
+        if setup.direction == Direction.LONG:
+            if target <= price:
+                self.consume(setup, "target_already_reached_before_entry", now_ms)
+                return "cancelled", None, {
+                    "reason": "target_already_reached_before_entry",
+                    "price": price,
+                    "target": target,
+                    "structural_target": structural_target,
+                }
+            reward = target - price
+        else:
+            if target >= price:
+                self.consume(setup, "target_already_reached_before_entry", now_ms)
+                return "cancelled", None, {
+                    "reason": "target_already_reached_before_entry",
+                    "price": price,
+                    "target": target,
+                    "structural_target": structural_target,
+                }
+            reward = price - target
+
+        risk = abs(price - stop)
+        rr = reward / max(risk, 1e-12)
+        min_rr = float(meta.get("minimum_viable_rr") or dynamic_min_rr(setup.strategy, setup.quality))
+        if rr < min_rr:
+            # Entry quote drift can temporarily destroy the original edge. Keep
+            # the structural target fixed and wait for a better executable price
+            # instead of stretching TP outward to restore a desired RR.
+            return "pending", None, {
+                "reason": "trigger_rr_temporarily_low",
+                "execution_rr": rr,
+                "minimum_viable_rr": min_rr,
+                "price": price,
+                "stop": stop,
+                "target": target,
+                "structural_target": structural_target,
+            }
 
         sl_pct = abs(price - stop) / price
         tp_pct = abs(target - price) / price
@@ -300,6 +337,8 @@ class EntryLifecycleV2:
             "tp_pct": tp_pct,
             "execution_rr": rr,
             "structural_target_price": structural_target,
+            "minimum_viable_rr": min_rr,
+            "target_locked_at_arm": True,
             "break_even_activation_ratio": break_even_activation_ratio(),
             "profit_lock_activation_ratio": profit_lock_activation_ratio(),
             "profit_lock_capture_ratio": profit_lock_capture_ratio(),

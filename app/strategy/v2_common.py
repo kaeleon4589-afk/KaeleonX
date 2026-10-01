@@ -170,28 +170,81 @@ def enforce_stop_distance(entry: float, raw_stop: float, atr_value: float, direc
 
 
 def target_from_structure(entry: float, stop: float, structural_target: float, direction: Direction,
-                          *, target_rr: float, min_rr: float = 1.05, front_run_ratio: float = 0.92) -> tuple[float, float] | None:
+                          *, min_rr: float = 0.0, front_run_ratio: float = 0.94) -> tuple[float, float] | None:
+    """Build an executable target from an actual market structure.
+
+    V2 deliberately does *not* manufacture TP from a fixed reward/risk multiple.
+    The caller must supply a real structural target (range value, internal
+    liquidity, HTF swing, measured/volatility objective, ...). RR is calculated
+    afterwards only as a viability metric.
+    """
     risk = abs(entry - stop)
-    if entry <= 0 or stop <= 0 or risk <= 1e-12:
+    if entry <= 0 or stop <= 0 or structural_target <= 0 or risk <= 1e-12:
         return None
+    ratio = clamp(front_run_ratio, 0.80, 1.0)
     if direction == Direction.LONG:
         if structural_target <= entry:
-            structural_target = entry + risk * target_rr
-        structural = entry + (structural_target - entry) * front_run_ratio
-        cap = entry + risk * target_rr
-        target = min(structural, cap)
+            return None
+        target = entry + (structural_target - entry) * ratio
         reward = target - entry
     else:
-        if structural_target >= entry or structural_target <= 0:
-            structural_target = entry - risk * target_rr
-        structural = entry - (entry - structural_target) * front_run_ratio
-        cap = entry - risk * target_rr
-        target = max(structural, cap)
+        if structural_target >= entry:
+            return None
+        target = entry - (entry - structural_target) * ratio
         reward = entry - target
     rr = reward / risk
-    if target <= 0 or rr < min_rr:
+    if target <= 0 or rr < max(0.0, float(min_rr)):
         return None
     return float(target), float(rr)
+
+
+def dynamic_min_rr(strategy: Strategy, quality: float) -> float:
+    """Return a soft viability floor without dictating the TP location.
+
+    Mean-reversion setups can rationally accept a smaller gross RR when their
+    structure/confirmation quality is high; continuation setups keep a slightly
+    higher floor. These values gate bad geometry, but never move the target.
+    """
+    q = clamp(float(quality), 0.0, 100.0)
+    if strategy == Strategy.LIQUIDITY_SWEEP:
+        # Mean reversion can be profitable below 1R when the hit rate/structure
+        # quality is high. This floor only rejects obviously poor geometry; it
+        # never moves the target farther away.
+        return clamp(0.82 - max(0.0, q - 68.0) * 0.004, 0.68, 0.82)
+    return clamp(1.10 - max(0.0, q - 68.0) * 0.006, 0.92, 1.10)
+
+
+def nearest_structural_target(entry: float, direction: Direction, candidates: list[tuple[float, str, float]]) -> tuple[float, str, float] | None:
+    """Pick the nearest meaningful barrier/objective in the trade direction.
+
+    Candidate tuples are ``(price, reason, front_run_ratio)``. Choosing the
+    nearest barrier is intentionally conservative: if that first obstacle does
+    not provide viable reward, the setup is rejected instead of pretending the
+    market can skip it to satisfy an arbitrary RR.
+    """
+    valid: list[tuple[float, str, float]] = []
+    for price, reason, ratio in candidates:
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value <= 0:
+            continue
+        if direction == Direction.LONG and value <= entry:
+            continue
+        if direction == Direction.SHORT and value >= entry:
+            continue
+        valid.append((value, str(reason), clamp(float(ratio), 0.80, 1.0)))
+    if not valid:
+        return None
+    valid.sort(key=lambda item: abs(item[0] - entry))
+    return valid[0]
+
+
+def range_fraction_target(level: float, opposite: float, fraction: float) -> float:
+    """Target a strategy-selected fraction of a range from the swept edge."""
+    f = clamp(float(fraction), 0.05, 0.95)
+    return float(level) + (float(opposite) - float(level)) * f
 
 
 def swing_barrier(candles: list, direction: Direction, entry: float, lookback: int = 80) -> float | None:

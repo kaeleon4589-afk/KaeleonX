@@ -500,31 +500,38 @@ class UserTradingRuntimeManager:
         }
 
     async def run_exit_quote(self, snapshot) -> None:
-        """Fast path for websocket exit quotes.
+        """Latency-critical TP/SL path, intentionally independent of scanner lock.
 
-        This deliberately bypasses regime/strategy/equity work on every depth tick.
-        It only marks locally-managed DEMO positions and persists dashboard state
-        when the quote actually changes terminal/protection state.
+        Exit triggers must never wait behind candle downloads, regime evaluation,
+        user scans, or Mongo work. ``PositionManager.mark`` is synchronous, so the
+        terminal state transition happens atomically on the event loop before any
+        await. Dashboard persistence may wait afterwards; the exit itself cannot.
         """
-        async with self._processing_lock:
-            now_ms = int(time.time() * 1000)
-            for runtime in list(self._runtimes.values()):
-                manager = runtime.position_manager
-                if not manager.evaluate_local_exits:
-                    continue
-                if not any(p.status == 'OPEN' and p.symbol == snapshot.symbol
-                           for p in manager.positions.values()):
-                    continue
-                manager.mark(
-                    snapshot.symbol, getattr(snapshot, 'last', None), now_ms,
-                    bid=getattr(snapshot, 'bid', None), ask=getattr(snapshot, 'ask', None),
-                    quote_received_ms=getattr(snapshot, 'quote_received_ms', None),
-                    quote_source=getattr(snapshot, 'quote_source', 'websocket'),
-                )
-                state_changed = manager.consume_state_changed()
-                if not state_changed:
-                    continue
+        now_ms = int(time.time() * 1000)
+        changed = []
+        for runtime in list(self._runtimes.values()):
+            manager = runtime.position_manager
+            if not manager.evaluate_local_exits:
+                continue
+            if not any(p.status == 'OPEN' and p.symbol == snapshot.symbol
+                       for p in manager.positions.values()):
+                continue
+            manager.mark(
+                snapshot.symbol, getattr(snapshot, 'last', None), now_ms,
+                bid=getattr(snapshot, 'bid', None), ask=getattr(snapshot, 'ask', None),
+                quote_received_ms=getattr(snapshot, 'quote_received_ms', None),
+                quote_source=getattr(snapshot, 'quote_source', 'websocket'),
+                trigger_price=getattr(snapshot, 'trigger_price', None),
+                trigger_source=getattr(snapshot, 'trigger_source', None),
+            )
+            if manager.consume_state_changed():
+                changed.append(runtime)
 
+        # The terminal transition is already committed in memory and queued for
+        # position persistence. Serialize only the slower dashboard/equity refresh.
+        for runtime in changed:
+            async with self._processing_lock:
+                manager = runtime.position_manager
                 available_equity = await runtime.execution.get_equity()
                 effective_capital = min(runtime.configured_capital, max(0.0, float(available_equity)))
                 if any(p.status == 'OPEN' for p in manager.positions.values()):

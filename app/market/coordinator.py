@@ -285,12 +285,11 @@ class MultiMarketCoordinator:
             await asyncio.sleep(self.poll_seconds)
 
     async def monitor_realtime_exits(self, on_quote, symbols_provider):
-        """Stream executable bid/ask for DEMO TP/SL; REST monitor remains fallback.
+        """Stream realtime exit triggers independently from scanner cadence.
 
-        Open risk must not depend on the 2-second REST cadence.  The websocket
-        connection subscribes only to symbols with locally-managed exits and is
-        rebuilt whenever that set changes.  A two-sided depth quote is required;
-        malformed/partial payloads are ignored rather than guessed.
+        CoinW ``fills`` is the trigger authority so DEMO TP/SL matches the Last
+        price users see on the chart. ``depth`` supplies executable bid/ask for
+        the simulated market fill. REST monitoring remains a safety fallback.
         """
         if not self.realtime_exit_ws_enabled:
             if self.audit:
@@ -307,20 +306,21 @@ class MultiMarketCoordinator:
 
             symbol_map = {feed._base(symbol): symbol for symbol in symbols}
             expected = frozenset(symbols)
+            latest_books = {}
             ws = None
             try:
                 ws = await feed.connect()
-                await feed.subscribe(ws, symbols, ('depth',))
+                # Depth gives executable fill prices; fills gives the exact Last
+                # trade trigger users see on the chart.
+                await feed.subscribe(ws, symbols, ('depth', 'fills'))
                 if self.audit:
                     self.audit.event(
                         'REALTIME_EXIT_MONITOR_CONNECTED', 'system',
                         symbols=symbols, source='coinw_websocket',
+                        channels=['depth', 'fills'],
                     )
 
                 while True:
-                    # Rebuild subscriptions as soon as an open position appears or
-                    # disappears. A 1s idle timeout is only for subscription
-                    # bookkeeping; market exits are processed on every WS message.
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
@@ -328,19 +328,42 @@ class MultiMarketCoordinator:
                             break
                         continue
 
+                    received_ms = int(time.time() * 1000)
                     quote = feed.parse_depth_quote(
-                        raw, symbol_map=symbol_map, received_ms=int(time.time() * 1000),
+                        raw, symbol_map=symbol_map, received_ms=received_ms,
                     )
                     if quote is not None:
+                        latest_books[quote.symbol] = quote
                         await on_quote(SimpleNamespace(
                             symbol=quote.symbol, timeframe='tick', candles=[], timeframes={},
                             bid=quote.bid, ask=quote.ask, bids=quote.bids, asks=quote.asks,
                             last=(quote.bid + quote.ask) / 2.0,
+                            trigger_price=None, trigger_source=None,
                             quote_received_ms=quote.received_ms,
                             exchange_ts_ms=quote.exchange_ts_ms, orderbook_valid=True,
                             data_complete=False, monitor_only=True, realtime_exit_monitor=True,
-                            quote_source='websocket',
+                            quote_source='websocket_depth',
                         ))
+
+                    for tick in feed.parse_trade_ticks(
+                        raw, symbol_map=symbol_map, received_ms=received_ms,
+                    ):
+                        book = latest_books.get(tick.symbol)
+                        await on_quote(SimpleNamespace(
+                            symbol=tick.symbol, timeframe='tick', candles=[], timeframes={},
+                            bid=(book.bid if book is not None else None),
+                            ask=(book.ask if book is not None else None),
+                            bids=(book.bids if book is not None else []),
+                            asks=(book.asks if book is not None else []),
+                            last=tick.price, trigger_price=tick.price,
+                            trigger_source='last_trade',
+                            quote_received_ms=tick.received_ms,
+                            exchange_ts_ms=tick.exchange_ts_ms,
+                            orderbook_valid=book is not None,
+                            data_complete=False, monitor_only=True, realtime_exit_monitor=True,
+                            quote_source='websocket_trade', trade_id=tick.trade_id,
+                        ))
+
                     if frozenset(symbols_provider()) != expected:
                         break
             except asyncio.CancelledError:

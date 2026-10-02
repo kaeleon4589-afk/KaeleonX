@@ -212,64 +212,14 @@ class EntryLifecycleV2:
             self.consume(setup, "invalid_atr_metadata", now_ms)
             return "cancelled", None, {"reason": "invalid_atr_metadata"}
 
-        favorable_move = (price - signal_entry) if setup.direction == Direction.LONG else (signal_entry - price)
-        chase_limit = max(self.chase_tolerance_atr, env_float("V2_TRIGGER_MAX_CHASE_ATR", 0.35, 0.10, 1.50)) * atr_value
-        if favorable_move > chase_limit and not (float(setup.entry_zone_low) <= price <= float(setup.entry_zone_high)):
-            self.consume(setup, "setup_chased", now_ms)
-            return "cancelled", None, {
-                "reason": "setup_chased",
-                "price": price,
-                "signal_entry": signal_entry,
-                "move_atr": favorable_move / atr_value,
-            }
-
-        frames = dict(getattr(snapshot, "timeframes", {}) or {})
-        c1 = list(frames.get("1m") or [])
-        if not c1:
-            return "pending", None, {"reason": "waiting_closed_1m_confirmation"}
-        candle = c1[-1]
-        cts = int(getattr(candle, "timestamp", 0) or 0)
-        candle_close_ms = cts + 60_000
-        age_from_arm = candle_close_ms - int(setup.armed_at_ms)
-        recent_prearm = -self.fast_confirm_max_age_ms <= age_from_arm < 0
-        post_arm = age_from_arm >= 0
-        if not post_arm and not (self.fast_confirm_enabled and recent_prearm):
-            return "pending", None, {"reason": "waiting_post_arm_1m_close", "age_from_arm_ms": age_from_arm}
-
-        o, h, l, c = map(float, (candle.open, candle.high, candle.low, candle.close))
-        rng = max(h - l, 1e-12)
-        body_ratio = abs(c - o) / rng
-        close_pos = (c - l) / rng
-        tol = self.trigger_close_tolerance_atr * atr_value
-        if setup.direction == Direction.LONG:
-            candle_ok = c >= float(setup.trigger_price) - tol and c >= o and close_pos >= 0.52 and body_ratio >= 0.18
-        else:
-            candle_ok = c <= float(setup.trigger_price) + tol and c <= o and close_pos <= 0.48 and body_ratio >= 0.18
-        if not candle_ok:
-            return "pending", None, {
-                "reason": "micro_confirmation_pending",
-                "candle_close": c,
-                "trigger_price": setup.trigger_price,
-                "body_ratio": body_ratio,
-                "close_pos": close_pos,
-            }
-
-        imbalance = orderbook_imbalance(snapshot, 12)
-        severe = env_float("V2_TRIGGER_ORDERBOOK_CONFLICT", 0.45, 0.15, 0.90)
-        if imbalance is not None:
-            if setup.direction == Direction.LONG and imbalance <= -severe:
-                return "pending", None, {"reason": "micro_orderbook_conflict", "orderbook_imbalance": imbalance}
-            if setup.direction == Direction.SHORT and imbalance >= severe:
-                return "pending", None, {"reason": "micro_orderbook_conflict", "orderbook_imbalance": imbalance}
-
         stop = float(setup.stop_price)
         if (setup.direction == Direction.LONG and not stop < price) or (setup.direction == Direction.SHORT and not price < stop):
             self.consume(setup, "trigger_invalid_stop_geometry", now_ms)
             return "cancelled", None, {"reason": "trigger_invalid_stop_geometry", "price": price, "stop": stop}
 
-        # The strategy already locked an absolute, structure-derived target when
-        # the setup was armed. Triggering must never rebuild TP from RR or move it
-        # farther away just because the executable quote changed.
+        # Strategy V2 locks an absolute structure-derived target at ARM time.
+        # Check it before the anti-chase gate so a setup that already completed
+        # its move is terminal, while a merely extended setup can wait for re-entry.
         structural_target = float(meta.get("structural_target_price") or setup.target_price)
         target = float(setup.target_price)
         if target <= 0:
@@ -284,7 +234,6 @@ class EntryLifecycleV2:
                     "target": target,
                     "structural_target": structural_target,
                 }
-            reward = target - price
         else:
             if target >= price:
                 self.consume(setup, "target_already_reached_before_entry", now_ms)
@@ -294,15 +243,159 @@ class EntryLifecycleV2:
                     "target": target,
                     "structural_target": structural_target,
                 }
-            reward = price - target
 
+        # Anti-chase measures extension *beyond the strategy trigger*, not from
+        # signal_entry.  In V2 the trigger can intentionally sit outside the raw
+        # entry zone (for example a breakout continuation threshold), so using
+        # signal_entry here made a valid trigger look chased before it could fire.
+        trigger_anchor = float(setup.trigger_price)
+        favorable_extension = (price - trigger_anchor) if setup.direction == Direction.LONG else (trigger_anchor - price)
+        chase_limit = max(
+            self.chase_tolerance_atr,
+            env_float("V2_TRIGGER_MAX_CHASE_ATR", 0.35, 0.10, 1.50),
+        ) * atr_value
+        if favorable_extension > chase_limit:
+            # Do NOT consume the setup. Extension is not invalidation. Keep it
+            # ARMED so a pullback toward trigger geometry can still execute.
+            return "pending", None, {
+                "reason": "setup_extended_wait_reentry",
+                "price": price,
+                "signal_entry": signal_entry,
+                "trigger_price": trigger_anchor,
+                "extension_atr": favorable_extension / atr_value,
+                "chase_limit_atr": chase_limit / atr_value,
+                "entry_zone_low": float(setup.entry_zone_low),
+                "entry_zone_high": float(setup.entry_zone_high),
+            }
+
+        imbalance = orderbook_imbalance(snapshot, 12)
+        severe = env_float("V2_TRIGGER_ORDERBOOK_CONFLICT", 0.45, 0.15, 0.90)
+        book_conflict = False
+        if imbalance is not None:
+            book_conflict = bool(
+                (setup.direction == Direction.LONG and imbalance <= -severe)
+                or (setup.direction == Direction.SHORT and imbalance >= severe)
+            )
+
+        # High-quality setups can confirm from the live executable quote + order
+        # book instead of always waiting up to one full minute for a new closed
+        # candle. This is deliberately strict and never bypasses target, stop,
+        # invalidation, RR or anti-chase geometry.
+        quote_received_ms = int(getattr(snapshot, "quote_received_ms", 0) or 0)
+        quote_age_ms = (now_ms - quote_received_ms) if 0 < quote_received_ms <= now_ms else None
+        live_quality_min = env_float("V2_LIVE_CONFIRM_MIN_QUALITY", 82.0, 70.0, 99.0)
+        live_max_quote_age_ms = int(env_float("V2_LIVE_CONFIRM_MAX_QUOTE_AGE_MS", 2500.0, 250.0, 10000.0))
+        live_trigger_tol = env_float("V2_LIVE_CONFIRM_TRIGGER_TOLERANCE_ATR", 0.03, 0.0, 0.20) * atr_value
+        live_zone_tol = env_float("V2_LIVE_CONFIRM_ZONE_TOLERANCE_ATR", 0.20, 0.02, 0.60) * atr_value
+
+        if setup.direction == Direction.LONG:
+            trigger_reached = price >= trigger_anchor - live_trigger_tol
+            geometry_low = float(setup.entry_zone_low)
+            geometry_high = max(float(setup.entry_zone_high), trigger_anchor)
+            zone_distance = max(0.0, price - geometry_high, geometry_low - price)
+        else:
+            trigger_reached = price <= trigger_anchor + live_trigger_tol
+            geometry_low = min(float(setup.entry_zone_low), trigger_anchor)
+            geometry_high = float(setup.entry_zone_high)
+            zone_distance = max(0.0, geometry_low - price, price - geometry_high)
+
+        live_confirmed = bool(
+            self.fast_confirm_enabled
+            and float(setup.quality) >= live_quality_min
+            and quote_age_ms is not None
+            and quote_age_ms <= live_max_quote_age_ms
+            and imbalance is not None
+            and not book_conflict
+            and trigger_reached
+            and zone_distance <= live_zone_tol
+        )
+
+        confirmation_mode = None
+        confirmation_payload: dict = {}
+
+        if live_confirmed:
+            confirmation_mode = "live_microstructure"
+            confirmation_payload = {
+                "mode": confirmation_mode,
+                "price": price,
+                "trigger_price": float(setup.trigger_price),
+                "quote_received_ms": quote_received_ms,
+                "quote_age_ms": quote_age_ms,
+                "orderbook_imbalance": imbalance,
+                "zone_distance_atr": zone_distance / max(atr_value, 1e-12),
+                "setup_quality": float(setup.quality),
+            }
+        else:
+            frames = dict(getattr(snapshot, "timeframes", {}) or {})
+            c1 = list(frames.get("1m") or [])
+            if not c1:
+                reason = "micro_orderbook_conflict" if book_conflict else "waiting_closed_1m_confirmation"
+                trace = {"reason": reason}
+                if imbalance is not None:
+                    trace["orderbook_imbalance"] = imbalance
+                return "pending", None, trace
+
+            candle = c1[-1]
+            cts = int(getattr(candle, "timestamp", 0) or 0)
+            candle_close_ms = cts + 60_000
+            age_from_arm = candle_close_ms - int(setup.armed_at_ms)
+            recent_prearm = -self.fast_confirm_max_age_ms <= age_from_arm < 0
+            post_arm = age_from_arm >= 0
+            if not post_arm and not (self.fast_confirm_enabled and recent_prearm):
+                return "pending", None, {
+                    "reason": "waiting_post_arm_1m_close",
+                    "age_from_arm_ms": age_from_arm,
+                    "live_confirm_eligible": False,
+                    "live_quote_age_ms": quote_age_ms,
+                    "live_trigger_reached": trigger_reached,
+                    "live_zone_distance_atr": zone_distance / max(atr_value, 1e-12),
+                    "live_quality": float(setup.quality),
+                }
+
+            o, h, l, c = map(float, (candle.open, candle.high, candle.low, candle.close))
+            rng = max(h - l, 1e-12)
+            body_ratio = abs(c - o) / rng
+            close_pos = (c - l) / rng
+            tol = self.trigger_close_tolerance_atr * atr_value
+            if setup.direction == Direction.LONG:
+                candle_ok = c >= float(setup.trigger_price) - tol and c >= o and close_pos >= 0.52 and body_ratio >= 0.18
+            else:
+                candle_ok = c <= float(setup.trigger_price) + tol and c <= o and close_pos <= 0.48 and body_ratio >= 0.18
+            if not candle_ok:
+                return "pending", None, {
+                    "reason": "micro_confirmation_pending",
+                    "candle_close": c,
+                    "trigger_price": setup.trigger_price,
+                    "body_ratio": body_ratio,
+                    "close_pos": close_pos,
+                    "live_quote_age_ms": quote_age_ms,
+                    "live_trigger_reached": trigger_reached,
+                    "live_zone_distance_atr": zone_distance / max(atr_value, 1e-12),
+                }
+
+            if book_conflict:
+                return "pending", None, {"reason": "micro_orderbook_conflict", "orderbook_imbalance": imbalance}
+
+            confirmation_mode = "postarm_closed_1m" if post_arm else "recent_prearm_closed_1m"
+            confirmation_payload = {
+                "mode": confirmation_mode,
+                "candle_ts": cts,
+                "candle_close": c,
+                "body_ratio": body_ratio,
+                "close_pos": close_pos,
+                "orderbook_imbalance": imbalance,
+                "price": price,
+            }
+
+        # Structural target is immutable after ARM. RR is a viability check only.
+        if setup.direction == Direction.LONG:
+            reward = target - price
+        else:
+            reward = price - target
         risk = abs(price - stop)
         rr = reward / max(risk, 1e-12)
         min_rr = float(meta.get("minimum_viable_rr") or dynamic_min_rr(setup.strategy, setup.quality))
         if rr < min_rr:
-            # Entry quote drift can temporarily destroy the original edge. Keep
-            # the structural target fixed and wait for a better executable price
-            # instead of stretching TP outward to restore a desired RR.
             return "pending", None, {
                 "reason": "trigger_rr_temporarily_low",
                 "execution_rr": rr,
@@ -315,7 +408,6 @@ class EntryLifecycleV2:
 
         sl_pct = abs(price - stop) / price
         tp_pct = abs(target - price) / price
-        confirmation_mode = "postarm_closed_1m" if post_arm else "recent_prearm_closed_1m"
         metadata = {
             **meta,
             "engine_version": "v2",
@@ -323,15 +415,7 @@ class EntryLifecycleV2:
             "armed_setup_id": setup.setup_id,
             "armed_at_ms": setup.armed_at_ms,
             "triggered_at_ms": now_ms,
-            "micro_confirmation": {
-                "mode": confirmation_mode,
-                "candle_ts": cts,
-                "candle_close": c,
-                "body_ratio": body_ratio,
-                "close_pos": close_pos,
-                "orderbook_imbalance": imbalance,
-                "price": price,
-            },
+            "micro_confirmation": confirmation_payload,
             "signal_entry_price": signal_entry,
             "sl_pct": sl_pct,
             "tp_pct": tp_pct,
@@ -363,6 +447,7 @@ class EntryLifecycleV2:
         return "triggered", intent, {
             "reason": "microstructure_confirmed",
             "execution_rr": rr,
+            "minimum_viable_rr": min_rr,
             "price": price,
             "orderbook_imbalance": imbalance,
             "confirmation_mode": confirmation_mode,

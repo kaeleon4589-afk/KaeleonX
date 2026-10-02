@@ -16,9 +16,10 @@ from app.trading.persistence import TradePersistence
 from app.trading.rejection_funnel import RejectionFunnel
 
 
-# Both strategies require at least this RR before generating a signal. Enforce
-# the same limit after executable bid/ask and DEMO slippage alter the entry.
-MIN_EXECUTION_RR = 1.05
+# Legacy strategies historically used a global execution-RR floor. Engine V2
+# carries its own strategy-specific minimum_viable_rr and must not be forced back
+# into a fixed RR after Dynamic Targets has already selected a structural TP.
+LEGACY_MIN_EXECUTION_RR = 1.05
 
 # Stable lifecycle stages make one setup traceable from the first precursor to
 # the position that was ultimately opened (or the exact terminal rejection).
@@ -990,16 +991,38 @@ class TradingOrchestrator:
             else:
                 regime = self.regime_engine.evaluate_snapshot(snapshot)
                 regime_meta = getattr(self.regime_engine, "last_metadata", {}) or {}
-                rf = regime_meta.get("features") or {}
+                # Regime V2 stores diagnostics flat in last_metadata, while the
+                # legacy engine stored them under ``features``.  Normalize both
+                # shapes so production logs expose the actual evidence behind
+                # TREND/RANGE/TRANSITION instead of features={}. 
+                rf = regime_meta.get("features") or regime_meta
                 rs = regime_meta.get("state") or {}
                 feature_summary = {
-                    k: rf.get(k) for k in (
-                        "adx", "choppiness", "efficiency_ratio", "atr_pct",
-                        "wick_instability", "body_quality", "breakout_failure_ratio",
-                        "ema_stack_alignment", "ema_bullish_alignment", "ema_bearish_alignment",
-                        "ema_alignment_edge", "trend_bias", "btc_shock_ratio",
-                    ) if k in rf
+                    "adx": rf.get("adx", rf.get("adx5")),
+                    "choppiness": rf.get("choppiness"),
+                    "efficiency_ratio": rf.get("efficiency_ratio", rf.get("efficiency")),
+                    "atr_pct": rf.get("atr_pct"),
+                    "rvol": rf.get("rvol"),
+                    "last_range_atr": rf.get("last_range_atr"),
+                    "move3_atr": rf.get("move3_atr"),
+                    "spread_bps": rf.get("spread_bps"),
+                    "alignment_5m": rf.get("alignment_5m"),
+                    "alignment_15m": rf.get("alignment_15m"),
+                    "alignment_1h": rf.get("alignment_1h"),
+                    "trend_behavior_ok": rf.get("trend_behavior_ok"),
+                    "trend_score": rf.get("trend_score"),
+                    "range_score": rf.get("range_score"),
+                    "wick_instability": rf.get("wick_instability"),
+                    "body_quality": rf.get("body_quality"),
+                    "breakout_failure_ratio": rf.get("breakout_failure_ratio"),
+                    "ema_stack_alignment": rf.get("ema_stack_alignment"),
+                    "ema_bullish_alignment": rf.get("ema_bullish_alignment"),
+                    "ema_bearish_alignment": rf.get("ema_bearish_alignment"),
+                    "ema_alignment_edge": rf.get("ema_alignment_edge"),
+                    "trend_bias": rf.get("trend_bias"),
+                    "btc_shock_ratio": rf.get("btc_shock_ratio"),
                 }
+                feature_summary = {k: v for k, v in feature_summary.items() if v is not None}
                 state_summary = {
                     k: rs.get(k) for k in (
                         "active", "candidate", "pending", "pending_count",
@@ -1329,7 +1352,8 @@ class TradingOrchestrator:
             )
             if not geometry_ok:
                 self.last_decision[key] = now
-                self.last_rejection = 'invalid_trade_geometry' 
+                self.last_rejection = 'invalid_trade_geometry'
+                self._funnel("post_trigger_rejected", "invalid_trade_geometry", user_id=user_id, symbol=snapshot.symbol) 
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1371,6 +1395,7 @@ class TradingOrchestrator:
                 if chase_atr > self.entry_max_chase_atr:
                     self.last_decision[key] = now
                     self.last_rejection = 'entry_chased_after_signal'
+                    self._funnel("post_trigger_rejected", "entry_chased_after_signal", user_id=user_id, symbol=snapshot.symbol)
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1391,6 +1416,7 @@ class TradingOrchestrator:
                 if adverse_atr > self.entry_max_adverse_reversal_atr:
                     self.last_decision[key] = now
                     self.last_rejection = 'entry_confirmation_lost_before_fill'
+                    self._funnel("post_trigger_rejected", "entry_confirmation_lost_before_fill", user_id=user_id, symbol=snapshot.symbol)
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1421,6 +1447,7 @@ class TradingOrchestrator:
                 if minimum_stop_distance > 0 and risk_distance < minimum_stop_distance:
                     self.last_decision[key] = now
                     self.last_rejection = 'stop_inside_market_noise'
+                    self._funnel("post_trigger_rejected", "stop_inside_market_noise", user_id=user_id, symbol=snapshot.symbol)
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1460,6 +1487,7 @@ class TradingOrchestrator:
                 if conflicts:
                     self.last_decision[key] = now
                     self.last_rejection = 'orderbook_conflict'
+                    self._funnel("post_trigger_rejected", "orderbook_conflict", user_id=user_id, symbol=snapshot.symbol)
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1492,6 +1520,7 @@ class TradingOrchestrator:
                         or actual_stop_pct < minimum_stop_pct):
                     self.last_decision[key] = now
                     self.last_rejection = 'entry_too_close_to_stop'
+                    self._funnel("post_trigger_rejected", "entry_too_close_to_stop", user_id=user_id, symbol=snapshot.symbol)
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1513,6 +1542,7 @@ class TradingOrchestrator:
                 if actual_stop_pct > 1.25 * float(planned_stop_pct):
                     self.last_decision[key] = now
                     self.last_rejection = 'entry_far_from_signal'
+                    self._funnel("post_trigger_rejected", "entry_far_from_signal", user_id=user_id, symbol=snapshot.symbol)
                     self.audit.event(
                         'SIGNAL_REJECTED', decision_id, user_id=user_id,
                         mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1532,9 +1562,24 @@ class TradingOrchestrator:
                     )
                     return None
 
-            if execution_rr < MIN_EXECUTION_RR:
+            intent_meta = getattr(intent, "metadata", {}) or {}
+            engine_version = str(intent_meta.get("engine_version") or "").lower()
+            strategy_min_rr = intent_meta.get("minimum_viable_rr")
+            try:
+                strategy_min_rr = float(strategy_min_rr)
+            except (TypeError, ValueError):
+                strategy_min_rr = float("nan")
+            if engine_version == "v2" and math.isfinite(strategy_min_rr) and strategy_min_rr > 0:
+                minimum_execution_rr = strategy_min_rr
+                minimum_rr_source = "strategy_dynamic"
+            else:
+                minimum_execution_rr = LEGACY_MIN_EXECUTION_RR
+                minimum_rr_source = "legacy_global_fallback"
+
+            if execution_rr < minimum_execution_rr:
                 self.last_decision[key] = now
                 self.last_rejection = 'execution_rr_too_low'
+                self._funnel("post_trigger_rejected", "execution_rr_too_low", user_id=user_id, symbol=snapshot.symbol)
                 self.audit.event(
                     "SIGNAL_REJECTED", decision_id, user_id=user_id,
                     mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1544,18 +1589,19 @@ class TradingOrchestrator:
                     direction=getattr(intent.direction, "value", str(intent.direction)),
                     reason='execution_rr_too_low', entry_price=entry,
                     stop_price=stop, target_price=target,
-                    execution_rr=round(execution_rr, 4), minimum_rr=MIN_EXECUTION_RR,
+                    execution_rr=round(execution_rr, 4), minimum_rr=round(minimum_execution_rr, 4),
+                    minimum_rr_source=minimum_rr_source,
                 )
                 self._terminal_lifecycle(
                     user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
                     reason='execution_rr_too_low', strategy=intent.strategy, direction=intent.direction,
-                    details={"execution_rr": round(execution_rr, 4)},
+                    details={"execution_rr": round(execution_rr, 4),
+                             "minimum_rr": round(minimum_execution_rr, 4),
+                             "minimum_rr_source": minimum_rr_source},
                 )
                 return None
 
-            structural_rr = (getattr(intent, "metadata", {}) or {}).get(
-                "structural_rr_estimate"
-            )
+            structural_rr = intent_meta.get("structural_rr_estimate")
             self.audit.event(
                 "SIGNAL_ACCEPTED", decision_id, user_id=user_id,
                 mode=self.execution_mode, symbol=snapshot.symbol,
@@ -1567,6 +1613,7 @@ class TradingOrchestrator:
                 quality=round(float(intent.quality), 2), entry_price=entry,
                 stop_price=stop, target_price=target,
                 execution_rr=round(execution_rr, 4), structural_rr=structural_rr,
+                minimum_rr=round(minimum_execution_rr, 4), minimum_rr_source=minimum_rr_source,
                 risk_multiplier=intent.risk_multiplier,
             )
             self._schedule_lifecycle_stage(

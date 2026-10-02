@@ -21,6 +21,17 @@ class DepthQuote:
     exchange_ts_ms: int | None = None
 
 
+@dataclass(frozen=True)
+class TradeTick:
+    symbol: str
+    price: float
+    quantity: float
+    direction: str | None
+    received_ms: int
+    exchange_ts_ms: int | None = None
+    trade_id: str | None = None
+
+
 class CoinWWebSocket:
     """Small public CoinW websocket adapter used by backend market consumers.
 
@@ -106,6 +117,58 @@ class CoinWWebSocket:
             symbol=str(symbol), bid=bid, ask=ask, bids=bids, asks=asks,
             received_ms=now_ms, exchange_ts_ms=exchange_ts_ms,
         )
+
+
+    @classmethod
+    def parse_trade_ticks(cls, payload: Any, *, symbol_map: dict[str, str] | None = None,
+                          received_ms: int | None = None) -> list[TradeTick]:
+        """Parse CoinW futures ``fills`` messages into last-trade trigger ticks.
+
+        Trade ticks are used only as TP/SL trigger evidence.  The simulated fill
+        still uses the latest executable bid/ask whenever one is available.
+        """
+        message = cls._unwrap(payload)
+        if not isinstance(message, dict) or str(message.get("type") or "") != "fills":
+            return []
+        data = cls._unwrap(message.get("data"))
+        if not isinstance(data, list):
+            return []
+
+        pair = str(message.get("pairCode") or "")
+        base = cls._base(pair)
+        if not base:
+            return []
+        mapping = symbol_map or {}
+        symbol = mapping.get(base, pair or base)
+        now_ms = int(received_ms if received_ms is not None else time.time() * 1000)
+        ticks: list[TradeTick] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            try:
+                price = float(row.get("price"))
+                quantity = float(row.get("quantity", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(price) or price <= 0:
+                continue
+            if not math.isfinite(quantity) or quantity < 0:
+                quantity = 0.0
+            exchange_ts = row.get("createdDate", row.get("ts", message.get("ts")))
+            try:
+                exchange_ts_ms = int(exchange_ts) if exchange_ts is not None else None
+                if exchange_ts_ms is not None and exchange_ts_ms < 100_000_000_000:
+                    exchange_ts_ms *= 1000
+            except (TypeError, ValueError):
+                exchange_ts_ms = None
+            trade_id = row.get("id")
+            ticks.append(TradeTick(
+                symbol=str(symbol), price=price, quantity=quantity,
+                direction=(str(row.get("direction")) if row.get("direction") is not None else None),
+                received_ms=now_ms, exchange_ts_ms=exchange_ts_ms,
+                trade_id=(str(trade_id) if trade_id is not None else None),
+            ))
+        return ticks
 
     async def connect(self):
         return await websockets.connect(self.url, ping_interval=20, ping_timeout=10)

@@ -178,25 +178,48 @@ class PositionManager:
         return True
 
     def mark(self, symbol, price, timestamp, bid=None, ask=None, quote_received_ms=None,
-             quote_source=None):
+             quote_source=None, trigger_price=None, trigger_source=None):
+        """Mark open positions and evaluate local exits.
+
+        ``trigger_price`` and the executable fill price are deliberately separate.
+        A CoinW last-trade tick may cross TP/SL before the next order-book snapshot.
+        In that case the trade price triggers the stop, while the simulated market
+        exit fills at the best bid (LONG) or ask (SHORT) available at processing time.
+        Without an explicit trigger price, legacy REST/depth behaviour is preserved.
+        """
         protection_changes = []
         raw_price = price
         for p in list(self.positions.values()):
             if p.symbol != symbol or p.status != "OPEN":
                 continue
-            mark_price = (bid if p.direction == Direction.LONG else ask)
-            mark_price = raw_price if mark_price is None else mark_price
-            if not math.isfinite(float(mark_price)) or float(mark_price) <= 0:
+            executable_price = (bid if p.direction == Direction.LONG else ask)
+            executable_price = raw_price if executable_price is None else executable_price
+            try:
+                executable_price = float(executable_price)
+            except (TypeError, ValueError):
                 continue
-            price = float(mark_price)
-            p.current_price = price
+            if not math.isfinite(executable_price) or executable_price <= 0:
+                continue
+
+            explicit_trigger = trigger_price is not None
+            candidate_trigger = trigger_price if explicit_trigger else executable_price
+            try:
+                candidate_trigger = float(candidate_trigger)
+            except (TypeError, ValueError):
+                candidate_trigger = executable_price
+                explicit_trigger = False
+            if not math.isfinite(candidate_trigger) or candidate_trigger <= 0:
+                candidate_trigger = executable_price
+                explicit_trigger = False
+
+            p.current_price = executable_price
             p.revision += 1
             qty = p.remaining_quantity or p.quantity
-            p.unrealized_pnl = self._pnl(p, price, qty)
-            if self._apply_dynamic_protection(p, price):
+            p.unrealized_pnl = self._pnl(p, executable_price, qty)
+            if self._apply_dynamic_protection(p, executable_price):
                 protection_changes.append(p)
             if self.evaluate_local_exits:
-                action = self.exit_engine.evaluate(p, price)
+                action = self.exit_engine.evaluate(p, candidate_trigger)
                 if action:
                     observed = (quote_received_ms if isinstance(quote_received_ms, (int, float))
                                 and 0 < quote_received_ms <= timestamp else timestamp)
@@ -208,15 +231,19 @@ class PositionManager:
                             user_id=self.owner_user_id, mode=self.owner_mode,
                             position_id=p.position_id, symbol=p.symbol,
                             direction=getattr(p.direction, 'value', str(p.direction)),
-                            action=action, executable_price=price,
+                            action=action, trigger_price=candidate_trigger,
+                            trigger_source=str(trigger_source or ('last_trade' if explicit_trigger else 'executable_quote')),
+                            executable_price=executable_price,
                             bid=bid, ask=ask, last=raw_price,
                             stop_price=p.stop_price, target_price=p.target_price,
                             quote_source=p.exit_quote_source,
                             quote_received_ms=int(observed),
                             quote_delay_ms=p.exit_quote_delay_ms,
                         )
-                    self.close_or_reduce(p, action, price, int(observed),
-                                         quote_source=p.exit_quote_source)
+                    self.close_or_reduce(
+                        p, action, executable_price, int(observed),
+                        quote_source=p.exit_quote_source, trigger_price=candidate_trigger,
+                    )
                     continue
             # Realtime websocket marks may arrive many times per second. Persist
             # at a bounded cadence instead of turning Mongo into a per-tick stream.
@@ -390,8 +417,8 @@ class PositionManager:
 
         return changes
 
-    def close_or_reduce(self, p, action, price, timestamp, quote_source=None):
-        trigger_price = price
+    def close_or_reduce(self, p, action, price, timestamp, quote_source=None, trigger_price=None):
+        trigger_price = price if trigger_price is None else float(trigger_price)
         if quote_source is not None:
             p.exit_quote_source = str(quote_source)
         if self.evaluate_local_exits:

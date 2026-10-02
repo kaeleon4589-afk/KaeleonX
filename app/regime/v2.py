@@ -130,6 +130,8 @@ def _raw(snapshot) -> tuple[str, str, float, dict]:
         "direction_15m": d15,
         "direction_1h": d1h,
         "trend_behavior_ok": locals().get("trend_behavior_ok", False),
+        "trend_score": locals().get("trend_score"),
+        "range_score": locals().get("range_score"),
         "ema_5m": m5,
         "ema_15m": m15,
         "ema_1h": m1h,

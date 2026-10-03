@@ -89,15 +89,22 @@ def _raw(snapshot) -> tuple[str, str, float, dict]:
         range_score += 20.0 if not aligned else 4.0
         range_score += 18.0 * min(1.0, max(0.0, 1.0 - max(a15, a1h)))
 
-        trend_min = env_float("V2_REGIME_TREND_SCORE_MIN", 61.0, 45.0, 90.0)
-        range_min = env_float("V2_REGIME_RANGE_SCORE_MIN", 58.0, 40.0, 90.0)
+        # Operable V2 baseline: keep the regime router selective, but do not
+        # require an almost textbook market before either strategy can even
+        # start watching.  The strategy engines still perform their own setup,
+        # geometry and execution checks after this router.
+        trend_min = env_float("V2_REGIME_TREND_SCORE_MIN", 58.0, 45.0, 90.0)
+        range_min = env_float("V2_REGIME_RANGE_SCORE_MIN", 54.0, 40.0, 90.0)
         # EMA ordering alone is not enough. In a flat market tiny numerical EMA
         # differences can produce a perfectly ordered stack while price remains
         # highly choppy and directionally inefficient. Require actual trend
         # behaviour before TREND can win the router.
         trend_behavior_ok = (
-            (adx5 >= 17.0 and eff >= 0.20 and chop <= 62.0)
-            or (adx5 >= 24.0 and eff >= 0.15 and chop <= 68.0)
+            (adx5 >= 16.0 and eff >= 0.16 and chop <= 64.0)
+            or (adx5 >= 22.0 and eff >= 0.10 and chop <= 68.0)
+            # Strong ADX + low choppiness is allowed to identify an emerging
+            # trend even before the efficiency ratio has fully caught up.
+            or (adx5 >= 28.0 and chop <= 55.0)
         )
         if direction != "neutral" and trend_behavior_ok and trend_score >= trend_min and trend_score >= range_score + 4.0:
             candidate = TREND
@@ -230,12 +237,58 @@ class RegimeEngineV2:
             preferred = None
             hard_block = True
         else:
-            direction = Direction.NEUTRAL
-            breakout_allowed = sweep_allowed = False
-            risk_multiplier = 0.0
-            rs = RegimeState.TRANSITION
-            preferred = None
-            hard_block = True
+            # TRANSITION remains a hard block by default, but a clearly
+            # developing trend/range may be *soft routed* at reduced risk. This
+            # removes the old "market must already be perfect" behavior while
+            # still refusing genuinely ambiguous transition states.
+            trend_score = float(diag.get("trend_score") or 0.0)
+            range_score = float(diag.get("range_score") or 0.0)
+            adx5 = float(diag.get("adx5") or 0.0)
+            chop = float(diag.get("choppiness") or 100.0)
+            eff = float(diag.get("efficiency") or 0.0)
+            a15 = float(diag.get("alignment_15m") or 0.0)
+            a1h = float(diag.get("alignment_1h") or 0.0)
+
+            developing_trend = bool(
+                raw_direction in {"long", "short"}
+                and trend_score >= 72.0
+                and a15 >= 0.75 and a1h >= 0.75
+                and chop <= 58.0
+                and (adx5 >= 18.0 or eff >= 0.10)
+            )
+            developing_range = bool(
+                range_score >= 52.0
+                and range_score >= trend_score - 15.0
+                and chop >= 52.0
+                and eff <= 0.18
+                and adx5 <= 35.0
+            )
+
+            if developing_trend:
+                direction = Direction.LONG if raw_direction == "long" else Direction.SHORT
+                breakout_allowed = True
+                sweep_allowed = False
+                risk_multiplier = 0.75
+                rs = RegimeState.TRANSITION
+                preferred = "BREAKOUT_RETEST"
+                hard_block = False
+                diag["soft_route"] = "developing_trend"
+            elif developing_range:
+                direction = Direction.NEUTRAL
+                breakout_allowed = False
+                sweep_allowed = True
+                risk_multiplier = 0.70
+                rs = RegimeState.TRANSITION
+                preferred = "LIQUIDITY_SWEEP"
+                hard_block = False
+                diag["soft_route"] = "developing_range"
+            else:
+                direction = Direction.NEUTRAL
+                breakout_allowed = sweep_allowed = False
+                risk_multiplier = 0.0
+                rs = RegimeState.TRANSITION
+                preferred = None
+                hard_block = True
 
         self.last_metadata = {
             **diag,

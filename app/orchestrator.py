@@ -1376,6 +1376,8 @@ class TradingOrchestrator:
             # signal or invalidated the confirmation, wait for a fresh setup instead
             # of buying/selling the exhausted move.
             metadata = getattr(intent, 'metadata', {}) or {}
+            engine_version = str(metadata.get("engine_version") or "").lower()
+            is_v2 = engine_version == "v2"
             try:
                 atr_value = float(metadata.get('atr_value') or 0.0)
             except (TypeError, ValueError):
@@ -1392,7 +1394,12 @@ class TradingOrchestrator:
                                     else (entry - signal_entry))
                 chase_atr = max(0.0, directional_move) / atr_value
                 adverse_atr = max(0.0, adverse_reversal) / atr_value
-                if chase_atr > self.entry_max_chase_atr:
+                # V2 already has a dedicated anti-chase lifecycle before this
+                # point. Keep this final guard, but do not duplicate it with a
+                # tighter legacy threshold that rejects otherwise valid fills.
+                effective_max_chase_atr = max(self.entry_max_chase_atr, 0.30) if is_v2 else self.entry_max_chase_atr
+                effective_max_adverse_atr = max(self.entry_max_adverse_reversal_atr, 0.22) if is_v2 else self.entry_max_adverse_reversal_atr
+                if chase_atr > effective_max_chase_atr:
                     self.last_decision[key] = now
                     self.last_rejection = 'entry_chased_after_signal'
                     self._funnel("post_trigger_rejected", "entry_chased_after_signal", user_id=user_id, symbol=snapshot.symbol)
@@ -1405,7 +1412,7 @@ class TradingOrchestrator:
                         direction=getattr(intent.direction, 'value', str(intent.direction)),
                         reason='entry_chased_after_signal', entry_price=entry,
                         signal_entry_price=signal_entry, atr_value=atr_value,
-                        move_atr=round(chase_atr, 4), maximum_atr=self.entry_max_chase_atr,
+                        move_atr=round(chase_atr, 4), maximum_atr=effective_max_chase_atr,
                     )
                     self._terminal_lifecycle(
                         user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
@@ -1413,7 +1420,7 @@ class TradingOrchestrator:
                         details={"move_atr": round(chase_atr, 4)},
                     )
                     return None
-                if adverse_atr > self.entry_max_adverse_reversal_atr:
+                if adverse_atr > effective_max_adverse_atr:
                     self.last_decision[key] = now
                     self.last_rejection = 'entry_confirmation_lost_before_fill'
                     self._funnel("post_trigger_rejected", "entry_confirmation_lost_before_fill", user_id=user_id, symbol=snapshot.symbol)
@@ -1426,7 +1433,7 @@ class TradingOrchestrator:
                         direction=getattr(intent.direction, 'value', str(intent.direction)),
                         reason='entry_confirmation_lost_before_fill', entry_price=entry,
                         signal_entry_price=signal_entry, atr_value=atr_value,
-                        move_atr=round(adverse_atr, 4), maximum_atr=self.entry_max_adverse_reversal_atr,
+                        move_atr=round(adverse_atr, 4), maximum_atr=effective_max_adverse_atr,
                     )
                     self._terminal_lifecycle(
                         user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
@@ -1440,9 +1447,16 @@ class TradingOrchestrator:
                     spread_abs = max(0.0, float(snapshot.ask) - float(snapshot.bid))
                 except (TypeError, ValueError):
                     pass
+                # Strategies V2 already construct stops from market structure
+                # with an ATR floor. After a live trigger, entry can legitimately
+                # be closer to that locked stop. A legacy 0.30 ATR / 3-spread
+                # floor was blocking roughly half of the triggered setups in the
+                # observed funnel, so V2 uses a smaller *final* noise guard only.
+                effective_min_stop_atr = min(self.entry_min_stop_atr, 0.22) if is_v2 else self.entry_min_stop_atr
+                effective_min_stop_spreads = min(self.entry_min_stop_spreads, 2.0) if is_v2 else self.entry_min_stop_spreads
                 minimum_stop_distance = max(
-                    atr_value * self.entry_min_stop_atr,
-                    spread_abs * self.entry_min_stop_spreads,
+                    atr_value * effective_min_stop_atr,
+                    spread_abs * effective_min_stop_spreads,
                 )
                 if minimum_stop_distance > 0 and risk_distance < minimum_stop_distance:
                     self.last_decision[key] = now
@@ -1458,7 +1472,9 @@ class TradingOrchestrator:
                         reason='stop_inside_market_noise', entry_price=entry, stop_price=stop,
                         stop_distance=risk_distance, minimum_stop_distance=minimum_stop_distance,
                         stop_atr=round(risk_distance / atr_value, 4),
-                        minimum_stop_atr=self.entry_min_stop_atr, spread_abs=spread_abs,
+                        minimum_stop_atr=effective_min_stop_atr,
+                        minimum_stop_spreads=effective_min_stop_spreads,
+                        spread_abs=spread_abs,
                     )
                     self._terminal_lifecycle(
                         user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
@@ -1472,7 +1488,11 @@ class TradingOrchestrator:
             # opposite wall immediately before execution is a useful final veto.
             bids = list(getattr(snapshot, 'bids', []) or [])[:20]
             asks = list(getattr(snapshot, 'asks', []) or [])[:20]
-            if len(bids) >= 5 and len(asks) >= 5 and self.entry_orderbook_conflict_threshold > 0:
+            effective_book_conflict_threshold = (
+                max(self.entry_orderbook_conflict_threshold, 0.50)
+                if is_v2 else self.entry_orderbook_conflict_threshold
+            )
+            if len(bids) >= 5 and len(asks) >= 5 and effective_book_conflict_threshold > 0:
                 try:
                     bid_value = sum(float(level[0]) * float(level[1]) for level in bids)
                     ask_value = sum(float(level[0]) * float(level[1]) for level in asks)
@@ -1481,8 +1501,8 @@ class TradingOrchestrator:
                 except (TypeError, ValueError, IndexError):
                     imbalance = 0.0
                 conflicts = (
-                    (intent.direction == Direction.LONG and imbalance <= -self.entry_orderbook_conflict_threshold)
-                    or (intent.direction == Direction.SHORT and imbalance >= self.entry_orderbook_conflict_threshold)
+                    (intent.direction == Direction.LONG and imbalance <= -effective_book_conflict_threshold)
+                    or (intent.direction == Direction.SHORT and imbalance >= effective_book_conflict_threshold)
                 )
                 if conflicts:
                     self.last_decision[key] = now
@@ -1496,7 +1516,7 @@ class TradingOrchestrator:
                         strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
                         reason='orderbook_conflict', direction=getattr(intent.direction, 'value', str(intent.direction)),
                         orderbook_imbalance=round(imbalance, 4),
-                        threshold=self.entry_orderbook_conflict_threshold, levels=20,
+                        threshold=effective_book_conflict_threshold, levels=20,
                     )
                     self._terminal_lifecycle(
                         user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol, decision_id=decision_id,
@@ -1562,8 +1582,7 @@ class TradingOrchestrator:
                     )
                     return None
 
-            intent_meta = getattr(intent, "metadata", {}) or {}
-            engine_version = str(intent_meta.get("engine_version") or "").lower()
+            intent_meta = metadata
             strategy_min_rr = intent_meta.get("minimum_viable_rr")
             try:
                 strategy_min_rr = float(strategy_min_rr)

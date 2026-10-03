@@ -1,0 +1,14 @@
+PRODUCCION:
+app/regime/v2.py
+app/strategy/breakout_retest_v2.py
+app/strategy/liquidity_sweep_v2.py
+app/strategy/entry_engine_v2.py
+app/orchestrator.py
+
+CONFIGURACION / DOCUMENTACION:
+.env.example
+KAELEON_OPERABLE_PROFILE_V2.md
+ARCHIVOS_TOCADOS_OPERABLE_V2.txt
+
+PRUEBAS:
+tests/test_operable_v2_profile.py

@@ -112,7 +112,7 @@ class LiquiditySweepStrategyV2:
 
         n = len(c5)
         lookback = 30
-        max_age = int(env_float("V2_SWEEP_MAX_AGE_BARS", 4, 2, 8))
+        max_age = int(env_float("V2_SWEEP_MAX_AGE_BARS", 6, 2, 8))
         sweep_candidates = []
         start = max(lookback + 2, n - max_age - 2)
         for idx in range(start, n):
@@ -126,14 +126,14 @@ class LiquiditySweepStrategyV2:
             long_depth = (low_level - float(l[idx])) / atr_value
             if 0.05 <= long_depth <= 1.25 and float(c[idx]) > low_level:
                 reclaim = (float(c[idx]) - low_level) / atr_value
-                if shape["lower_wick_ratio"] >= 0.30 and shape["close_pos"] >= 0.48 and rv >= 0.75:
+                if shape["lower_wick_ratio"] >= 0.24 and shape["close_pos"] >= 0.45 and rv >= 0.60:
                     score = 24.0 * clamp(shape["lower_wick_ratio"] / 0.65, 0.0, 1.0) + 16.0 * clamp(rv / 1.6, 0.0, 1.0) + 12.0 * clamp(reclaim / 0.45, 0.0, 1.0)
                     sweep_candidates.append((idx, Direction.LONG, low_level, high_level, long_depth, score, rv, shape, reclaim))
 
             short_depth = (float(h[idx]) - high_level) / atr_value
             if 0.05 <= short_depth <= 1.25 and float(c[idx]) < high_level:
                 reclaim = (high_level - float(c[idx])) / atr_value
-                if shape["upper_wick_ratio"] >= 0.30 and shape["close_pos"] <= 0.52 and rv >= 0.75:
+                if shape["upper_wick_ratio"] >= 0.24 and shape["close_pos"] <= 0.55 and rv >= 0.60:
                     score = 24.0 * clamp(shape["upper_wick_ratio"] / 0.65, 0.0, 1.0) + 16.0 * clamp(rv / 1.6, 0.0, 1.0) + 12.0 * clamp(reclaim / 0.45, 0.0, 1.0)
                     sweep_candidates.append((idx, Direction.SHORT, high_level, low_level, short_depth, score, rv, shape, reclaim))
 
@@ -145,7 +145,7 @@ class LiquiditySweepStrategyV2:
             high_level = max(float(x) for x in h[-lookback - 1:-1])
             dist_low = (current - low_level) / atr_value
             dist_high = (high_level - current) / atr_value
-            if not allow_watch or min(dist_low, dist_high) > 0.38:
+            if not allow_watch or min(dist_low, dist_high) > 0.55:
                 return self._reject("no_liquidity_sweep", distance_low_atr=dist_low, distance_high_atr=dist_high)
             direction = Direction.LONG if dist_low <= dist_high else Direction.SHORT
             level = low_level if direction == Direction.LONG else high_level
@@ -155,8 +155,8 @@ class LiquiditySweepStrategyV2:
             if stop_info is None:
                 return self._reject("watch_stop_geometry_invalid")
             stop, _ = stop_info
-            quality = clamp(58.0 + 16.0 * clamp(1.0 - min(dist_low, dist_high) / 0.38, 0.0, 1.0), 0.0, 100.0)
-            proximity_strength = clamp(1.0 - min(dist_low, dist_high) / 0.38, 0.0, 1.0)
+            quality = clamp(58.0 + 16.0 * clamp(1.0 - min(dist_low, dist_high) / 0.55, 0.0, 1.0), 0.0, 100.0)
+            proximity_strength = clamp(1.0 - min(dist_low, dist_high) / 0.55, 0.0, 1.0)
             plan = self._target_plan(
                 c5,
                 direction=direction,
@@ -209,9 +209,9 @@ class LiquiditySweepStrategyV2:
         for idx in range(sweep_idx, n):
             shape = candle_shape(c5[idx])
             if direction == Direction.LONG:
-                confirmed = float(c[idx]) > level + 0.05 * atr_value and float(c[idx]) >= float(o[idx]) and shape["close_pos"] >= 0.55 and shape["body_ratio"] >= 0.20
+                confirmed = float(c[idx]) > level + 0.03 * atr_value and float(c[idx]) >= float(o[idx]) and shape["close_pos"] >= 0.52 and shape["body_ratio"] >= 0.14
             else:
-                confirmed = float(c[idx]) < level - 0.05 * atr_value and float(c[idx]) <= float(o[idx]) and shape["close_pos"] <= 0.45 and shape["body_ratio"] >= 0.20
+                confirmed = float(c[idx]) < level - 0.03 * atr_value and float(c[idx]) <= float(o[idx]) and shape["close_pos"] <= 0.48 and shape["body_ratio"] >= 0.14
             if confirmed:
                 confirm_idx = idx
                 break
@@ -278,11 +278,11 @@ class LiquiditySweepStrategyV2:
             return candidate
 
         confirm_age = n - 1 - confirm_idx
-        if confirm_age > 2:
+        if confirm_age > 3:
             return self._reject("sweep_confirmation_stale", age=confirm_age)
-        if direction == Direction.LONG and current < level - 0.15 * atr_value:
+        if direction == Direction.LONG and current < level - 0.22 * atr_value:
             return self._reject("sweep_reclaim_lost")
-        if direction == Direction.SHORT and current > level + 0.15 * atr_value:
+        if direction == Direction.SHORT and current > level + 0.22 * atr_value:
             return self._reject("sweep_reclaim_lost")
 
         raw_stop = sweep_extreme - 0.18 * atr_value if direction == Direction.LONG else sweep_extreme + 0.18 * atr_value
@@ -301,7 +301,7 @@ class LiquiditySweepStrategyV2:
             + 6.0 * clamp(1.0 - confirm_age / 3.0, 0.0, 1.0),
             0.0, 100.0,
         )
-        min_score = env_float("V2_SWEEP_MIN_SCORE", 68.0, 50.0, 90.0)
+        min_score = env_float("V2_SWEEP_MIN_SCORE", 62.0, 50.0, 90.0)
         if quality < min_score:
             return self._reject("quality_below_threshold", quality=quality, minimum=min_score)
 

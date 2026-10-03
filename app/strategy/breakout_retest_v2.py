@@ -127,11 +127,22 @@ class BreakoutRetestStrategyV2:
         d15, a15, _ = trend_alignment(c15, slow=min(200, max(50, len(c15) - 5)))
         d1h, a1h, _ = trend_alignment(c1h, slow=min(200, max(50, len(c1h) - 5)))
         expected = side
-        if d15 != expected or d1h != expected:
-            return self._reject("htf_alignment_lost", direction15=d15, direction1h=d1h)
+        htf_matches = int(d15 == expected) + int(d1h == expected)
+        strong_opposite = bool(
+            (d15 not in {expected, "neutral"} and a15 >= 0.85)
+            or (d1h not in {expected, "neutral"} and a1h >= 0.85)
+        )
+        if htf_matches == 0 or (strong_opposite and htf_matches < 2):
+            return self._reject(
+                "htf_alignment_lost",
+                direction15=d15,
+                direction1h=d1h,
+                alignment15=a15,
+                alignment1h=a1h,
+            )
 
         lookback = 24
-        max_breakout_age = int(env_float("V2_BREAKOUT_MAX_AGE_BARS", 6, 3, 12))
+        max_breakout_age = int(env_float("V2_BREAKOUT_MAX_AGE_BARS", 8, 3, 12))
         candidates = []
         n = len(c5)
         start = max(lookback, n - max_breakout_age - 2)
@@ -146,16 +157,16 @@ class BreakoutRetestStrategyV2:
             if direction == Direction.LONG:
                 level = prior_h
                 broke = float(c[idx]) >= level + 0.04 * atr_value
-                close_pos_ok = shape["close_pos"] >= 0.62
+                close_pos_ok = shape["close_pos"] >= 0.58
                 extension = (float(c[idx]) - level) / atr_value
             else:
                 level = prior_l
                 broke = float(c[idx]) <= level - 0.04 * atr_value
-                close_pos_ok = shape["close_pos"] <= 0.38
+                close_pos_ok = shape["close_pos"] <= 0.42
                 extension = (level - float(c[idx])) / atr_value
             if not broke:
                 continue
-            if shape["body_ratio"] < 0.42 or not close_pos_ok or rv < 0.80:
+            if shape["body_ratio"] < 0.34 or not close_pos_ok or rv < 0.65:
                 continue
             if shape["range"] > 2.3 * atr_value or extension > 1.35:
                 continue
@@ -186,8 +197,8 @@ class BreakoutRetestStrategyV2:
             1.0,
         )
 
-        retest_tolerance = 0.28 * atr_value
-        invalidation_buffer = 0.48 * atr_value
+        retest_tolerance = 0.38 * atr_value
+        invalidation_buffer = 0.62 * atr_value
         retest_idx = None
         retest_extreme = None
         retest_quality = 0.0
@@ -214,7 +225,7 @@ class BreakoutRetestStrategyV2:
 
         if retest_idx is None:
             distance_now = abs(current - level) / atr_value
-            if allow_watch and distance_now <= 1.30:
+            if allow_watch and distance_now <= 1.55:
                 zone_low = level - 0.22 * atr_value
                 zone_high = level + 0.32 * atr_value
                 raw_stop = level - 0.70 * atr_value if direction == Direction.LONG else level + 0.70 * atr_value
@@ -275,9 +286,9 @@ class BreakoutRetestStrategyV2:
         for idx in range(retest_idx, n):
             shape = candle_shape(c5[idx])
             if direction == Direction.LONG:
-                confirmed = float(c[idx]) > level and float(c[idx]) >= float(o[idx]) and shape["close_pos"] >= 0.54 and shape["body_ratio"] >= 0.22
+                confirmed = float(c[idx]) > level and float(c[idx]) >= float(o[idx]) and shape["close_pos"] >= 0.52 and shape["body_ratio"] >= 0.16
             else:
-                confirmed = float(c[idx]) < level and float(c[idx]) <= float(o[idx]) and shape["close_pos"] <= 0.46 and shape["body_ratio"] >= 0.22
+                confirmed = float(c[idx]) < level and float(c[idx]) <= float(o[idx]) and shape["close_pos"] <= 0.48 and shape["body_ratio"] >= 0.16
             if confirmed:
                 confirm_idx = idx
                 break
@@ -337,10 +348,10 @@ class BreakoutRetestStrategyV2:
             return self._reject("retest_without_confirmation")
 
         confirm_age = n - 1 - confirm_idx
-        if confirm_age > 2:
+        if confirm_age > 3:
             return self._reject("continuation_confirmation_stale", age=confirm_age)
         extension_now = (current - level) / atr_value if direction == Direction.LONG else (level - current) / atr_value
-        if extension_now > 0.95:
+        if extension_now > 1.15:
             return self._reject("entry_chased_after_retest", extension_atr=extension_now)
 
         raw_stop = float(retest_extreme) - 0.16 * atr_value if direction == Direction.LONG else float(retest_extreme) + 0.16 * atr_value
@@ -360,7 +371,7 @@ class BreakoutRetestStrategyV2:
             + freshness * 7.0,
             0.0, 100.0,
         )
-        min_score = env_float("V2_BREAKOUT_MIN_SCORE", 68.0, 50.0, 90.0)
+        min_score = env_float("V2_BREAKOUT_MIN_SCORE", 62.0, 50.0, 90.0)
         if quality < min_score:
             return self._reject("quality_below_threshold", quality=quality, minimum=min_score)
 

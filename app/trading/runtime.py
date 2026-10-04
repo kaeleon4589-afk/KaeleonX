@@ -183,6 +183,9 @@ class UserTradingRuntimeManager:
                     exit_trigger_price=row.get('exit_trigger_price'),
                     stop_gap_bps=row.get('stop_gap_bps'),
                     exit_quote_delay_ms=row.get('exit_quote_delay_ms'),
+                    fixed_exit_profile=bool(row.get('fixed_exit_profile', False)),
+                    fixed_tp_percent=(float(row['fixed_tp_percent']) if row.get('fixed_tp_percent') is not None else None),
+                    fixed_sl_percent=(float(row['fixed_sl_percent']) if row.get('fixed_sl_percent') is not None else None),
                 )
                 for attr in ("strategy", "quality", "execution_rr", "structural_rr", "lifecycle_id", "watch_id", "setup_id"):
                     if row.get(attr) is not None:

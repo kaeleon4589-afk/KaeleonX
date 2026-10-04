@@ -421,7 +421,25 @@ class PositionManager:
         trigger_price = price if trigger_price is None else float(trigger_price)
         if quote_source is not None:
             p.exit_quote_source = str(quote_source)
-        if self.evaluate_local_exits:
+
+        raw_executable_price = float(price)
+        fixed_barrier_fill = bool(
+            self.evaluate_local_exits
+            and getattr(p, "fixed_exit_profile", False)
+            and action in ("TP1", "TP2", "SL")
+        )
+        if fixed_barrier_fill:
+            # Validation mode must measure the configured strategy geometry, not
+            # websocket/REST scheduling latency. Once the market has crossed a
+            # fixed TP/SL, fill exactly at that barrier in DEMO. LIVE/exchange
+            # execution is intentionally untouched and may experience slippage.
+            if action == "SL":
+                price = float(p.stop_price)
+            elif action == "TP1" and p.tp1_price is not None:
+                price = float(p.tp1_price)
+            else:
+                price = float(p.tp2_price or p.target_price)
+        elif self.evaluate_local_exits:
             slip = self.exit_slippage_bps / 10000
             price *= (1 - slip) if p.direction == Direction.LONG else (1 + slip)
         p.revision += 1
@@ -465,6 +483,8 @@ class PositionManager:
                     direction=getattr(p.direction, "value", str(p.direction)),
                     reason=action, exit_price=price, quantity=qty,
                     exit_trigger_price=p.exit_trigger_price,
+                    raw_executable_price=raw_executable_price,
+                    simulated_fill_policy=("fixed_barrier" if fixed_barrier_fill else "market_quote"),
                     stop_gap_bps=p.stop_gap_bps,
                     quote_delay_ms=p.exit_quote_delay_ms,
                     realized_pnl=p.realized_pnl, gross_pnl=gross,

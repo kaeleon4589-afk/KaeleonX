@@ -252,6 +252,21 @@ def apply_intent_management(position: Any, intent: Any) -> Any:
         or getattr(position, "break_even_buffer_bps", None)
         or break_even_buffer_bps()
     )
+    position.fixed_exit_profile = bool(
+        metadata.get("fixed_exit_profile")
+        if metadata.get("fixed_exit_profile") is not None
+        else getattr(position, "fixed_exit_profile", False)
+    )
+    position.fixed_tp_percent = (
+        float(metadata.get("fixed_tp_percent"))
+        if metadata.get("fixed_tp_percent") is not None
+        else getattr(position, "fixed_tp_percent", None)
+    )
+    position.fixed_sl_percent = (
+        float(metadata.get("fixed_sl_percent"))
+        if metadata.get("fixed_sl_percent") is not None
+        else getattr(position, "fixed_sl_percent", None)
+    )
     if not getattr(position, "management_stage", None):
         position.management_stage = "INITIAL"
     if getattr(position, "best_price", None) is None:

@@ -3,6 +3,7 @@ import math
 from app.models.trading import Position
 from app.models.enums import Direction
 from app.position.protection import apply_intent_management
+from app.strategy.v2_common import fixed_exit_prices
 
 class PaperExecutionEngine:
     mode='paper'
@@ -27,8 +28,22 @@ class PaperExecutionEngine:
         fill=raw*(1+self.slippage_bps/10000) if intent.direction==Direction.LONG else raw*(1-self.slippage_bps/10000)
         if not math.isfinite(quantity) or quantity <= 0:
             return {'accepted':False,'filled':False,'reason':'invalid_quantity'}
-        if not ((intent.direction == Direction.LONG and intent.stop_price < fill < intent.target_price)
-                or (intent.direction == Direction.SHORT and intent.target_price < fill < intent.stop_price)):
+
+        stop_price=float(intent.stop_price)
+        target_price=float(intent.target_price)
+        metadata=getattr(intent, 'metadata', {}) or {}
+        if bool(metadata.get('fixed_exit_profile')):
+            try:
+                stop_price,target_price=fixed_exit_prices(
+                    fill, intent.direction,
+                    float(metadata.get('fixed_tp_percent') or 0.45),
+                    float(metadata.get('fixed_sl_percent') or 0.45),
+                )
+            except (TypeError, ValueError):
+                return {'accepted':False,'filled':False,'reason':'invalid_fixed_exit_profile'}
+
+        if not ((intent.direction == Direction.LONG and stop_price < fill < target_price)
+                or (intent.direction == Direction.SHORT and target_price < fill < stop_price)):
             return {'accepted':False,'filled':False,'reason':'fill_outside_trade_geometry'}
         if quantity / self.leverage + quantity * self.fee_rate > self.equity:
             return {'accepted':False,'filled':False,'reason':'insufficient_margin'}
@@ -36,9 +51,9 @@ class PaperExecutionEngine:
         base_quantity=quantity/max(fill,1e-12)
         fee=fill*base_quantity*self.fee_rate
         pid='PAPER-'+uuid4().hex[:16]
-        p=Position(pid,intent.decision_id,intent.symbol,intent.direction,base_quantity,fill,intent.stop_price,intent.target_price,entry_fee=fee,opened_at=market.get('ts'))
+        p=Position(pid,intent.decision_id,intent.symbol,intent.direction,base_quantity,fill,stop_price,target_price,entry_fee=fee,opened_at=market.get('ts'))
         p.tp1_price=(float(intent.metadata['tp1_price']) if intent.metadata.get('partial_tp_enabled') and intent.metadata.get('tp1_price') else None)
-        p.tp2_price=float(intent.metadata.get('tp2_price', intent.target_price))
+        p.tp2_price=float(intent.metadata.get('tp2_price', target_price))
         p.remaining_quantity=base_quantity
         p.leverage=self.leverage
         p.current_price=fill

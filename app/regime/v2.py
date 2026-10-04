@@ -93,8 +93,8 @@ def _raw(snapshot) -> tuple[str, str, float, dict]:
         # require an almost textbook market before either strategy can even
         # start watching.  The strategy engines still perform their own setup,
         # geometry and execution checks after this router.
-        trend_min = env_float("V2_REGIME_TREND_SCORE_MIN", 58.0, 45.0, 90.0)
-        range_min = env_float("V2_REGIME_RANGE_SCORE_MIN", 54.0, 40.0, 90.0)
+        trend_min = env_float("V2_REGIME_TREND_SCORE_MIN", 60.0, 45.0, 90.0)
+        range_min = env_float("V2_REGIME_RANGE_SCORE_MIN", 56.0, 40.0, 90.0)
         # EMA ordering alone is not enough. In a flat market tiny numerical EMA
         # differences can produce a perfectly ordered stack while price remains
         # highly choppy and directionally inefficient. Require actual trend

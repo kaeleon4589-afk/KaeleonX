@@ -201,6 +201,9 @@ class UserTradingRuntimeManager:
                 armed_fast_confirm_enabled=self.settings.trade_armed_fast_confirm_enabled,
                 armed_fast_confirm_max_age_seconds=self.settings.trade_armed_fast_confirm_max_age_seconds,
                 setup_watch_ttl_seconds=self.settings.trade_setup_watch_ttl_seconds,
+                fixed_exits_enabled=bool(self.settings.v2_fixed_exits_enabled and mode == 'demo'),
+                fixed_tp_percent=self.settings.v2_fixed_tp_percent,
+                fixed_sl_percent=self.settings.v2_fixed_sl_percent,
             ),
             RiskManager(
                 max_leverage=self.settings.fixed_leverage,
@@ -232,6 +235,9 @@ class UserTradingRuntimeManager:
             legacy_entry_fallback_enabled=self.settings.trade_legacy_entry_fallback_enabled,
             funnel_emit_seconds=self.settings.trade_funnel_emit_seconds,
             funnel_emit_every=self.settings.trade_funnel_emit_every,
+            fixed_exits_enabled=bool(self.settings.v2_fixed_exits_enabled and mode == 'demo'),
+            fixed_tp_percent=self.settings.v2_fixed_tp_percent,
+            fixed_sl_percent=self.settings.v2_fixed_sl_percent,
         )
         orchestrator.seed_loss_cooldowns(persisted_positions)
         # DEMO closes locally inside PositionManager; register the loss cooldown

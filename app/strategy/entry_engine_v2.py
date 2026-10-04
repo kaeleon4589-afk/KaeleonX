@@ -278,7 +278,7 @@ class EntryLifecycleV2:
             }
 
         imbalance = orderbook_imbalance(snapshot, 12)
-        severe = env_float("V2_TRIGGER_ORDERBOOK_CONFLICT", 0.55, 0.15, 0.90)
+        severe = env_float("V2_TRIGGER_ORDERBOOK_CONFLICT", 0.52, 0.15, 0.90)
         book_conflict = False
         if imbalance is not None:
             book_conflict = bool(
@@ -292,10 +292,10 @@ class EntryLifecycleV2:
         # invalidation, RR or anti-chase geometry.
         quote_received_ms = int(getattr(snapshot, "quote_received_ms", 0) or 0)
         quote_age_ms = (now_ms - quote_received_ms) if 0 < quote_received_ms <= now_ms else None
-        live_quality_min = env_float("V2_LIVE_CONFIRM_MIN_QUALITY", 76.0, 70.0, 99.0)
+        live_quality_min = env_float("V2_LIVE_CONFIRM_MIN_QUALITY", 78.0, 70.0, 99.0)
         live_max_quote_age_ms = int(env_float("V2_LIVE_CONFIRM_MAX_QUOTE_AGE_MS", 2500.0, 250.0, 10000.0))
-        live_trigger_tol = env_float("V2_LIVE_CONFIRM_TRIGGER_TOLERANCE_ATR", 0.05, 0.0, 0.20) * atr_value
-        live_zone_tol = env_float("V2_LIVE_CONFIRM_ZONE_TOLERANCE_ATR", 0.30, 0.02, 0.60) * atr_value
+        live_trigger_tol = env_float("V2_LIVE_CONFIRM_TRIGGER_TOLERANCE_ATR", 0.04, 0.0, 0.20) * atr_value
+        live_zone_tol = env_float("V2_LIVE_CONFIRM_ZONE_TOLERANCE_ATR", 0.27, 0.02, 0.60) * atr_value
 
         if setup.direction == Direction.LONG:
             trigger_reached = price >= trigger_anchor - live_trigger_tol

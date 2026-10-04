@@ -37,6 +37,27 @@ def clamp(value: float, low: float, high: float) -> float:
     return min(high, max(low, float(value)))
 
 
+def fixed_exit_prices(entry: float, direction: Direction, tp_percent: float, sl_percent: float) -> tuple[float, float]:
+    """Return ``(stop, target)`` from percentages of the executable entry.
+
+    Percent inputs use human units: ``0.45`` means 0.45%, not 45%.
+    This helper is intentionally strategy-agnostic so trigger-time and final
+    execution-time rebasing cannot drift apart.
+    """
+    entry = float(entry)
+    tp_fraction = float(tp_percent) / 100.0
+    sl_fraction = float(sl_percent) / 100.0
+    if not math.isfinite(entry) or entry <= 0:
+        raise ValueError("invalid_entry_price")
+    if not math.isfinite(tp_fraction) or not math.isfinite(sl_fraction) or tp_fraction <= 0 or sl_fraction <= 0:
+        raise ValueError("invalid_fixed_exit_percent")
+    if direction == Direction.LONG:
+        return entry * (1.0 - sl_fraction), entry * (1.0 + tp_fraction)
+    if direction == Direction.SHORT:
+        return entry * (1.0 + sl_fraction), entry * (1.0 - tp_fraction)
+    raise ValueError("fixed_exits_require_direction")
+
+
 def frames(snapshot, fallback=None) -> dict[str, list]:
     tf = dict(getattr(snapshot, "timeframes", {}) or {}) if snapshot is not None else {}
     if "5m" not in tf and fallback is not None:

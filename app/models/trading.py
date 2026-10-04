@@ -54,4 +54,7 @@ class Position:
     stop_gap_bps:float|None=None
     exit_quote_delay_ms:int|None=None
     exit_quote_source:str|None=None
+    fixed_exit_profile:bool=False
+    fixed_tp_percent:float|None=None
+    fixed_sl_percent:float|None=None
     opened_at:int|None=None; closed_at:int|None=None; exit_price:float|None=None; exit_reason:str|None=None

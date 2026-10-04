@@ -1,0 +1,131 @@
+from functools import lru_cache
+from typing import Literal
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+    environment: Literal['development','test','staging','production'] = 'development'
+    log_level: str = 'INFO'
+    trading_worker_enabled: bool = False
+    engine_heartbeat_seconds: float = Field(900.0, ge=60.0, le=3600.0)
+    cors_allowed_origins: str = ''
+    coinw_rest_base_url: str = 'https://api.coinw.com'
+    coinw_ws_url: str = 'wss://ws.futurescw.com/perpum'
+    mongodb_uri: str = ''
+    mongodb_database: str = 'kaeleon'
+    default_symbol: str = 'BTC'
+    default_timeframe: str = '5m'
+    paper_initial_equity: float = Field(100, gt=0)
+    paper_taker_fee: float = Field(.0006, ge=0)
+    paper_maker_fee: float = Field(.0001, ge=0)
+    paper_slippage_bps: float = Field(2.0, ge=0)
+    paper_max_spread_bps: float = Field(30.0, ge=0)
+    trade_target_front_run_ratio: float = Field(0.92, ge=0.80, le=1.0)
+    # V2 strategy TP levels are structure/strength-derived. There is deliberately
+    # no server-side BREAKOUT/SWEEP target-RR setting: RR is measured after the
+    # natural target is selected and is used only as an edge/geometry check.
+    # Disabled during strategy-validation phase: keep the original SL untouched
+    # so every trade resolves naturally at its initial SL or TP.
+    trade_dynamic_protection_enabled: bool = False
+    trade_break_even_activation_ratio: float = Field(0.55, ge=0.20, le=0.90)
+    trade_profit_lock_activation_ratio: float = Field(0.80, ge=0.40, le=0.98)
+    trade_profit_lock_capture_ratio: float = Field(0.35, ge=0.05, le=0.80)
+    trade_exit_fee_rate_estimate: float = Field(0.0006, ge=0.0, le=0.01)
+    trade_break_even_buffer_bps: float = Field(3.0, ge=0.0, le=50.0)
+    # Entry-quality / anti-reentry protections. These defaults intentionally favor
+    # fewer, cleaner entries over rapid re-entry after a failed setup.
+    trade_post_loss_global_cooldown_seconds: float = Field(900.0, ge=0.0, le=7200.0)
+    trade_post_loss_symbol_cooldown_seconds: float = Field(1800.0, ge=0.0, le=14400.0)
+    trade_entry_max_chase_atr: float = Field(0.20, ge=0.0, le=2.0)
+    trade_entry_max_adverse_reversal_atr: float = Field(0.15, ge=0.0, le=2.0)
+    # v6 uses one final market-noise floor. The old 0.90 ATR global floor
+    # duplicated strategy geometry and systematically rejected early entries.
+    trade_entry_min_stop_atr: float = Field(0.30, ge=0.0, le=5.0)
+    trade_entry_min_stop_spreads: float = Field(3.0, ge=0.0, le=20.0)
+    trade_entry_orderbook_conflict_threshold: float = Field(0.35, ge=0.0, le=0.95)
+    trade_armed_entry_enabled: bool = True
+    trade_legacy_entry_fallback_enabled: bool = False
+    trade_armed_setup_ttl_seconds: float = Field(600.0, ge=60.0, le=1800.0)
+    # v6.1 ARMED->TRIGGERED calibration. Small ATR-based buffers absorb quote
+    # noise without reopening the old late-entry/chasing behavior.
+    trade_armed_chase_tolerance_atr: float = Field(0.15, ge=0.0, le=0.50)
+    trade_armed_trigger_close_tolerance_atr: float = Field(0.08, ge=0.0, le=0.30)
+    # If the most recent CLOSED 1m candle finished immediately before arming and
+    # is unusually strong, it may confirm the setup without waiting another minute.
+    trade_armed_fast_confirm_enabled: bool = True
+    trade_armed_fast_confirm_max_age_seconds: float = Field(30.0, ge=5.0, le=60.0)
+    trade_armed_consumed_ttl_seconds: float = Field(3600.0, ge=600.0, le=21600.0)
+    # Once a setup is ARMED it leaves the scanner rotation and gets its own
+    # lightweight quote + closed-1m monitor. This is deliberately separate from
+    # market_poll_seconds so discovery quality is not traded for execution speed.
+    trade_armed_monitor_poll_seconds: float = Field(2.0, ge=0.5, le=10.0)
+    # Precursors are followed independently from the rotating market scanner.
+    # WATCHING uses closed 5m/15m/1h data, so it does not need a 2-second cadence.
+    trade_setup_watch_poll_seconds: float = Field(15.0, ge=5.0, le=60.0)
+    trade_setup_watch_ttl_seconds: float = Field(1800.0, ge=300.0, le=3600.0)
+    trade_funnel_emit_seconds: float = Field(300.0, ge=30.0, le=3600.0)
+    trade_funnel_emit_every: int = Field(50, ge=5, le=1000)
+    # DEMO TP/SL uses the public CoinW depth websocket as its primary exit feed.
+    # The existing REST position monitor remains active as a fallback.
+    trade_realtime_exit_ws_enabled: bool = True
+    trade_realtime_exit_reconnect_seconds: float = Field(1.0, ge=0.25, le=30.0)
+    # Temporary V2 validation profile: in DEMO, rebase TP/SL from the final executable
+    # entry price so strategy entry quality can be measured without oversized targets.
+    v2_fixed_exits_enabled: bool = True
+    v2_fixed_tp_percent: float = Field(0.45, gt=0.0, le=5.0)
+    v2_fixed_sl_percent: float = Field(0.45, gt=0.0, le=5.0)
+    market_poll_seconds: float = Field(2.0, gt=0)
+    market_scanner_depth: int = Field(30, ge=1, le=50)
+    market_scanner_parallel: int = Field(5, ge=1, le=10)
+    market_scanner_cache_seconds: float = Field(30.0, gt=0)
+    fixed_leverage: int = Field(10, ge=10, le=10)
+    min_operating_capital: float = Field(3.0, gt=0)
+    max_active_users: int = Field(1000, ge=1, le=10000)
+    user_runtime_refresh_seconds: float = Field(10.0, gt=0)
+    engine_state_persist_seconds: float = Field(15.0, ge=2.0, le=300.0)
+    trade_persist_timeout_seconds: float = Field(4.0, ge=0.5, le=15.0)
+    trade_persist_retries: int = Field(2, ge=1, le=5)
+    regime_structure_weight: float = Field(.25, ge=0, le=1)
+    regime_momentum_weight: float = Field(.20, ge=0, le=1)
+    regime_volatility_weight: float = Field(.20, ge=0, le=1)
+    regime_liquidity_weight: float = Field(.20, ge=0, le=1)
+    regime_breadth_weight: float = Field(.15, ge=0, le=1)
+
+    credential_encryption_key: str = ''
+
+    # admin (from admin_ui / admin_data_views branch)
+    admin_phone: str = ''
+
+    # billing / subscriptions (from billing_referrals branch)
+    live_trial_days: int = Field(5, ge=1, le=30)
+    payment_wallet: str = ''
+    payment_network: str = 'BNB_SMART_CHAIN'
+    bsc_rpc_url: str = 'https://bsc-dataseed.binance.org/'
+    # Binance-Peg USDT on BNB Smart Chain; override with USDT_BSC_CONTRACT if needed.
+    usdt_bsc_contract: str = '0x55d398326f99059fF775485246999027B3197955'
+    usdt_decimals: int = Field(18, ge=0, le=36)
+
+    # telegram registration verification
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ''
+    telegram_bot_username: str = ''
+    telegram_webhook_url: str = ''
+    telegram_webhook_secret: str = ''
+    telegram_auto_set_webhook: bool = True
+    telegram_api_timeout_seconds: float = Field(10.0, gt=0, le=60)
+
+    @property
+    def telegram_registration_configured(self) -> bool:
+        required = bool(
+            self.telegram_bot_token
+            and self.telegram_bot_username
+            and self.telegram_webhook_secret
+        )
+        if self.telegram_auto_set_webhook:
+            required = required and bool(self.telegram_webhook_url)
+        return required
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

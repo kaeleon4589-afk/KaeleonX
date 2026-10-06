@@ -73,6 +73,9 @@ class Database:
         self.db.orders.create_index([('order_id', ASCENDING)])
         self.db.positions.create_index([('position_id', ASCENDING)], unique=True)
         self.db.positions.create_index([('user_id', ASCENDING), ('mode', ASCENDING), ('status', ASCENDING)])
+        # Admin/statistics queries filter globally by mode and, after a reset, by
+        # opened_at.  The user-first index above cannot serve that access pattern.
+        self.db.positions.create_index([('mode', ASCENDING), ('opened_at', DESCENDING)])
         self.db.pnl.create_index([('position_id', ASCENDING)])
         self.db.statistics_periods.create_index('reset_id', unique=True)
         self.db.statistics_periods.create_index([('mode', ASCENDING), ('started_at', DESCENDING)])
@@ -177,6 +180,44 @@ class Database:
         if sort_field:
             rows.sort(key=lambda d: (d.get(sort_field) is not None, d.get(sort_field)), reverse=descending)
         return rows[:limit] if limit else rows
+
+    def statistics_positions(self, mode, since=None):
+        """Return only fields needed by the admin statistics report.
+
+        Production used to fetch every full position document for a mode with an
+        unbounded cursor.  As history grew, that query could exceed the MongoDB
+        socket timeout and turn the admin statistics page into a 500.  Keep the
+        query bounded to the active statistics period and project only metric
+        fields.
+        """
+        if self.db is not None:
+            query = {'mode': mode}
+            if since is not None:
+                query['opened_at'] = {'$gte': since}
+            projection = {
+                '_id': 0,
+                'opened_at': 1,
+                'status': 1,
+                'settlement_pending': 1,
+                'net_pnl': 1,
+                'realized_pnl': 1,
+                'entry_fee': 1,
+                'exit_fee': 1,
+                'funding_pnl': 1,
+            }
+            return list(self.db.positions.find(query, projection))
+
+        rows = [
+            dict(d) for c, d in self.memory
+            if c == 'positions' and d.get('mode') == mode
+            and (since is None or (isinstance(d.get('opened_at'), (int, float))
+                                   and d.get('opened_at') >= since))
+        ]
+        fields = {
+            'opened_at', 'status', 'settlement_pending', 'net_pnl',
+            'realized_pnl', 'entry_fee', 'exit_fee', 'funding_pnl',
+        }
+        return [{k: v for k, v in row.items() if k in fields} for row in rows]
 
     def update_many(self, collection, key, update):
         key = bson_safe(dict(key))

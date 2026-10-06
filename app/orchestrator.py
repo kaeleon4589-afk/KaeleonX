@@ -59,7 +59,7 @@ class TradingOrchestrator:
                  entry_orderbook_conflict_threshold=0.35,
                  armed_entry_enabled=True, legacy_entry_fallback_enabled=False,
                  funnel_emit_seconds=300.0, funnel_emit_every=50, execution_quote_provider=None,
-                 fixed_exits_enabled=False, fixed_tp_percent=0.55, fixed_sl_percent=0.40):
+                 fixed_exits_enabled=False, fixed_tp_percent=0.45, fixed_sl_percent=0.45):
         self.execution_quote_provider = execution_quote_provider
         self.regime_engine = regime_engine
         self.router = router

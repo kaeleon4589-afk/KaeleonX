@@ -73,8 +73,8 @@ class Settings(BaseSettings):
     # Temporary V2 validation profile: in DEMO, rebase TP/SL from the final executable
     # entry price so strategy entry quality can be measured without oversized targets.
     v2_fixed_exits_enabled: bool = True
-    v2_fixed_tp_percent: float = Field(0.55, gt=0.0, le=5.0)
-    v2_fixed_sl_percent: float = Field(0.40, gt=0.0, le=5.0)
+    v2_fixed_tp_percent: float = Field(0.45, gt=0.0, le=5.0)
+    v2_fixed_sl_percent: float = Field(0.45, gt=0.0, le=5.0)
     market_poll_seconds: float = Field(2.0, gt=0)
     market_scanner_depth: int = Field(30, ge=1, le=50)
     market_scanner_parallel: int = Field(5, ge=1, le=10)

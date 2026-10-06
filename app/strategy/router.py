@@ -48,8 +48,8 @@ class StrategyRouter:
         armed_fast_confirm_max_age_seconds: float | None = None,
         setup_watch_ttl_seconds: float | None = None,
         fixed_exits_enabled: bool = False,
-        fixed_tp_percent: float = 0.55,
-        fixed_sl_percent: float = 0.40,
+        fixed_tp_percent: float = 0.45,
+        fixed_sl_percent: float = 0.45,
     ):
         self.breakout = BreakoutRetestStrategyV2()
         self.sweep = LiquiditySweepStrategyV2()

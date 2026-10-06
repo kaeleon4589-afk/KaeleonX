@@ -166,7 +166,7 @@ class BreakoutRetestStrategyV2:
                 extension = (level - float(c[idx])) / atr_value
             if not broke:
                 continue
-            if shape["body_ratio"] < 0.40 or not close_pos_ok or rv < 0.80:
+            if shape["body_ratio"] < 0.38 or not close_pos_ok or rv < 0.75:
                 continue
             if shape["range"] > 2.3 * atr_value or extension > 1.35:
                 continue
@@ -197,7 +197,7 @@ class BreakoutRetestStrategyV2:
             1.0,
         )
 
-        retest_tolerance = 0.30 * atr_value
+        retest_tolerance = 0.32 * atr_value
         invalidation_buffer = 0.62 * atr_value
         retest_idx = None
         retest_extreme = None
@@ -371,7 +371,7 @@ class BreakoutRetestStrategyV2:
             + freshness * 7.0,
             0.0, 100.0,
         )
-        min_score = env_float("V2_BREAKOUT_MIN_SCORE", 66.0, 50.0, 90.0)
+        min_score = env_float("V2_BREAKOUT_MIN_SCORE", 65.0, 50.0, 90.0)
         if quality < min_score:
             return self._reject("quality_below_threshold", quality=quality, minimum=min_score)
 

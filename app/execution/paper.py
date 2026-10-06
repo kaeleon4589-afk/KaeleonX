@@ -36,8 +36,8 @@ class PaperExecutionEngine:
             try:
                 stop_price,target_price=fixed_exit_prices(
                     fill, intent.direction,
-                    float(metadata.get('fixed_tp_percent') or 0.55),
-                    float(metadata.get('fixed_sl_percent') or 0.40),
+                    float(metadata.get('fixed_tp_percent') or 0.45),
+                    float(metadata.get('fixed_sl_percent') or 0.45),
                 )
             except (TypeError, ValueError):
                 return {'accepted':False,'filled':False,'reason':'invalid_fixed_exit_profile'}

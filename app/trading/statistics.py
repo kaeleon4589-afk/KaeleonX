@@ -31,8 +31,14 @@ class TradingStatistics:
                                     sort_field='started_at')
         period = periods[0] if periods else None
         since = period['started_at'] if period else None
-        rows = self.db.find_many('positions', {'mode': mode}, limit=0)
-        selected = self.active_positions(mode, rows)
+
+        # Do not pull the entire historical positions collection into the API
+        # process.  Statistics only needs the current period, and only a handful
+        # of PnL/status fields from each row.
+        selected = self.db.statistics_positions(mode, since)
+        total_positions = self.db.count('positions', {'mode': mode})
+        excluded_positions = max(total_positions - len(selected), 0) if since is not None else 0
+
         closed = [p for p in selected if p.get('status') == 'CLOSED' and not p.get('settlement_pending')]
         pnls = [position_net_pnl(p) for p in closed]
         profit = sum(p for p in pnls if p > 0)
@@ -48,7 +54,7 @@ class TradingStatistics:
                 'pnl': sum(pnls), 'win_rate': wins / len(pnls) * 100 if pnls else 0,
                 'profit_factor': profit / loss if loss else None,
                 'open_positions': sum(p.get('status') == 'OPEN' for p in selected),
-                'excluded_positions': len(rows) - len(selected),
+                'excluded_positions': excluded_positions,
             },
         }
 

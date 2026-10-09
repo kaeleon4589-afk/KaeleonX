@@ -47,9 +47,6 @@ class StrategyRouter:
         armed_fast_confirm_enabled: bool | None = None,
         armed_fast_confirm_max_age_seconds: float | None = None,
         setup_watch_ttl_seconds: float | None = None,
-        fixed_exits_enabled: bool = False,
-        fixed_tp_percent: float = 0.45,
-        fixed_sl_percent: float = 0.45,
     ):
         self.breakout = BreakoutRetestStrategyV2()
         self.sweep = LiquiditySweepStrategyV2()
@@ -61,9 +58,6 @@ class StrategyRouter:
             trigger_close_tolerance_atr=_env_float("TRADE_ARMED_TRIGGER_CLOSE_TOLERANCE_ATR", 0.08) if armed_trigger_close_tolerance_atr is None else armed_trigger_close_tolerance_atr,
             fast_confirm_enabled=_env_bool("TRADE_ARMED_FAST_CONFIRM_ENABLED", True) if armed_fast_confirm_enabled is None else armed_fast_confirm_enabled,
             fast_confirm_max_age_seconds=_env_float("TRADE_ARMED_FAST_CONFIRM_MAX_AGE_SECONDS", 30.0) if armed_fast_confirm_max_age_seconds is None else armed_fast_confirm_max_age_seconds,
-            fixed_exits_enabled=fixed_exits_enabled,
-            fixed_tp_percent=fixed_tp_percent,
-            fixed_sl_percent=fixed_sl_percent,
         )
         self.legacy = LegacyArmedEntryEngine(
             ttl_seconds=_env_float("TRADE_ARMED_SETUP_TTL_SECONDS", 600.0) if armed_ttl_seconds is None else armed_ttl_seconds,

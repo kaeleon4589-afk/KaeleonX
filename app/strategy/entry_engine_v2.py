@@ -13,7 +13,7 @@ from app.position.protection import (
     profit_lock_capture_ratio,
 )
 from app.strategy.v2_common import (
-    StrategyCandidate, dynamic_min_rr, env_float, executable_price, fixed_exit_prices, orderbook_imbalance,
+    StrategyCandidate, dynamic_min_rr, env_float, executable_price, orderbook_imbalance,
 )
 
 
@@ -43,9 +43,6 @@ class EntryLifecycleV2:
         trigger_close_tolerance_atr: float = 0.08,
         fast_confirm_enabled: bool = True,
         fast_confirm_max_age_seconds: float = 30.0,
-        fixed_exits_enabled: bool = False,
-        fixed_tp_percent: float = 0.45,
-        fixed_sl_percent: float = 0.45,
     ):
         self.ttl_ms = max(60_000, int(float(ttl_seconds) * 1000))
         self.watch_ttl_ms = max(300_000, int(float(watch_ttl_seconds) * 1000))
@@ -54,9 +51,6 @@ class EntryLifecycleV2:
         self.trigger_close_tolerance_atr = max(0.0, float(trigger_close_tolerance_atr))
         self.fast_confirm_enabled = bool(fast_confirm_enabled)
         self.fast_confirm_max_age_ms = max(5_000, int(float(fast_confirm_max_age_seconds) * 1000))
-        self.fixed_exits_enabled = bool(fixed_exits_enabled)
-        self.fixed_tp_fraction = max(0.0001, float(fixed_tp_percent) / 100.0)
-        self.fixed_sl_fraction = max(0.0001, float(fixed_sl_percent) / 100.0)
         self._consumed: dict[str, tuple[int, str]] = {}
         self._consumed_watches: dict[str, tuple[int, str]] = {}
 
@@ -230,11 +224,10 @@ class EntryLifecycleV2:
         target = float(setup.target_price)
         strategy_stop = stop
         strategy_target = target
-        fixed_exit_mode = bool(self.fixed_exits_enabled and str(meta.get("engine_version") or "").lower() == "v2")
         if target <= 0:
             self.consume(setup, "trigger_invalid_target_geometry", now_ms)
             return "cancelled", None, {"reason": "trigger_invalid_target_geometry", "price": price, "target": target}
-        if not fixed_exit_mode and setup.direction == Direction.LONG:
+        if setup.direction == Direction.LONG:
             if target <= price:
                 self.consume(setup, "target_already_reached_before_entry", now_ms)
                 return "cancelled", None, {
@@ -243,7 +236,7 @@ class EntryLifecycleV2:
                     "target": target,
                     "structural_target": structural_target,
                 }
-        elif not fixed_exit_mode:
+        else:
             if target >= price:
                 self.consume(setup, "target_already_reached_before_entry", now_ms)
                 return "cancelled", None, {
@@ -396,14 +389,6 @@ class EntryLifecycleV2:
                 "price": price,
             }
 
-        # Fixed-exit validation profile is applied only after entry confirmation.
-        # It does not change discovery, direction, invalidation, anti-chase or
-        # microstructure confirmation.  Dynamic structure is preserved in metadata.
-        if fixed_exit_mode:
-            stop, target = fixed_exit_prices(
-                price, setup.direction, self.fixed_tp_fraction * 100.0, self.fixed_sl_fraction * 100.0
-            )
-
         if setup.direction == Direction.LONG:
             reward = target - price
         else:
@@ -411,7 +396,7 @@ class EntryLifecycleV2:
         risk = abs(price - stop)
         rr = reward / max(risk, 1e-12)
         strategy_min_rr = float(meta.get("minimum_viable_rr") or dynamic_min_rr(setup.strategy, setup.quality))
-        min_rr = 0.0 if fixed_exit_mode else strategy_min_rr
+        min_rr = strategy_min_rr
         if rr < min_rr:
             return "pending", None, {
                 "reason": "trigger_rr_temporarily_low",
@@ -440,12 +425,11 @@ class EntryLifecycleV2:
             "structural_target_price": structural_target,
             "minimum_viable_rr": min_rr,
             "strategy_minimum_viable_rr": strategy_min_rr,
-            "fixed_exit_profile": fixed_exit_mode,
-            "fixed_tp_percent": self.fixed_tp_fraction * 100.0 if fixed_exit_mode else None,
-            "fixed_sl_percent": self.fixed_sl_fraction * 100.0 if fixed_exit_mode else None,
+            "exit_profile": "strategy_dynamic",
+            "fixed_exit_profile": False,
             "strategy_stop_price": strategy_stop,
             "strategy_target_price": strategy_target,
-            "target_locked_at_arm": not fixed_exit_mode,
+            "target_locked_at_arm": True,
             "break_even_activation_ratio": break_even_activation_ratio(),
             "profit_lock_activation_ratio": profit_lock_activation_ratio(),
             "profit_lock_capture_ratio": profit_lock_capture_ratio(),

@@ -12,9 +12,9 @@ from datetime import datetime, timezone, timedelta
 from app.models.enums import Direction
 from app.models.trading import Position
 from app.position.protection import apply_intent_management
-from app.strategy.v2_common import fixed_exit_prices
 from app.trading.persistence import TradePersistence
 from app.trading.rejection_funnel import RejectionFunnel
+from app.trading.edge_metrics import edge_estimate
 
 
 # Legacy strategies historically used a global execution-RR floor. Engine V2
@@ -59,7 +59,7 @@ class TradingOrchestrator:
                  entry_orderbook_conflict_threshold=0.35,
                  armed_entry_enabled=True, legacy_entry_fallback_enabled=False,
                  funnel_emit_seconds=300.0, funnel_emit_every=50, execution_quote_provider=None,
-                 fixed_exits_enabled=False, fixed_tp_percent=0.45, fixed_sl_percent=0.45):
+):
         self.execution_quote_provider = execution_quote_provider
         self.regime_engine = regime_engine
         self.router = router
@@ -86,9 +86,6 @@ class TradingOrchestrator:
         self.entry_min_stop_atr = max(0.0, float(entry_min_stop_atr))
         self.entry_min_stop_spreads = max(0.0, float(entry_min_stop_spreads))
         self.entry_orderbook_conflict_threshold = min(0.95, max(0.0, float(entry_orderbook_conflict_threshold)))
-        self.fixed_exits_enabled = bool(fixed_exits_enabled)
-        self.fixed_tp_fraction = max(0.0001, float(fixed_tp_percent) / 100.0)
-        self.fixed_sl_fraction = max(0.0001, float(fixed_sl_percent) / 100.0)
         self.armed_entry_enabled = bool(armed_entry_enabled)
         self.legacy_entry_fallback_enabled = bool(legacy_entry_fallback_enabled)
         self.armed_setups = {}
@@ -1344,33 +1341,17 @@ class TradingOrchestrator:
             entry = float(intent.entry_price)
             metadata = dict(getattr(intent, 'metadata', {}) or {})
             engine_version = str(metadata.get("engine_version") or "").lower()
-            fixed_exit_mode = bool(self.fixed_exits_enabled and engine_version == "v2")
-            if fixed_exit_mode:
-                strategy_stop = float(intent.stop_price)
-                strategy_target = float(intent.target_price)
-                stop, target = fixed_exit_prices(
-                    entry, intent.direction, self.fixed_tp_fraction * 100.0, self.fixed_sl_fraction * 100.0
-                )
-                metadata.update({
-                    "fixed_exit_profile": True,
-                    "fixed_tp_percent": self.fixed_tp_fraction * 100.0,
-                    "fixed_sl_percent": self.fixed_sl_fraction * 100.0,
-                    "strategy_stop_price": metadata.get("strategy_stop_price", strategy_stop),
-                    "strategy_target_price": metadata.get("strategy_target_price", strategy_target),
-                    "sl_pct": self.fixed_sl_fraction,
-                    "tp_pct": self.fixed_tp_fraction,
-                    "minimum_viable_rr": 0.0,
-                    "target_locked_at_arm": False,
-                })
-                intent = replace(intent, stop_price=stop, target_price=target, metadata=metadata)
-            else:
-                stop = float(intent.stop_price)
-                target = float(intent.target_price)
+            # Engine V2 targets/stops are locked from confirmed market structure.
+            # Do not rebase them to entry-relative percentages after refreshing
+            # the executable quote; the final geometry/RR guards run below.
+            stop = float(intent.stop_price)
+            target = float(intent.target_price)
             risk_distance = abs(entry - stop)
             reward_distance = abs(target - entry)
             execution_rr = reward_distance / max(risk_distance, 1e-12)
             geometry_ok = (
                 math.isfinite(execution_rr)
+                and min(entry, stop, target) > 0
                 and execution_rr > 0
                 and (
                     (intent.direction == Direction.LONG and stop < entry < target)
@@ -1477,7 +1458,7 @@ class TradingOrchestrator:
                 # be closer to that locked stop. A legacy 0.30 ATR / 3-spread
                 # floor was blocking roughly half of the triggered setups in the
                 # observed funnel, so V2 uses a smaller *final* noise guard only.
-                effective_min_stop_atr = (0.0 if fixed_exit_mode else min(self.entry_min_stop_atr, 0.22)) if is_v2 else self.entry_min_stop_atr
+                effective_min_stop_atr = min(self.entry_min_stop_atr, 0.22) if is_v2 else self.entry_min_stop_atr
                 effective_min_stop_spreads = min(self.entry_min_stop_spreads, 2.0) if is_v2 else self.entry_min_stop_spreads
                 minimum_stop_distance = max(
                     atr_value * effective_min_stop_atr,
@@ -1613,10 +1594,7 @@ class TradingOrchestrator:
                 strategy_min_rr = float(strategy_min_rr)
             except (TypeError, ValueError):
                 strategy_min_rr = float("nan")
-            if fixed_exit_mode:
-                minimum_execution_rr = 0.0
-                minimum_rr_source = "fixed_exit_profile"
-            elif engine_version == "v2" and math.isfinite(strategy_min_rr) and strategy_min_rr > 0:
+            if engine_version == "v2" and math.isfinite(strategy_min_rr) and strategy_min_rr > 0:
                 minimum_execution_rr = strategy_min_rr
                 minimum_rr_source = "strategy_dynamic"
             else:
@@ -1648,6 +1626,38 @@ class TradingOrchestrator:
                 )
                 return None
 
+            # Stage 1 profitability improvement: calculate executable TP/SL edge
+            # after fees and estimated exit slippage. A TP unable to cover these
+            # basic costs is economically nonviable even with a 100% hit rate.
+            # No arbitrary win-rate/RR tightening: V2 structural guards stay as-is.
+            edge = {}
+            if engine_version == "v2":
+                edge = edge_estimate(
+                    entry=entry, stop=stop, target=target, direction=intent.direction,
+                    taker_fee_rate=max(0.0, float(getattr(
+                        self.execution, "fee_rate", getattr(self.risk, "fee_rate", 0.0006)
+                    ))),
+                    exit_slippage_bps=max(0.0, float(getattr(
+                        self.execution, "slippage_bps", getattr(self.risk, "exit_slippage_bps", 0.0)
+                    ))),
+                )
+            if (engine_version == "v2" and self.execution_mode in ("demo", "paper")
+                    and edge["estimated_net_tp_bps"] <= 0):
+                self.last_decision[key] = now
+                self.last_rejection = "target_does_not_cover_costs"
+                self._funnel("post_trigger_rejected", self.last_rejection, user_id=user_id, symbol=snapshot.symbol)
+                self.audit.event(
+                    "SIGNAL_REJECTED", decision_id, user_id=user_id, mode=self.execution_mode,
+                    symbol=snapshot.symbol, reason=self.last_rejection, stage="REJECTED",
+                    lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                    strategy=getattr(intent.strategy, "value", str(intent.strategy)), **edge,
+                )
+                self._terminal_lifecycle(
+                    user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol,
+                    decision_id=decision_id, reason=self.last_rejection,
+                    strategy=intent.strategy, direction=intent.direction,
+                )
+                return None
             structural_rr = intent_meta.get("structural_rr_estimate")
             self.audit.event(
                 "SIGNAL_ACCEPTED", decision_id, user_id=user_id,
@@ -1661,10 +1671,9 @@ class TradingOrchestrator:
                 stop_price=stop, target_price=target,
                 execution_rr=round(execution_rr, 4), structural_rr=structural_rr,
                 minimum_rr=round(minimum_execution_rr, 4), minimum_rr_source=minimum_rr_source,
-                exit_profile=("fixed_pct" if fixed_exit_mode else "strategy_dynamic"),
-                fixed_tp_percent=(self.fixed_tp_fraction * 100.0 if fixed_exit_mode else None),
-                fixed_sl_percent=(self.fixed_sl_fraction * 100.0 if fixed_exit_mode else None),
+                exit_profile="strategy_dynamic" if engine_version == "v2" else "legacy",
                 risk_multiplier=intent.risk_multiplier,
+                **edge,
             )
             self._schedule_lifecycle_stage(
                 user_id, lifecycle_id=lifecycle_ctx.get("lifecycle_id"), stage="SIGNAL_ACCEPTED",

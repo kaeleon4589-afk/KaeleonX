@@ -3,7 +3,6 @@ import math
 from app.models.trading import Position
 from app.models.enums import Direction
 from app.position.protection import apply_intent_management
-from app.strategy.v2_common import fixed_exit_prices
 
 class PaperExecutionEngine:
     mode='paper'
@@ -32,16 +31,6 @@ class PaperExecutionEngine:
         stop_price=float(intent.stop_price)
         target_price=float(intent.target_price)
         metadata=getattr(intent, 'metadata', {}) or {}
-        if bool(metadata.get('fixed_exit_profile')):
-            try:
-                stop_price,target_price=fixed_exit_prices(
-                    fill, intent.direction,
-                    float(metadata.get('fixed_tp_percent') or 0.45),
-                    float(metadata.get('fixed_sl_percent') or 0.45),
-                )
-            except (TypeError, ValueError):
-                return {'accepted':False,'filled':False,'reason':'invalid_fixed_exit_profile'}
-
         if not ((intent.direction == Direction.LONG and stop_price < fill < target_price)
                 or (intent.direction == Direction.SHORT and target_price < fill < stop_price)):
             return {'accepted':False,'filled':False,'reason':'fill_outside_trade_geometry'}

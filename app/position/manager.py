@@ -440,8 +440,19 @@ class PositionManager:
             else:
                 price = float(p.tp2_price or p.target_price)
         elif self.evaluate_local_exits:
+            # New structure-based DEMO trades use the executable quote, including
+            # adverse slippage/gaps. Do not credit a TP price better than the
+            # strategy's planned target simply because monitoring was delayed.
             slip = self.exit_slippage_bps / 10000
             price *= (1 - slip) if p.direction == Direction.LONG else (1 + slip)
+            if action in ("TP1", "TP2"):
+                target = (float(p.tp1_price) if action == "TP1" and p.tp1_price is not None
+                          else float(p.tp2_price or p.target_price))
+                price = min(price, target) if p.direction == Direction.LONG else max(price, target)
+            elif action == "SL":
+                # A gapping market may fill worse than the stop; never fabricate
+                # an SL improvement beyond the requested protective level.
+                price = min(price, float(p.stop_price)) if p.direction == Direction.LONG else max(price, float(p.stop_price))
         p.revision += 1
         qty = p.remaining_quantity or p.quantity
         if action == "TP1" and not p.tp1_hit:

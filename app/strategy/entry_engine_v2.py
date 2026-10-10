@@ -303,6 +303,10 @@ class EntryLifecycleV2:
 
         live_confirmed = bool(
             self.fast_confirm_enabled
+            # A sweep is a reversal setup, not a momentum breakout.  A fresh
+            # quote + non-extreme book cannot replace proof of a reclaimed
+            # 1m close; keep this shortcut available to BREAKOUT_RETEST only.
+            and setup.strategy != Strategy.LIQUIDITY_SWEEP
             and float(setup.quality) >= live_quality_min
             and quote_age_ms is not None
             and quote_age_ms <= live_max_quote_age_ms
@@ -377,6 +381,39 @@ class EntryLifecycleV2:
 
             if book_conflict:
                 return "pending", None, {"reason": "micro_orderbook_conflict", "orderbook_imbalance": imbalance}
+
+            if setup.strategy == Strategy.LIQUIDITY_SWEEP:
+                # Require the reversal to remain visible at the executable
+                # quote, not merely in a previously closed bullish/bearish bar.
+                # A failing check keeps the setup ARMED, allowing a later
+                # recovery without increasing the strategy's scan thresholds.
+                candle_age_ms = now_ms - candle_close_ms
+                if candle_age_ms > 90_000:
+                    return "pending", None, {
+                        "reason": "sweep_fresh_reversal_pending",
+                        "candle_age_ms": candle_age_ms,
+                    }
+                reclaim_tolerance = 0.10 * atr_value
+                live_reclaim = (
+                    price >= max(float(setup.trigger_price), c) - reclaim_tolerance
+                    if setup.direction == Direction.LONG
+                    else price <= min(float(setup.trigger_price), c) + reclaim_tolerance
+                )
+                # Book imbalance is a corroboration, not the main signal. Only
+                # meaningful counter-pressure delays an otherwise valid close.
+                counterpressure = imbalance is not None and (
+                    (setup.direction == Direction.LONG and imbalance < -0.30)
+                    or (setup.direction == Direction.SHORT and imbalance > 0.30)
+                )
+                if not live_reclaim or counterpressure:
+                    return "pending", None, {
+                        "reason": "sweep_live_reversal_pending",
+                        "price": price,
+                        "candle_close": c,
+                        "trigger_price": trigger_anchor,
+                        "orderbook_imbalance": imbalance,
+                        "live_reclaim": live_reclaim,
+                    }
 
             # A bullish/bearish closed candle is historical confirmation, not
             # proof that the executable quote still holds the breakout now.

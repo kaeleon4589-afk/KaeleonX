@@ -129,3 +129,16 @@ svg{width:22px;height:22px}.green{color:var(--green)!important}.red{color:var(--
 .recovery-gate-shell{min-height:100vh;display:grid;place-items:center;padding:28px 18px;background:radial-gradient(circle at 50% 5%,rgba(0,232,139,.12),transparent 32%),linear-gradient(145deg,#020b12,#06141e 50%,#020a10)}.recovery-gate-card{width:min(610px,100%);display:grid;gap:18px;background:linear-gradient(180deg,rgba(10,28,40,.98),rgba(4,14,22,.98));border:1px solid #194056;border-radius:24px;padding:32px;box-shadow:0 30px 100px rgba(0,0,0,.5)}.recovery-gate-card>.brand{margin-bottom:4px}.recovery-gate-card h1{font-size:clamp(28px,5vw,40px);margin:0}.recovery-gate-card .recovery-lead{color:#8fa6b5;line-height:1.65;margin:0}.recovery-shield{display:grid;place-items:center;width:62px;height:62px;border-radius:18px;background:rgba(0,232,139,.1);border:1px solid rgba(0,232,139,.25);font-size:28px}.recovery-warning{display:grid;gap:5px;border-left:3px solid #f5b93f;background:rgba(245,185,63,.06);padding:12px 14px;border-radius:8px}.recovery-warning strong{color:#ffd06b;font-size:12px}.recovery-warning span{color:#9db0bc;font-size:12px;line-height:1.55}.recovery-continue{width:100%}.recovery-gate-card>small{color:#607a8b;font-size:10px;line-height:1.5;text-align:center}
 @media(max-width:520px){.recovery-gate-card{padding:24px 18px;border-radius:18px}.recovery-code-box>strong{font-size:17px;letter-spacing:.035em}.password-recovery-card .auth-title h2{font-size:24px}.recovery-methods button{padding:15px}}
 .security-profile-button{border:1px solid rgba(0,232,139,.28)!important;background:rgba(0,232,139,.07)!important;color:#89f5c8!important}.security-modal-backdrop{position:fixed;inset:0;z-index:120;background:rgba(0,5,9,.78);backdrop-filter:blur(5px);display:grid;place-items:center;padding:18px}.security-modal{width:min(520px,100%);background:linear-gradient(180deg,#0a1d29,#05121b);border:1px solid #1b4256;border-radius:20px;padding:24px;box-shadow:0 28px 90px rgba(0,0,0,.6);display:grid;gap:16px}.security-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.security-modal-head h2{margin:4px 0 0;font-size:24px}.security-modal-head>button{border:1px solid #274657;background:#0b202d;color:#b8cbd5;border-radius:9px;width:38px;height:38px;font-size:24px;cursor:pointer}.security-modal>p{margin:0;color:#8fa6b5;line-height:1.6;font-size:13px}
+
+/* Visible even when the live websocket has recovered, because live bars do
+   not reconstruct missing CoinW historical candles. */
+.market-chart-history-notice {
+  margin: 0 12px 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(245, 158, 11, .35);
+  border-radius: 8px;
+  background: rgba(120, 74, 10, .12);
+  color: #f5d493;
+  font-size: 12px;
+  line-height: 1.4;
+}

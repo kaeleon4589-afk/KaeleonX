@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from dataclasses import replace
 import time
 
 from app.models.enums import Direction, Strategy
@@ -95,6 +96,11 @@ def test_v2_armed_entry_requires_micro_confirmation_and_is_single_use(monkeypatc
     engine = EntryLifecycleV2(fast_confirm_enabled=False)
     setup = engine.arm(candidate, "TEST", "5m")
     assert setup is not None
+    # This test exercises confirmation/single-use, not the strategy target
+    # geometry; provide an achievable reward at the reclaimed trigger.
+    target = setup.trigger_price + 2.0 * (setup.trigger_price - setup.stop_price)
+    setup = replace(setup, target_price=target,
+                    metadata={**setup.metadata, "structural_target_price": target})
 
     now = setup.armed_at_ms + 120_000
     monkeypatch.setattr("app.strategy.entry_engine_v2.time.time", lambda: now / 1000.0)
@@ -108,6 +114,16 @@ def test_v2_armed_entry_requires_micro_confirmation_and_is_single_use(monkeypatc
     snap.bids = [(snap.bid, 70)] * 12
     snap.asks = [(snap.ask, 45)] * 12
     status, intent, trace = engine.trigger(setup, snap, "decision-v2")
+    assert status == "pending", trace
+    assert intent is None
+    assert trace["reason"] == "breakout_live_reclaim_pending"
+
+    # A fresh quote reclaims the trigger geometry before submitting an order.
+    snap.ask = setup.trigger_price - 0.09 * setup.metadata["atr_value"]
+    snap.bid = snap.ask - .01
+    snap.bids = [(snap.bid, 70)] * 12
+    snap.asks = [(snap.ask, 45)] * 12
+    status, intent, trace = engine.trigger(setup, snap, "decision-v2-reclaim")
     assert status == "triggered", trace
     assert intent is not None
     assert intent.metadata["engine_version"] == "v2"

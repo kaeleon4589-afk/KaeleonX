@@ -524,6 +524,7 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
   const [searching, setSearching] = useState(false);
   const [streamState, setStreamState] = useState<StreamState>('connecting');
   const [chartError, setChartError] = useState('');
+  const [historyWarning, setHistoryWarning] = useState('');
   const [lastPrice, setLastPrice] = useState<number | null>(() => {
     const matching = positions.find((p) => positionSymbol(p) === firstPositionSymbol);
     return toNumber(matching?.current_price);
@@ -883,6 +884,7 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
           return;
         }
         setChartError('');
+        setHistoryWarning('');
         try {
           const response = await api.marketCandles(symbol.ticker, timeframeFromPeriod(period), 500);
           const sourceCandles = (response.items || []).slice().sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
@@ -894,9 +896,17 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
             setLastPriceSource('rest');
           }
           callback(bars, false);
-          if (!bars.length) setChartError('CoinW no devolvió velas para este mercado y temporalidad.');
+          if (bars.length < 10) {
+            setHistoryWarning(bars.length
+              ? `CoinW solo devolvió ${bars.length} velas históricas para este par y temporalidad.`
+              : 'CoinW no devolvió velas históricas para este mercado y temporalidad.');
+          }
         } catch (error) {
-          setChartError(humanizeError(error));
+          const detail = humanizeError(error);
+          setChartError(detail);
+          // A live websocket can keep printing new candles even if history
+          // failed. Its onopen handler must not hide this separate warning.
+          setHistoryWarning(`No se pudo recuperar el histórico de CoinW: ${detail}`);
           callback([], false);
         }
       },
@@ -1112,6 +1122,8 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
     if (!chart) return;
     setMarkPrice(null);
     setChartError('');
+    setHistoryWarning('');
+    setCandleHistory([]);
     chart.setSymbol({ ticker: canonicalSymbol(selected.symbol), pricePrecision: selected.price_precision || 6, volumePrecision: 4 });
   }, [selected.symbol, selected.price_precision]);
 
@@ -1376,6 +1388,7 @@ export default function LiveMarketChart({ positions, closedPositions = [], dynam
         <div className="market-chart-canvas" ref={chartRef} />
         {chartError && <div className="market-chart-error"><strong>Datos de mercado</strong><span>{chartError}</span></div>}
       </div>
+      {historyWarning && <p className="market-chart-history-notice" role="status">{historyWarning} Las velas en vivo pueden seguir apareciendo, pero no sustituyen el histórico.</p>}
 
       <div className="market-chart-footer">
         <span>Velas, Last, Mark, Index, Funding, Order Book y Trades: CoinW</span>

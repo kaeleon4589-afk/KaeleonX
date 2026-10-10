@@ -279,10 +279,11 @@ class EntryLifecycleV2:
                 or (setup.direction == Direction.SHORT and imbalance >= severe)
             )
 
-        # High-quality setups can confirm from the live executable quote + order
-        # book instead of always waiting up to one full minute for a new closed
-        # candle. This is deliberately strict and never bypasses target, stop,
-        # invalidation, RR or anti-chase geometry.
+        # A live quote and order-book snapshot do not prove the retest has
+        # resumed in the intended direction. In the two production V2
+        # strategies, require a confirmed 1m close before triggering. Keep
+        # setups ARMED while awaiting the candle (no extra discovery filters).
+        # The legacy fast-confirm switch is retained for other strategies.
         quote_received_ms = int(getattr(snapshot, "quote_received_ms", 0) or 0)
         quote_age_ms = (now_ms - quote_received_ms) if 0 < quote_received_ms <= now_ms else None
         live_quality_min = env_float("V2_LIVE_CONFIRM_MIN_QUALITY", 79.0, 70.0, 99.0)
@@ -303,10 +304,9 @@ class EntryLifecycleV2:
 
         live_confirmed = bool(
             self.fast_confirm_enabled
-            # A sweep is a reversal setup, not a momentum breakout.  A fresh
-            # quote + non-extreme book cannot replace proof of a reclaimed
-            # 1m close; keep this shortcut available to BREAKOUT_RETEST only.
-            and setup.strategy != Strategy.LIQUIDITY_SWEEP
+            # Neither a sweep reversal nor a breakout continuation should
+            # bypass the directionally confirmed close of a 1m candle.
+            and setup.strategy not in {Strategy.LIQUIDITY_SWEEP, Strategy.BREAKOUT_RETEST}
             and float(setup.quality) >= live_quality_min
             and quote_age_ms is not None
             and quote_age_ms <= live_max_quote_age_ms
@@ -341,9 +341,20 @@ class EntryLifecycleV2:
                     trace["orderbook_imbalance"] = imbalance
                 return "pending", None, trace
 
-            candle = c1[-1]
+            # Snapshots may include the currently forming 1m candle. Never
+            # mistake that mutable bar for a CLOSED confirmation candle.
+            closed_1m = [
+                row for row in c1
+                if 0 < int(getattr(row, "timestamp", 0) or 0) + 60_000 <= now_ms
+            ]
+            if not closed_1m:
+                return "pending", None, {"reason": "waiting_closed_1m_confirmation", "live_trigger_reached": trigger_reached}
+            candle = closed_1m[-1]
             cts = int(getattr(candle, "timestamp", 0) or 0)
             candle_close_ms = cts + 60_000
+            candle_age_ms = now_ms - candle_close_ms
+            if candle_age_ms > 90_000:
+                return "pending", None, {"reason": "confirmation_1m_stale", "candle_age_ms": candle_age_ms}
             age_from_arm = candle_close_ms - int(setup.armed_at_ms)
             recent_prearm = -self.fast_confirm_max_age_ms <= age_from_arm < 0
             post_arm = age_from_arm >= 0
@@ -374,6 +385,9 @@ class EntryLifecycleV2:
                     "trigger_price": setup.trigger_price,
                     "body_ratio": body_ratio,
                     "close_pos": close_pos,
+                    "candle_ts": cts,
+                    "candle_age_ms": candle_age_ms,
+                    "candle_open": o,
                     "live_quote_age_ms": quote_age_ms,
                     "live_trigger_reached": trigger_reached,
                     "live_zone_distance_atr": zone_distance / max(atr_value, 1e-12),
@@ -442,10 +456,14 @@ class EntryLifecycleV2:
                 "mode": confirmation_mode,
                 "candle_ts": cts,
                 "candle_close": c,
+                "candle_open": o,
+                "candle_age_ms": candle_age_ms,
                 "body_ratio": body_ratio,
                 "close_pos": close_pos,
                 "orderbook_imbalance": imbalance,
                 "price": price,
+                "trigger_price": trigger_anchor,
+                "atr_value": atr_value,
             }
 
         if setup.direction == Direction.LONG:
@@ -517,4 +535,8 @@ class EntryLifecycleV2:
             "price": price,
             "orderbook_imbalance": imbalance,
             "confirmation_mode": confirmation_mode,
+            "confirmed_1m_close": confirmation_payload.get("candle_close"),
+            "confirmed_1m_age_ms": confirmation_payload.get("candle_age_ms"),
+            "setup_age_ms": now_ms - int(setup.armed_at_ms),
+            "trigger_price": trigger_anchor,
         }

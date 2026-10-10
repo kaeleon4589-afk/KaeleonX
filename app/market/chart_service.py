@@ -256,6 +256,10 @@ class ChartMarketService:
         self.instruments_ttl = max(5.0, float(instruments_ttl))
         self._instrument_cache: tuple[float, list[MarketInstrument]] | None = None
         self._instrument_lock = asyncio.Lock()
+        # Newly listed/perpetual-only symbols can stream on CoinW before the
+        # instruments catalog includes them. Verify via CoinW REST, never
+        # blindly treat an arbitrary user-provided symbol as tradeable.
+        self._verified_fallbacks: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
     @staticmethod
     def _unwrap_rows(raw: Any) -> list[Any]:
@@ -320,7 +324,46 @@ class ChartMarketService:
         for item in await self.instruments(target, 500):
             if item["symbol"] == target:
                 return item
-        return None
+
+        # Some CoinW symbols are visible in the futures websocket/ticker but
+        # absent from /v1/perpum/instruments (observed for WLDPROPWUSDT).
+        # Verify that the exchange actually publishes a positive market price
+        # before using the canonical symbol to request historical candles.
+        now = time.monotonic()
+        cached = self._verified_fallbacks.get(target)
+        if cached and now - cached[0] < (300 if cached[1] else 30):
+            return cached[1]
+        valid_suffix = target.endswith("USDT") or target.endswith("_USDC")
+        base = coinw_pair_code(target)
+        if not valid_suffix or not 2 <= len(base) <= 28 or not base.replace("_", "").isalnum():
+            return None
+        try:
+            raw = await self.client.ticker(base)
+            market_price = normalize_ticker(raw).get("last")
+        except Exception:
+            market_price = None
+        if market_price is None or market_price <= 0:
+            # New listings can appear on the kline endpoint before the
+            # individual-ticker endpoint. Accept only real valid OHLC returned
+            # by CoinW; never create a synthetic history.
+            try:
+                raw_history = await self.client.klines(base, "5m", 50)
+                has_verified_history = any(
+                    normalize_rest_candle(row) is not None
+                    for row in self._unwrap_rows(raw_history)
+                )
+            except Exception:
+                has_verified_history = False
+            if not has_verified_history:
+                self._verified_fallbacks[target] = (now, None)
+                return None
+        verified = MarketInstrument(
+            symbol=target, display=display_symbol(target), base=base,
+            quote="USDC" if target.endswith("_USDC") else "USDT",
+            pair_code=base, price_precision=8, status="verified_ticker",
+        ).as_dict()
+        self._verified_fallbacks[target] = (now, verified)
+        return verified
 
     async def candles(self, symbol: str, timeframe: str = "5m", limit: int = 400) -> list[dict[str, Any]]:
         timeframe = str(timeframe or "").lower()

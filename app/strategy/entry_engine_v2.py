@@ -3,7 +3,7 @@ from __future__ import annotations
 from hashlib import sha1
 import time
 
-from app.models.enums import Direction
+from app.models.enums import Direction, Strategy
 from app.models.trading import ArmedSetup, SetupWatch, TradeIntent
 from app.position.protection import (
     break_even_activation_ratio,
@@ -377,6 +377,28 @@ class EntryLifecycleV2:
 
             if book_conflict:
                 return "pending", None, {"reason": "micro_orderbook_conflict", "orderbook_imbalance": imbalance}
+
+            # A bullish/bearish closed candle is historical confirmation, not
+            # proof that the executable quote still holds the breakout now.
+            # Without this check, a LONG may fire while the live price is already
+            # retreating well below its breakout trigger (seen in BB on Oct 10).
+            # Keep the setup ARMED rather than cancelling it, so a reclaim can
+            # still enter; do not change LIQUIDITY_SWEEP mean-reversion entries.
+            if setup.strategy == Strategy.BREAKOUT_RETEST:
+                reclaim_tolerance_atr = max(self.trigger_close_tolerance_atr, 0.12)
+                adverse_gap_atr = (
+                    (trigger_anchor - price) if setup.direction == Direction.LONG
+                    else (price - trigger_anchor)
+                ) / atr_value
+                if adverse_gap_atr > reclaim_tolerance_atr:
+                    return "pending", None, {
+                        "reason": "breakout_live_reclaim_pending",
+                        "price": price,
+                        "trigger_price": trigger_anchor,
+                        "adverse_gap_atr": round(adverse_gap_atr, 5),
+                        "reclaim_tolerance_atr": reclaim_tolerance_atr,
+                        "confirmation_source": "closed_1m",
+                    }
 
             confirmation_mode = "postarm_closed_1m" if post_arm else "recent_prearm_closed_1m"
             confirmation_payload = {

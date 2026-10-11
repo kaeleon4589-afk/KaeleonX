@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from app.coinw.live_adapter import build_live_adapter_from_credentials
 from app.execution.demo import DemoExecutionEngine
@@ -43,6 +43,8 @@ class UserRuntime:
     last_state_persist: float = 0.0
     last_state_signature: str = ""
     last_reset_id: str | None = None
+    # Serialize state mutations only within this account, never between users.
+    snapshot_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 class UserTradingRuntimeManager:
@@ -65,7 +67,11 @@ class UserTradingRuntimeManager:
         self.entry_guard = None
         self._last_refresh = 0.0
         self._lock = asyncio.Lock()
-        self._processing_lock = asyncio.Lock()
+        # A global lock made 11 users take 30+ seconds per shared market event.
+        # Keep one lock per account and limit aggregate DB/exchange pressure.
+        self._snapshot_parallelism = 32
+        self._snapshot_slots = asyncio.Semaphore(self._snapshot_parallelism)
+        self._last_fanout_audit = {}
 
     @staticmethod
     def _fingerprint(row: dict) -> str:
@@ -530,30 +536,43 @@ class UserTradingRuntimeManager:
             if manager.consume_state_changed():
                 changed.append(runtime)
 
-        # The terminal transition is already committed in memory and queued for
-        # position persistence. Serialize only the slower dashboard/equity refresh.
-        for runtime in changed:
-            async with self._processing_lock:
-                manager = runtime.position_manager
-                available_equity = await runtime.execution.get_equity()
-                effective_capital = min(runtime.configured_capital, max(0.0, float(available_equity)))
-                if any(p.status == 'OPEN' for p in manager.positions.values()):
-                    status = 'OPERANDO'
-                elif runtime.orchestrator.pending_execution:
-                    status = 'CONFIRMANDO_ORDEN'
-                elif effective_capital < self.settings.min_operating_capital:
-                    status = 'INSUFFICIENT_CAPITAL'
-                else:
-                    status = 'ACTIVO' if runtime.trading_enabled else 'PAUSADO'
-                await self._persist_state(
-                    runtime, float(available_equity), effective_capital, status, snapshot, force=True,
-                )
+        # Realtime exit state transitions already occurred synchronously above.
+        # Never block the next exit tick behind 100s of sequential dashboard writes.
+        async def persist_closed(runtime):
+            async with runtime.snapshot_lock:
+                async with self._snapshot_slots:
+                    try:
+                        manager = runtime.position_manager
+                        available_equity = await runtime.execution.get_equity()
+                        effective_capital = min(runtime.configured_capital, max(0.0, float(available_equity)))
+                        if any(p.status == 'OPEN' for p in manager.positions.values()):
+                            status = 'OPERANDO'
+                        elif runtime.orchestrator.pending_execution:
+                            status = 'CONFIRMANDO_ORDEN'
+                        elif effective_capital < self.settings.min_operating_capital:
+                            status = 'INSUFFICIENT_CAPITAL'
+                        else:
+                            status = 'ACTIVO' if runtime.trading_enabled else 'PAUSADO'
+                        await self._persist_state(runtime, float(available_equity), effective_capital,
+                                                  status, snapshot, force=True)
+                    except Exception as exc:
+                        self.audit.event('EXIT_STATE_PERSIST_ERROR', runtime.user_id, level='ERROR',
+                                         user_id=runtime.user_id, symbol=snapshot.symbol,
+                                         error=f'{type(exc).__name__}: {exc}')
+
+        changed_cursor = iter(changed)
+
+        async def exit_worker():
+            for runtime in changed_cursor:
+                await persist_closed(runtime)
+
+        await asyncio.gather(*(exit_worker() for _ in range(min(self._snapshot_parallelism, len(changed)))))
 
     async def run_snapshot(self, snapshot) -> None:
-        async with self._processing_lock:
-            await self._run_snapshot(snapshot)
+        await self._run_snapshot(snapshot)
 
     async def _run_snapshot(self, snapshot) -> None:
+        started_mono = time.monotonic()
         await self.refresh()
         periods = None
         if not getattr(snapshot, 'monitor_only', False):
@@ -572,78 +591,119 @@ class UserTradingRuntimeManager:
                         or (runtime.orchestrator.pending_execution or {}).get('symbol') == snapshot.symbol
                         or (armed_monitor and snapshot.symbol in runtime.orchestrator.armed_setups)
                         or (watch_monitor and snapshot.symbol in runtime.orchestrator.watching_setups)]
-        for runtime in runtimes:
-            try:
-                period = periods[runtime.mode] if periods is not None else None
-                reset_id = period.get('reset_id') if period else None
-                if periods is not None and runtime.last_reset_id != reset_id:
-                    if runtime.mode == 'demo':
-                        runtime.execution.equity = await asyncio.to_thread(
-                            self.profiles.demo_account.balance, runtime.user_id)
-                    runtime.last_reset_id = reset_id
-                    runtime.last_state_persist = 0.0
-                self.audit.event('USER_MARKET_ANALYSIS_START', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, trading_enabled=runtime.trading_enabled, configured_capital=runtime.configured_capital)
-                live_allowed = runtime.live_allowed
+        parallelism = getattr(self, '_snapshot_parallelism', 32)
+        slots = getattr(self, '_snapshot_slots', None) or asyncio.Semaphore(parallelism)
 
-                if hasattr(runtime.execution, "get_equity"):
-                    try:
-                        available_equity = await runtime.execution.get_equity()
-                    except Exception as exc:
-                        # Account balance failure must not prevent position reconciliation.
-                        available_equity = 0.0
-                        self.audit.event('ACCOUNT_SYNC_ERROR', runtime.user_id, level='ERROR',
-                                         user_id=runtime.user_id, error=type(exc).__name__)
-                else:
-                    # DEMO always owns a fixed virtual wallet. The configured
-                    # capital is only the portion allocated to KAELEON.
-                    available_equity = float(self.settings.paper_initial_equity)
+        async def process_runtime(runtime):
+            # Different accounts run concurrently; one account never handles two
+            # market snapshots at once, including from separate monitor loops.
+            async with getattr(runtime, 'snapshot_lock', None) or asyncio.Lock():
+                async with slots:
+                    await self._process_user_snapshot(runtime, snapshot, periods)
 
-                effective_capital = min(runtime.configured_capital, float(available_equity))
-                if effective_capital < self.settings.min_operating_capital:
-                    self.audit.event('ENTRY_BLOCKED', runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='insufficient_capital', effective_capital=effective_capital, minimum=self.settings.min_operating_capital)
+        # Fixed worker count: do not create one task per subscriber for thousands
+        # of accounts; memory and DB fan-out stay bounded.
+        cursor = iter(runtimes)
 
-                armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
-                watch_monitor = bool(getattr(snapshot, 'watch_monitor', False))
-                allow_entries = (runtime.trading_enabled and live_allowed
-                                 and runtime.coinw_verified
-                                 and effective_capital >= self.settings.min_operating_capital
-                                 and (not getattr(snapshot, 'monitor_only', False) or armed_monitor or watch_monitor))
-                if not allow_entries:
-                    self.audit.event('ENTRY_BLOCKED', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='trading_paused' if not runtime.trading_enabled else 'live_not_entitled')
-                result = await runtime.orchestrator.on_snapshot(
-                    snapshot,
-                    effective_capital,
-                    user_id=runtime.user_id,
-                    allow_entries=allow_entries,
-                    available_equity=available_equity,
-                )
-                if runtime.mode == TradingEnvironment.LIVE.value and not live_allowed:
-                    status = "LIVE_NO_ENTITLED"
-                else:
-                    status = "ACTIVO" if runtime.trading_enabled else "PAUSADO"
-                if result and result.get("filled"):
-                    status = "OPERANDO"
-                state_changed = runtime.position_manager.consume_state_changed()
-                # Capture fees and realized PnL after this snapshot's open/close.
+        async def worker():
+            for runtime in cursor:
+                await process_runtime(runtime)
+
+        await asyncio.gather(*(worker() for _ in range(min(parallelism, len(runtimes)))))
+
+        # One summary per market symbol/monitor path per 15s, irrespective of
+        # whether 11 or 11,000 accounts subscribe. Keeps bottlenecks observable.
+        if getattr(snapshot, 'armed_monitor', False) or getattr(snapshot, 'watch_monitor', False):
+            key = (str(snapshot.symbol), bool(getattr(snapshot, 'armed_monitor', False)))
+            now_mono = time.monotonic()
+            if now_mono - self._last_fanout_audit.get(key, -1e9) >= 15.0:
+                self._last_fanout_audit[key] = now_mono
+                if len(self._last_fanout_audit) > 256:
+                    self._last_fanout_audit = {k: t for k, t in self._last_fanout_audit.items()
+                                               if now_mono - t < 60.0}
+                micro = (getattr(snapshot, 'timeframes', None) or {}).get('1m') or []
+                candle_age_ms = (int(time.time() * 1000) - int(micro[-1].timestamp) - 60_000
+                                 if micro else None)
+                self.audit.event('MARKET_FANOUT_SUMMARY', 'system',
+                                 symbol=snapshot.symbol,
+                                 monitor='ARMED' if key[1] else 'WATCH',
+                                 accounts=len(runtimes),
+                                 duration_ms=round((now_mono - started_mono) * 1000),
+                                 confirmed_1m_age_ms=candle_age_ms,
+                                 concurrency_limit=parallelism)
+
+    async def _process_user_snapshot(self, runtime, snapshot, periods):
+        try:
+            period = periods[runtime.mode] if periods is not None else None
+            reset_id = period.get('reset_id') if period else None
+            if periods is not None and runtime.last_reset_id != reset_id:
                 if runtime.mode == 'demo':
+                    runtime.execution.equity = await asyncio.to_thread(
+                        self.profiles.demo_account.balance, runtime.user_id)
+                runtime.last_reset_id = reset_id
+                runtime.last_state_persist = 0.0
+            self.audit.event('USER_MARKET_ANALYSIS_START', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, trading_enabled=runtime.trading_enabled, configured_capital=runtime.configured_capital)
+            live_allowed = runtime.live_allowed
+
+            if hasattr(runtime.execution, "get_equity"):
+                try:
                     available_equity = await runtime.execution.get_equity()
-                    profile = await asyncio.to_thread(self.profiles.get, runtime.user_id)
-                    if profile.get('demo_auto_compound', False):
-                        runtime.configured_capital = max(0.0, available_equity)
-                    effective_capital = min(runtime.configured_capital, max(0.0, available_equity))
-                if any(p.status == 'OPEN' for p in runtime.position_manager.positions.values()):
-                    status = 'OPERANDO'
-                elif runtime.orchestrator.pending_execution:
-                    status = 'CONFIRMANDO_ORDEN'
-                elif effective_capital < self.settings.min_operating_capital:
-                    status = 'INSUFFICIENT_CAPITAL'
-                await self._persist_state(
-                    runtime, available_equity, effective_capital, status, snapshot,
-                    force=bool(state_changed or (result and result.get("filled"))),
-                )
-            except Exception as exc:
-                self.audit.event("USER_RUNTIME_ERROR", runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, error=str(exc))
-                await self._persist_state(runtime, 0.0, 0.0, "ERROR", snapshot)
+                except Exception as exc:
+                    # Account balance failure must not prevent position reconciliation.
+                    available_equity = 0.0
+                    self.audit.event('ACCOUNT_SYNC_ERROR', runtime.user_id, level='ERROR',
+                                     user_id=runtime.user_id, error=type(exc).__name__)
+            else:
+                # DEMO always owns a fixed virtual wallet. The configured
+                # capital is only the portion allocated to KAELEON.
+                available_equity = float(self.settings.paper_initial_equity)
+
+            effective_capital = min(runtime.configured_capital, float(available_equity))
+            if effective_capital < self.settings.min_operating_capital:
+                self.audit.event('ENTRY_BLOCKED', runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='insufficient_capital', effective_capital=effective_capital, minimum=self.settings.min_operating_capital)
+
+            armed_monitor = bool(getattr(snapshot, 'armed_monitor', False))
+            watch_monitor = bool(getattr(snapshot, 'watch_monitor', False))
+            allow_entries = (runtime.trading_enabled and live_allowed
+                             and runtime.coinw_verified
+                             and effective_capital >= self.settings.min_operating_capital
+                             and (not getattr(snapshot, 'monitor_only', False) or armed_monitor or watch_monitor))
+            if not allow_entries:
+                self.audit.event('ENTRY_BLOCKED', runtime.user_id, level='DEBUG', persist=False, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, reason='trading_paused' if not runtime.trading_enabled else 'live_not_entitled')
+            result = await runtime.orchestrator.on_snapshot(
+                snapshot,
+                effective_capital,
+                user_id=runtime.user_id,
+                allow_entries=allow_entries,
+                available_equity=available_equity,
+            )
+            if runtime.mode == TradingEnvironment.LIVE.value and not live_allowed:
+                status = "LIVE_NO_ENTITLED"
+            else:
+                status = "ACTIVO" if runtime.trading_enabled else "PAUSADO"
+            if result and result.get("filled"):
+                status = "OPERANDO"
+            state_changed = runtime.position_manager.consume_state_changed()
+            # Capture fees and realized PnL after this snapshot's open/close.
+            if runtime.mode == 'demo':
+                available_equity = await runtime.execution.get_equity()
+                profile = await asyncio.to_thread(self.profiles.get, runtime.user_id)
+                if profile.get('demo_auto_compound', False):
+                    runtime.configured_capital = max(0.0, available_equity)
+                effective_capital = min(runtime.configured_capital, max(0.0, available_equity))
+            if any(p.status == 'OPEN' for p in runtime.position_manager.positions.values()):
+                status = 'OPERANDO'
+            elif runtime.orchestrator.pending_execution:
+                status = 'CONFIRMANDO_ORDEN'
+            elif effective_capital < self.settings.min_operating_capital:
+                status = 'INSUFFICIENT_CAPITAL'
+            await self._persist_state(
+                runtime, available_equity, effective_capital, status, snapshot,
+                force=bool(state_changed or (result and result.get("filled"))),
+            )
+        except Exception as exc:
+            self.audit.event("USER_RUNTIME_ERROR", runtime.user_id, user_id=runtime.user_id, mode=runtime.mode, symbol=snapshot.symbol, error=str(exc))
+            await self._persist_state(runtime, 0.0, 0.0, "ERROR", snapshot)
 
     async def _persist_state(self, runtime: UserRuntime, available_equity: float, effective_capital: float, status: str, snapshot=None, *, force: bool = False) -> None:
         """Persist dashboard state at a bounded cadence without blocking the market loop.

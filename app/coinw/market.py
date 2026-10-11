@@ -61,7 +61,7 @@ class CoinWMarketClient:
         # Real-time funding is consumed from the public websocket by the UI.
         return await self._get('/v1/perpum/fundingRate', {'instrument': _base(instrument).lower()})
 
-    async def klines(self, instrument, period='5m', size=320):
+    async def klines(self, instrument, period='5m', size=320, *, force_refresh=False):
         if period not in _GRANULARITY:
             raise ValueError('unsupported_timeframe')
         key = (_base(instrument), period, size)
@@ -72,7 +72,7 @@ class CoinWMarketClient:
             '1h': 3600, '4h': 14400, '1d': 86400, '1w': 604800, '1M': 2592000,
         }.get(period, 60)
         bucket = int(time.time()) // span
-        if cached and cached[0] == bucket and time.monotonic() - cached[1] < 30:
+        if not force_refresh and cached and cached[0] == bucket and time.monotonic() - cached[1] < 30:
             return cached[2]
         raw = await self._get('/v1/perpumPublic/klines', {
             'currencyCode': key[0], 'granularity': _GRANULARITY[period],

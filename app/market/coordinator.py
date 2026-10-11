@@ -25,6 +25,10 @@ class MarketCoordinator:
         # trigger-time trend revalidation does not multiply CoinW traffic.
         self._armed_trend_cache = {}
         self._armed_trend_cache_ttl_seconds = 15.0
+        # A 1m REST response can lag even with a fresh 5m trend snapshot.
+        # Refresh at most once per symbol per 12s, not once per account.
+        self._armed_micro_forced_at = {}
+        self._armed_micro_retry_seconds = 12.0
 
     @staticmethod
     def _parse_klines(raw):
@@ -144,6 +148,34 @@ class MarketCoordinator:
             now = int(time.time() * 1000)
             span = TF_MS['1m']
             micro = [c for c in self._parse_klines(micro_result) if c.timestamp + span <= now]
+            # The signal stage requires a CLOSED 1m candle no more than 90s old.
+            # A cached response may lag beyond that; bypass only that cache once
+            # per symbol per bounded retry interval. Never synthesize a candle.
+            closed_age_ms = now - (micro[-1].timestamp + span) if micro else None
+            monotonic_now = time.monotonic()
+            can_retry = ((closed_age_ms is None or closed_age_ms > 90_000)
+                         and monotonic_now - self._armed_micro_forced_at.get(symbol, -1e9)
+                         >= self._armed_micro_retry_seconds
+                         and callable(getattr(self.client, 'klines', None)))
+            if can_retry and hasattr(self.client, '_cache'):
+                self._armed_micro_forced_at[symbol] = monotonic_now
+                if len(self._armed_micro_forced_at) > 512:
+                    self._armed_micro_forced_at = {
+                        key: checked for key, checked in self._armed_micro_forced_at.items()
+                        if monotonic_now - checked < 300.0
+                    }
+                try:
+                    fresh_raw = await self.client.klines(symbol, '1m', 61, force_refresh=True)
+                    fresh_now = int(time.time() * 1000)
+                    fresh_micro = [c for c in self._parse_klines(fresh_raw)
+                                   if c.timestamp + span <= fresh_now]
+                    if fresh_micro and fresh_micro[-1].timestamp >= (micro[-1].timestamp if micro else 0):
+                        micro = fresh_micro
+                    now = fresh_now
+                except Exception as exc:
+                    if self.audit:
+                        self.audit.event('MARKET_MICRODATA_REFRESH_ERROR', 'system', level='WARNING',
+                                         symbol=symbol, error=f'{type(exc).__name__}: {exc}')
             if len(micro) >= 20:
                 recent = micro[-min(30, len(micro)):]
                 fresh = now - recent[-1].timestamp <= span * 2 + 15_000
@@ -169,6 +201,7 @@ class MarketCoordinator:
         quote.trend_context_valid = bool(frames.get('5m'))
         quote.monitor_only = True
         quote.armed_monitor = True
+        quote.market_snapshot_built_ms = int(time.time() * 1000)
         return quote
 
     async def watch_snapshot(self, symbol):
@@ -240,6 +273,59 @@ class MarketCoordinator:
                 if self.audit:
                     self.audit.event('MARKET_LOOP_ERROR', 'system', error=str(exc), symbol=self.symbol)
             await asyncio.sleep(self.poll_seconds)
+
+
+class SharedExecutionQuoteProvider:
+    """Short-lived per-symbol/single-flight quotes for independent subscriber accounts.
+
+    Entries still validate quote freshness, geometry and slippage at submission.
+    The cache avoids 2 REST depth calls per subscriber on the same symbol while
+    preserving recent real exchange quotes; failures never return old quotes.
+    """
+
+    def __init__(self, coordinator, ttl_seconds=0.35, max_symbols=256):
+        self.coordinator = coordinator
+        self.ttl_seconds = min(0.5, max(0.05, float(ttl_seconds)))
+        self.max_symbols = max(1, int(max_symbols))
+        self._cached = {}
+        self._inflight = {}
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, symbol):
+        symbol = str(symbol)
+        async with self._lock:
+            now = time.monotonic()
+            cached = self._cached.get(symbol)
+            if cached is not None and now - cached[0] <= self.ttl_seconds:
+                quote = cached[1]
+                # The exchange timestamps remain authoritative, not cache access time.
+                age_ms = int(time.time() * 1000) - int(getattr(quote, 'quote_received_ms', 0) or 0)
+                if 0 <= age_ms <= 1000:
+                    return quote
+            task = self._inflight.get(symbol)
+            if task is None:
+                task = asyncio.create_task(self.coordinator.quote(symbol))
+                self._inflight[symbol] = task
+        try:
+            quote = await asyncio.shield(task)
+            if (getattr(quote, 'symbol', None) != symbol
+                    or not bool(getattr(quote, 'orderbook_valid', False))):
+                raise ValueError('invalid_shared_execution_quote')
+            age_ms = int(time.time() * 1000) - int(getattr(quote, 'quote_received_ms', 0) or 0)
+            if not 0 <= age_ms <= 1000:
+                raise ValueError('stale_shared_execution_quote')
+            async with self._lock:
+                self._cached[symbol] = (time.monotonic(), quote)
+                if len(self._cached) > self.max_symbols:
+                    # Small bounded cache; oldest keys are always evicted first.
+                    oldest = sorted(self._cached, key=lambda key: self._cached[key][0])
+                    for key in oldest[:len(self._cached) - self.max_symbols]:
+                        self._cached.pop(key, None)
+            return quote
+        finally:
+            async with self._lock:
+                if self._inflight.get(symbol) is task and task.done():
+                    self._inflight.pop(symbol, None)
 
 
 class MultiMarketCoordinator:

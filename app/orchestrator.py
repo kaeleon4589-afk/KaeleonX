@@ -15,6 +15,7 @@ from app.position.protection import apply_intent_management
 from app.trading.persistence import TradePersistence
 from app.trading.rejection_funnel import RejectionFunnel
 from app.trading.edge_metrics import edge_estimate
+from app.strategy.entry_barrier_f1e import evaluate_barrier
 
 
 # Legacy strategies historically used a global execution-RR floor. Engine V2
@@ -1688,6 +1689,41 @@ class TradingOrchestrator:
                         decision_id=decision_id, reason=self.last_rejection,
                         strategy=intent.strategy, direction=intent.direction,
                         details={'estimated_net_rr': round(estimated_net_rr, 4)},
+                    )
+                    return None
+            # Phase 1E: directional runway to confirmed support/resistance.
+            # Do not change targets or stop; reject only when a recognized
+            # opposing zone blocks the path before a net 1:1 reward can occur.
+            if engine_version == "v2" and self.execution_mode in ("demo", "paper"):
+                barrier_reason, barrier_trace = evaluate_barrier(
+                    context=getattr(snapshot, "structural_context_f1e", None),
+                    direction=intent.direction, strategy=intent.strategy,
+                    entry=entry, stop=stop, target=target,
+                    fee_rate=float(getattr(self.execution, "fee_rate", getattr(self.risk, "fee_rate", .0006))),
+                    slippage_bps=float(getattr(self.execution, "slippage_bps", getattr(self.risk, "exit_slippage_bps", 0.0))),
+                )
+                if barrier_reason:
+                    self.last_decision[key] = now
+                    self.last_rejection = barrier_reason
+                    self._funnel("post_trigger_rejected", barrier_reason,
+                                 user_id=user_id, symbol=snapshot.symbol)
+                    self.audit.event(
+                        "SIGNAL_REJECTED", decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        stage="REJECTED", reason=barrier_reason,
+                        strategy=getattr(intent.strategy, "value", str(intent.strategy)),
+                        direction=getattr(intent.direction, "value", str(intent.direction)),
+                        lifecycle_id=lifecycle_ctx.get("lifecycle_id"),
+                        watch_id=lifecycle_ctx.get("watch_id"),
+                        setup_id=lifecycle_ctx.get("setup_id"),
+                        entry_price=entry, stop_price=stop, target_price=target,
+                        trace=barrier_trace,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol,
+                        decision_id=decision_id, reason=barrier_reason,
+                        strategy=intent.strategy, direction=intent.direction,
+                        details=barrier_trace,
                     )
                     return None
             structural_rr = intent_meta.get("structural_rr_estimate")

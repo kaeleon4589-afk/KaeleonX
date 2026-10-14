@@ -1,0 +1,20 @@
+KAELEON FASE 1E — CORE ENGINE (comparación con KAELEON_FASE1E_CAPITAL_RR_SOPORTES_2026-10-14.zip)
+
+MODIFICADOS
+app/strategy/entry_engine_v2.py
+tests/test_strategy_engine_v2.py
+
+NUEVOS
+tests/test_fase1e_engine_fresh_thesis.py
+KAELEON_FASE1E_CORRECCION_MOTOR_2026-10-14.md
+ARCHIVOS_TOCADOS_FASE1E_MOTOR_2026-10-14.txt
+
+ELIMINADOS
+Ninguno.
+
+OTROS DATOS
+- La nueva entrega es acumulativa: mantiene el capital fijo configurable, el RR neto y las barreras estructurales de la entrega anterior.
+- KAELEON Fase 1F: sin cambios.
+- Variables obligatorias nuevas de Railway: ninguna.
+- Ajuste opcional: V2_BREAKOUT_CONFIRM_MAX_ADVERSE_ATR=0.20 (no hace falta configurarlo).
+- 354 pruebas superadas; 2 heredadas fallidas.

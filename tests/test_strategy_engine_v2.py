@@ -118,8 +118,9 @@ def test_v2_armed_entry_requires_micro_confirmation_and_is_single_use(monkeypatc
     assert intent is None
     assert trace["reason"] == "breakout_live_reclaim_pending"
 
-    # A fresh quote reclaims the trigger geometry before submitting an order.
-    snap.ask = setup.trigger_price - 0.09 * setup.metadata["atr_value"]
+    # A fresh quote must hold both the 5m trigger AND the most recent 1m
+    # confirmation close; do not execute into a meaningful live reversal.
+    snap.ask = snap.timeframes["1m"][-1].close - 0.10 * setup.metadata["atr_value"]
     snap.bid = snap.ask - .01
     snap.bids = [(snap.bid, 70)] * 12
     snap.asks = [(snap.ask, 45)] * 12
@@ -223,17 +224,24 @@ def test_v2_extension_waits_for_reentry_instead_of_consuming(monkeypatch):
     assert trace["reason"] == "setup_extended_wait_reentry"
     assert engine.consumed_record(setup.setup_id) is None
 
-    # Price returns to trigger geometry while the setup is still valid. The live
-    # microstructure path can execute without waiting another closed 1m candle.
+    # Returning to the trigger is not enough: Breakout also needs a confirmed
+    # 1m continuation close. Keep the setup armed until that evidence arrives.
     reentry = SimpleNamespace(
         bid=100.49, ask=100.50, bids=[(100.49, 80)] * 12, asks=[(100.50, 40)] * 12,
         orderbook_valid=True, quote_received_ms=now - 100, timeframes={},
     )
     status, intent, trace = engine.trigger(setup, reentry, "d-reentry")
+    assert status == "pending", trace
+    assert intent is None
+    assert trace["reason"] == "waiting_closed_1m_confirmation"
+    assert engine.consumed_record(setup.setup_id) is None
+    # A just-closed 1m bullish candle can authorize the same setup.
+    reentry.timeframes["1m"] = [Candle(now - 60_000, 100.45, 100.57, 100.43, 100.54, 150)]
+    status, intent, trace = engine.trigger(setup, reentry, "d-confirmed")
     assert status == "triggered", trace
     assert intent is not None
-    assert trace["confirmation_mode"] == "live_microstructure"
-    assert intent.metadata["micro_confirmation"]["mode"] == "live_microstructure"
+    assert trace["confirmation_mode"] == "postarm_closed_1m"
+    assert intent.metadata["micro_confirmation"]["mode"] == "postarm_closed_1m"
 
 
 def test_v2_live_micro_confirmation_requires_fresh_quote(monkeypatch):

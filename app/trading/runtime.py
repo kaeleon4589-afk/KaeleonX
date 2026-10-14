@@ -687,9 +687,9 @@ class UserTradingRuntimeManager:
             # Capture fees and realized PnL after this snapshot's open/close.
             if runtime.mode == 'demo':
                 available_equity = await runtime.execution.get_equity()
-                profile = await asyncio.to_thread(self.profiles.get, runtime.user_id)
-                if profile.get('demo_auto_compound', False):
-                    runtime.configured_capital = max(0.0, available_equity)
+                # Never mutate the user-defined allocation from changing PnL.
+                # When wallet equity is below allocation we can only execute
+                # against what is actually available, not fictitious margin.
                 effective_capital = min(runtime.configured_capital, max(0.0, available_equity))
             if any(p.status == 'OPEN' for p in runtime.position_manager.positions.values()):
                 status = 'OPERANDO'

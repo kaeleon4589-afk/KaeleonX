@@ -59,12 +59,12 @@ class UserTradingProfileService:
 
     def get(self, user_id: str) -> dict:
         row = self.db.find_one(self.COLLECTION, {"user_id": user_id}) or {}
-        if row and 'demo_auto_compound' not in row:
-            # Existing users that allocated the original entire virtual account retain that intent.
-            initial = self.demo_account.opening_balance(user_id)
-            auto = abs(self._capital_for_mode(row, 'demo') - initial) < .011
-            self.db.upsert(self.COLLECTION, {'user_id': user_id}, {'demo_auto_compound': auto})
-            row['demo_auto_compound'] = auto
+        if row and row.get('demo_auto_compound') is not False:
+            # Fase 1E: migrate legacy auto-compounding profiles in place.
+            # Never overwrite the user's originally configured DEMO capital.
+            # Balance and historical positions remain untouched.
+            self.db.upsert(self.COLLECTION, {'user_id': user_id}, {'demo_auto_compound': False})
+            row['demo_auto_compound'] = False
         return row
 
     def public(self, user_id: str) -> UserTradingProfile:
@@ -75,13 +75,15 @@ class UserTradingProfileService:
         if api_key_encrypted:
             masked = self.vault.mask(self.vault.decrypt(api_key_encrypted))
         demo_balance = self.demo_account.balance(user_id)
-        demo_capital = demo_balance if row.get("demo_auto_compound", False) else self._capital_for_mode(row, "demo")
+        # Allocation stays at its last user-configured value, even when the
+        # virtual balance rises above it. Current equity is displayed separately.
+        demo_capital = self._capital_for_mode(row, "demo")
         live_capital = self._capital_for_mode(row, "live")
         configured = bool(row.get("coinw_api_key_encrypted") and row.get("coinw_api_secret_encrypted"))
         return UserTradingProfile(
             user_id=user_id,
             demo_available_equity=demo_balance,
-            demo_auto_compound=bool(row.get("demo_auto_compound", False)),
+            demo_auto_compound=False,
             execution_mode=mode,
             trading_enabled=bool(row.get("trading_enabled", False)),
             operating_capital=demo_capital if mode == "demo" else live_capital,
@@ -136,7 +138,8 @@ class UserTradingProfileService:
 
         demo_capital = self._capital_for_mode(existing, "demo")
         live_capital = self._capital_for_mode(existing, "live")
-        auto_compound = bool(existing.get("demo_auto_compound", False))
+        # Compounding cannot be silently enabled by choosing 100% of the wallet.
+        auto_compound = False
         if operating_capital is not None:
             capital = float(operating_capital)
             if not math.isfinite(capital):
@@ -147,9 +150,14 @@ class UserTradingProfileService:
                 raise ValueError("coinw_verification_required_for_capital")
             if mode == "demo":
                 balance = self.demo_account.balance(user_id)
-                if capital > balance + 1e-8:
+                # Previously approved allocations may exceed the current
+                # balance after losses. Re-saving the SAME allocation is safe;
+                # increasing or changing it above the wallet is not.
+                if capital > balance + 1e-8 and abs(capital - demo_capital) > 1e-8:
                     raise ValueError('demo_capital_exceeds_virtual_balance')
-                auto_compound = abs(capital - balance) < 0.011
+                # Store exactly the requested allocation; never auto-adjust it
+                # after profit or loss. Actual executable margin remains bounded
+                # by the available balance in UserTradingRuntimeManager.
                 demo_capital = capital
             else:
                 live_capital = capital

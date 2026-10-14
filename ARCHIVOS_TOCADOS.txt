@@ -1,11 +1,5 @@
-MODIFICADOS
-ARCHIVOS_TOCADOS.txt
-KAELEON_V6_STRATEGY_ENGINE.md
-app/strategy/armed_entry.py
-tests/test_armed_entry_v6.py
-
-NUEVOS
-ninguno
-
-ELIMINADOS
-ninguno
+MODIFICADOS:
+app/orchestrator.py
+app/strategy/entry_engine_v2.py
+NUEVOS: ninguno
+ELIMINADOS: ninguno

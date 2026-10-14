@@ -378,7 +378,8 @@ class EntryLifecycleV2:
             ]
             if not closed_1m:
                 return "pending", None, {"reason": "waiting_closed_1m_confirmation", "live_trigger_reached": trigger_reached}
-            candle = closed_1m[-1]
+            # Use the newest CLOSED candle even when frames arrive unordered.
+            candle = max(closed_1m, key=lambda row: int(getattr(row, "timestamp", 0) or 0))
             cts = int(getattr(candle, "timestamp", 0) or 0)
             candle_close_ms = cts + 60_000
             candle_age_ms = now_ms - candle_close_ms

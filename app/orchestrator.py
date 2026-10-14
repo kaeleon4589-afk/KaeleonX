@@ -1342,11 +1342,31 @@ class TradingOrchestrator:
             entry = float(intent.entry_price)
             metadata = dict(getattr(intent, 'metadata', {}) or {})
             engine_version = str(metadata.get("engine_version") or "").lower()
-            # Engine V2 targets/stops are locked from confirmed market structure.
-            # Do not rebase them to entry-relative percentages after refreshing
-            # the executable quote; the final geometry/RR guards run below.
+            # Keep the market-structure objective fixed, but recalculate its
+            # front-run fraction against the FINAL executable entry quote.
+            # The original arm-time target may be stale after quote refresh.
+            # Never move the stop or place the target beyond structure.
             stop = float(intent.stop_price)
             target = float(intent.target_price)
+            if engine_version == "v2":
+                try:
+                    structural = float(metadata.get("structural_target_price"))
+                    front_run = float(metadata.get("target_front_run_ratio"))
+                except (TypeError, ValueError):
+                    structural, front_run = float("nan"), float("nan")
+                if (math.isfinite(structural) and structural > 0
+                        and math.isfinite(front_run) and 0.80 <= front_run <= 1.0):
+                    rebased = None
+                    if intent.direction == Direction.LONG and structural > entry:
+                        rebased = entry + (structural - entry) * front_run
+                    elif intent.direction == Direction.SHORT and structural < entry:
+                        rebased = entry - (entry - structural) * front_run
+                    if rebased is not None and rebased > 0:
+                        target = rebased
+                        if target != float(intent.target_price):
+                            metadata["target_rebased_at_execution"] = True
+                            metadata["target_at_arm"] = float(intent.target_price)
+                            intent = replace(intent, target_price=target, metadata=metadata)
             risk_distance = abs(entry - stop)
             reward_distance = abs(target - entry)
             execution_rr = reward_distance / max(risk_distance, 1e-12)

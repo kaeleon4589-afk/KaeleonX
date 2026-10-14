@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from app.models.market import Candle
 from app.coinw.websocket import CoinWWebSocket
+from app.strategy.entry_barrier_f1e import build_context
 
 TF_MS = {'1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000}
 
@@ -29,6 +30,9 @@ class MarketCoordinator:
         # Refresh at most once per symbol per 12s, not once per account.
         self._armed_micro_forced_at = {}
         self._armed_micro_retry_seconds = 12.0
+        # Higher-timeframe structure shared by symbol, never per subscriber.
+        self._structural_higher_cache = {}
+        self._structural_higher_ttl_seconds = 180.0
 
     @staticmethod
     def _parse_klines(raw):
@@ -116,6 +120,32 @@ class MarketCoordinator:
         self._armed_trend_cache[symbol] = (now_mono, candles)
         return list(candles)
 
+    async def _structural_higher_frames(self, symbol):
+        now_mono = time.monotonic()
+        cached = self._structural_higher_cache.get(symbol)
+        if cached and now_mono-cached[0] < self._structural_higher_ttl_seconds:
+            return {tf: list(rows) for tf, rows in cached[1].items()}
+        results = await asyncio.gather(
+            self.client.klines(symbol, '15m', 121),
+            self.client.klines(symbol, '1h', 101), return_exceptions=True,
+        )
+        now_ms = int(time.time()*1000)
+        frames = {}
+        for tf, raw in zip(('15m', '1h'), results):
+            if isinstance(raw, Exception):
+                continue
+            span = TF_MS[tf]
+            bars = [c for c in self._parse_klines(raw) if c.timestamp+span <= now_ms]
+            if len(bars) >= 18 and now_ms-(bars[-1].timestamp+span) <= span+30_000:
+                frames[tf] = bars
+        self._structural_higher_cache[symbol] = (now_mono, frames)
+        if len(self._structural_higher_cache) > 256:
+            self._structural_higher_cache = {
+                k:v for k,v in self._structural_higher_cache.items()
+                if now_mono-v[0] < self._structural_higher_ttl_seconds
+            }
+        return {tf: list(rows) for tf, rows in frames.items()}
+
     async def armed_snapshot(self, symbol):
         """Lightweight high-priority snapshot for an already ARMED setup.
 
@@ -195,8 +225,16 @@ class MarketCoordinator:
                 )
         else:
             frames['5m'] = list(trend_result)
+        if frames.get('5m'):
+            try:
+                frames.update(await self._structural_higher_frames(symbol))
+            except Exception as exc:
+                if self.audit:
+                    self.audit.event('STRUCTURAL_CONTEXT_ERROR', 'system', level='WARNING',
+                                     symbol=symbol, error=type(exc).__name__)
         quote.candles = list(frames.get('5m') or [])
         quote.timeframes = frames
+        quote.structural_context_f1e = build_context(quote)
         quote.data_complete = bool(frames.get('1m'))
         quote.trend_context_valid = bool(frames.get('5m'))
         quote.monitor_only = True
@@ -260,6 +298,9 @@ class MarketCoordinator:
                                      symbol=sym, bars=len(micro), fresh=fresh, contiguous=contiguous)
         quote.candles = frames['5m']
         quote.timeframes = frames
+        quote.structural_context_f1e = build_context(quote)
+        self._structural_higher_cache[sym] = (time.monotonic(),
+                                              {tf:list(frames[tf]) for tf in ('15m','1h')})
         quote.btc_candles = btc_candles
         quote.data_complete = True
         quote.monitor_only = False

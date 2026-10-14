@@ -13,7 +13,7 @@ from app.position.protection import (
     profit_lock_capture_ratio,
 )
 from app.strategy.v2_common import (
-    StrategyCandidate, dynamic_min_rr, env_float, executable_price, orderbook_imbalance,
+    StrategyCandidate, dynamic_min_rr, env_float, executable_price, orderbook_imbalance, trend_alignment,
 )
 
 
@@ -279,6 +279,35 @@ class EntryLifecycleV2:
                 or (setup.direction == Direction.SHORT and imbalance >= severe)
             )
 
+        # A watch may remain ARMED after the regime has changed. Priority ARMED
+        # polling deliberately bypasses the full (stateful) regime scanner, so
+        # recheck directional context here without advancing its state machine.
+        # Only cancel on an unambiguous reversal across multiple timeframes;
+        # missing frames or neutral readings are NOT treated as a reversal.
+        if setup.strategy == Strategy.BREAKOUT_RETEST:
+            tf = dict(getattr(snapshot, "timeframes", {}) or {})
+            expected = "long" if setup.direction == Direction.LONG else "short"
+            opposed = []
+            details = {}
+            for frame in ("5m", "15m", "1h"):
+                candles = list(tf.get(frame) or [])
+                if len(candles) < 60:
+                    continue
+                side, confidence, _ = trend_alignment(
+                    candles, slow=min(200, max(50, len(candles) - 5))
+                )
+                details[frame] = {"direction": side, "confidence": round(confidence, 4)}
+                if side not in {"neutral", expected} and confidence >= 0.80:
+                    opposed.append(frame)
+            # Two confirmed timeframe reversals mean the armed thesis is stale.
+            if len(opposed) >= 2:
+                self.consume(setup, "breakout_regime_reversed", now_ms)
+                return "cancelled", None, {
+                    "reason": "breakout_regime_reversed",
+                    "opposing_timeframes": opposed,
+                    "trend_context": details,
+                }
+
         # A live quote and order-book snapshot do not prove the retest has
         # resumed in the intended direction. In the two production V2
         # strategies, require a confirmed 1m close before triggering. Keep
@@ -449,6 +478,28 @@ class EntryLifecycleV2:
                         "adverse_gap_atr": round(adverse_gap_atr, 5),
                         "reclaim_tolerance_atr": reclaim_tolerance_atr,
                         "confirmation_source": "closed_1m",
+                    }
+
+            # The 1m candle says the continuation WAS present at its close.
+            # Require the executable price to still show the same momentum.
+            # STRK 2026-10-14: a 0.07847 bearish close later authorized a
+            # SHORT at ~0.07866, after a substantial opposing rebound. Simply
+            # checking price vs the old 5m trigger fails to detect this.
+            if setup.strategy == Strategy.BREAKOUT_RETEST:
+                adverse_from_close = (
+                    (c - price) if setup.direction == Direction.LONG
+                    else (price - c)
+                )
+                limit_atr = env_float("V2_BREAKOUT_CONFIRM_MAX_ADVERSE_ATR", 0.20, 0.10, 0.40)
+                if adverse_from_close > limit_atr * atr_value:
+                    return "pending", None, {
+                        "reason": "breakout_live_confirmation_diverged",
+                        "direction": setup.direction.value,
+                        "live_price": price,
+                        "confirmed_1m_close": c,
+                        "adverse_from_close_atr": round(adverse_from_close / atr_value, 5),
+                        "max_adverse_atr": limit_atr,
+                        "confirmation_age_ms": candle_age_ms,
                     }
 
             confirmation_mode = "postarm_closed_1m" if post_arm else "recent_prearm_closed_1m"

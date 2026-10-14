@@ -143,7 +143,11 @@ async def save_trading_config(req: TradingConfigRequest, authorization: str | No
             if not before.coinw_verified:
                 raise ValueError("coinw_verification_required_for_capital")
             if req.execution_mode == "demo":
-                if requested > before.demo_available_equity + 1e-8:
+                # Allow unchanged, previously configured capital even if a
+                # losing streak left less equity. Do not allow a new higher
+                # allocation than the current balance.
+                if (requested > before.demo_available_equity + 1e-8
+                        and abs(requested - before.demo_operating_capital) > 1e-8):
                     raise ValueError("demo_capital_exceeds_virtual_balance")
             else:
                 available = await _coinw_equity(profiles, uid)

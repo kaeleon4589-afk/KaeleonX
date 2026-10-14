@@ -1658,6 +1658,38 @@ class TradingOrchestrator:
                     strategy=intent.strategy, direction=intent.direction,
                 )
                 return None
+            # Fase 1E economics: reject a DEMO V2 entry whose estimated net
+            # upside is lower than its estimated net downside after fees/slip.
+            # This is a per-entry viability test, NOT a daily stop or loss streak
+            # cooldown. No strategy target/stop/threshold is rewritten.
+            if engine_version == "v2" and self.execution_mode in ("demo", "paper"):
+                net_loss_bps = abs(edge["estimated_net_sl_bps"])
+                estimated_net_rr = edge["estimated_net_tp_bps"] / max(net_loss_bps, 1e-12)
+                edge["estimated_net_rr"] = round(estimated_net_rr, 4)
+                if estimated_net_rr < 1.0:
+                    self.last_decision[key] = now
+                    self.last_rejection = 'net_execution_rr_too_low'
+                    self._funnel('post_trigger_rejected', self.last_rejection,
+                                 user_id=user_id, symbol=snapshot.symbol)
+                    self.audit.event(
+                        'SIGNAL_REJECTED', decision_id, user_id=user_id,
+                        mode=self.execution_mode, symbol=snapshot.symbol,
+                        stage='REJECTED', reason=self.last_rejection,
+                        strategy=getattr(intent.strategy, 'value', str(intent.strategy)),
+                        direction=getattr(intent.direction, 'value', str(intent.direction)),
+                        lifecycle_id=lifecycle_ctx.get('lifecycle_id'),
+                        watch_id=lifecycle_ctx.get('watch_id'),
+                        setup_id=lifecycle_ctx.get('setup_id'),
+                        entry_price=entry, stop_price=stop, target_price=target,
+                        execution_rr=round(execution_rr, 4), **edge,
+                    )
+                    self._terminal_lifecycle(
+                        user_id, lifecycle_ctx=lifecycle_ctx, symbol=snapshot.symbol,
+                        decision_id=decision_id, reason=self.last_rejection,
+                        strategy=intent.strategy, direction=intent.direction,
+                        details={'estimated_net_rr': round(estimated_net_rr, 4)},
+                    )
+                    return None
             structural_rr = intent_meta.get("structural_rr_estimate")
             self.audit.event(
                 "SIGNAL_ACCEPTED", decision_id, user_id=user_id,

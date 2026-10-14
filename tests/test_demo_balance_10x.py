@@ -51,12 +51,12 @@ def test_realized_balance_fees_restart_and_duplicate_save(side,exit_price,positi
     assert DemoAccount(db,999).balance('u')==pytest.approx(expected) # Restart never seeds again.
 
 
-def test_fixed_allocation_and_full_account_follow_balance_without_polluting_live():
+def test_fixed_allocation_at_100_percent_never_auto_compounds_or_pollutes_live():
     db=Database(); profiles=profile(db)
     profiles.save('u',execution_mode='demo',trading_enabled=True,operating_capital=100)
     db.upsert('positions',{'position_id':'loss'},{'user_id':'u','mode':'demo','status':'CLOSED','realized_pnl':-7,'entry_fee':1,'exit_fee':2})
     p=profiles.public('u')
-    assert p.demo_auto_compound and p.operating_capital==90 and p.demo_available_equity==90
+    assert not p.demo_auto_compound and p.operating_capital==100 and p.demo_available_equity==90
     assert p.coinw_available_equity==1000
     profiles.save('u',execution_mode='demo',trading_enabled=True,operating_capital=20)
     db.upsert('positions',{'position_id':'win'},{'user_id':'u','mode':'demo','status':'CLOSED','realized_pnl':5})
@@ -141,7 +141,7 @@ def test_complete_demo_runtime_close_api_and_restart(monkeypatch):
         client=TestClient(app)
         config=client.get('/user/trading-config').json()
         assert config['demo_available_equity']==pytest.approx(expected)
-        assert config['operating_capital']==pytest.approx(expected)
+        assert config['operating_capital']==pytest.approx(100)
         perf=client.get('/user/performance').json()
         assert perf['capital']==100 and perf['current_capital']==pytest.approx(expected)
         assert len(client.get('/user/operations').json()['closed'])==1
